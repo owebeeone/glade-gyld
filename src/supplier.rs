@@ -35,6 +35,7 @@ use glade_wire::generated::ExchangeReq;
 use crate::bundle::{self, Layout};
 use crate::envelope::{GyldOutputRecord, GyldRequest, GyldResponse};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
+use crate::publish::{self, Surfaces};
 use crate::verbs::{self, Plan};
 
 /// The default surfaces a gyld supplier stands behind (`gyld-app.glade`).
@@ -53,6 +54,9 @@ pub struct GyldConfig {
     pub glade_id: String,
     pub output_id: String,
     pub layout: Layout,
+    /// The value surfaces a successful build publishes onto, and the static
+    /// base the lens pointers are written against (step 4.2).
+    pub surfaces: Surfaces,
     pub principal: Option<String>,
     pub limits: Limits,
 }
@@ -71,6 +75,7 @@ impl GyldConfig {
             glade_id: DEFAULT_GLADE_ID.into(),
             output_id: DEFAULT_OUTPUT_ID.into(),
             layout: Layout::new(gyld_root, bundle_root),
+            surfaces: Surfaces::default(),
             principal: None,
             limits: Limits::default(),
         }
@@ -205,8 +210,9 @@ fn answer(
 
     match runner.run(&plan, config.limits, &mut |_, _| {}) {
         Ok(out) => {
-            let dir = finish(config, &plan, &out);
-            GyldResponse::ran(run_id, out.exit, out.stdout, out.stderr, dir, who)
+            let dir = finish(client, config, handle, &plan, &out);
+            let named = dir.as_ref().map(|d| d.display().to_string());
+            GyldResponse::ran(run_id, out.exit, out.stdout, out.stderr, named, who)
         }
         Err(e) => GyldResponse::failed(e, who),
     }
@@ -235,10 +241,17 @@ fn write_overlay(plan: &Plan) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", write.path.display()))
 }
 
-/// Record a successful build as the bundle root's latest, and answer with the
-/// directory it built. A failed run advertises nothing: the previous bundle
-/// stands untouched.
-fn finish(config: &Arc<GyldConfig>, plan: &Plan, out: &RunOutput) -> Option<String> {
+/// Record a successful build as the bundle root's latest, publish its documents
+/// onto the value surfaces, and answer with the directory it built. A failed run
+/// advertises nothing: the previous bundle stands untouched and nothing is
+/// published over it.
+fn finish(
+    client: &GladeClient,
+    config: &Arc<GyldConfig>,
+    handle: &Handle,
+    plan: &Plan,
+    out: &RunOutput,
+) -> Option<PathBuf> {
     let dir = plan.output_dir.as_ref()?;
     if out.exit != 0 || !dir.join("streams.json").is_file() {
         return None;
@@ -246,7 +259,43 @@ fn finish(config: &Arc<GyldConfig>, plan: &Plan, out: &RunOutput) -> Option<Stri
     if let Err(e) = bundle::write_latest(&config.layout, dir) {
         eprintln!("glade-gyld: could not record the latest build: {e}");
     }
-    Some(dir.display().to_string())
+    spawn_publish(client.clone(), config.clone(), handle.clone(), dir.clone());
+    Some(dir.clone())
+}
+
+/// Publish the build's documents onto the value surfaces (step 4.2), off the
+/// exchange's own thread: the answer already carried the build directory, and a
+/// mount converges when the ops land.
+fn spawn_publish(
+    client: GladeClient,
+    config: Arc<GyldConfig>,
+    handle: Handle,
+    output_dir: PathBuf,
+) {
+    handle.spawn(async move {
+        let plan = publish::publications(&config.layout, &output_dir, &config.surfaces);
+        for note in plan.notes.iter() {
+            eprintln!("glade-gyld: not published: {note}");
+        }
+        for publication in plan.publications.iter() {
+            let key = publication.key.as_deref().map(str::as_bytes);
+            let appended = client
+                .append(
+                    &config.share,
+                    &publication.glade_id,
+                    "value",
+                    publication.payload.clone(),
+                    key,
+                )
+                .await;
+            if let Err(e) = appended {
+                eprintln!(
+                    "glade-gyld: could not publish {} {:?}: {e}",
+                    publication.glade_id, publication.key
+                );
+            }
+        }
+    });
 }
 
 /// Read a bundle document, bounded. A document larger than the budget is a
@@ -277,6 +326,7 @@ fn spawn_stream(
     plan: Plan,
     who: Option<String>,
 ) {
+    let inner = handle.clone();
     handle.spawn(async move {
         let (tx, mut rx) = mpsc::unbounded_channel::<(String, String)>();
         let limits = config.limits;
@@ -299,7 +349,7 @@ fn spawn_stream(
 
         let exit = match work.await {
             Ok((plan, Ok(out))) => {
-                finish(&config, &plan, &out);
+                finish(&client, &config, &inner, &plan, &out);
                 out.exit
             }
             Ok((_, Err(e))) => {

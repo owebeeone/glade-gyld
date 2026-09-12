@@ -741,3 +741,145 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
     requester.close().await;
     node.kill().await.ok();
 }
+
+// ---- 7. a successful build publishes onto the value surfaces (step 4.2) ----
+
+/// A runner that writes a small but complete emitted bundle into the plan's
+/// output directory, so the publication path has something real to read.
+struct BundleBuilder;
+
+impl Runner for BundleBuilder {
+    fn run(
+        &self,
+        plan: &Plan,
+        _limits: Limits,
+        _on_line: &mut dyn FnMut(&str, &str),
+    ) -> Result<RunOutput, String> {
+        let dir = plan.output_dir.clone().ok_or("this verb builds nothing")?;
+        let lenses = dir.join("streams/base/lenses");
+        std::fs::create_dir_all(&lenses).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("streams.json"),
+            br#"{"format":"gyld.streams.v1","streams":[{"id":"base"}]}"#,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("streams/base/stream.json"), br#"{"id":"base"}"#)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("streams/base/decide-now.json"),
+            br#"{"format":"gyld.decide-now.v1","questions":[]}"#,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(lenses.join("decisions.lens.json"), b"abc").map_err(|e| e.to_string())?;
+        Ok(RunOutput {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_build_publishes_the_bundle_onto_the_value_surfaces() {
+    let tmp = Tmp::new("publish");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle.clone()),
+        Arc::new(BundleBuilder),
+    )
+    .await
+    .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    for (id, key) in [
+        ("gyld.streams", None),
+        ("gyld.stream", Some("base")),
+        ("gyld.decisions", Some("base")),
+        ("gyld.lens", Some("base/decisions")),
+    ] {
+        sub.subscribe("ws-razel", id, key.map(str::as_bytes))
+            .await
+            .unwrap();
+    }
+
+    let built = request(&requester, r#"{"verb":"rebuild"}"#).await;
+    assert!(built.ok, "{built:?}");
+    let output_dir = built.output_dir.clone().expect("a build directory");
+
+    // The four surfaces converge: three documents and one lens POINTER.
+    let s = sub.clone();
+    let converged = poll(|| {
+        let s = s.clone();
+        async move {
+            s.fold_value("ws-razel", "gyld.lens", Some(b"base/decisions"))
+                .await
+                .is_some()
+        }
+    })
+    .await;
+    assert!(converged, "the lens pointer reached the subscriber");
+
+    let listing = sub
+        .fold_value("ws-razel", "gyld.streams", None)
+        .await
+        .expect("streams.json");
+    assert!(
+        String::from_utf8_lossy(&listing).contains("gyld.streams.v1"),
+        "the listing itself"
+    );
+
+    let stream = sub
+        .fold_value("ws-razel", "gyld.stream", Some(b"base"))
+        .await
+        .expect("stream.json");
+    assert_eq!(String::from_utf8_lossy(&stream), r#"{"id":"base"}"#);
+
+    let decisions = sub
+        .fold_value("ws-razel", "gyld.decisions", Some(b"base"))
+        .await
+        .expect("decide-now.json");
+    assert!(String::from_utf8_lossy(&decisions).contains("gyld.decide-now.v1"));
+
+    let pointer = sub
+        .fold_value("ws-razel", "gyld.lens", Some(b"base/decisions"))
+        .await
+        .unwrap();
+    let pointer: glade_gyld::FilePointer =
+        serde_json::from_slice(&pointer).expect("a file pointer");
+    assert_eq!(
+        pointer.bytes, 3,
+        "the pointer carries the size, not the bytes"
+    );
+    assert_eq!(
+        pointer.digest,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    // The URL path is the bundle-root-relative path under the static base, and
+    // it resolves to the file grazel serves.
+    let relative = pointer
+        .path
+        .strip_prefix("/gyld/")
+        .expect("the default static base");
+    assert_eq!(
+        bundle.join(relative),
+        PathBuf::from(&output_dir).join("streams/base/lenses/decisions.lens.json")
+    );
+    assert!(
+        bundle.join(relative).is_file(),
+        "the pointed-at file is there"
+    );
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+}

@@ -25,6 +25,8 @@ stream verbs by invoking the Gyld hosts as subprocesses. It is the write path of
 glade-gyld --node ws://127.0.0.1:9099 \
   --gyld-root /path/to/gyld-wz/gyld --bundle-root /path/to/data/files/gyld \
   [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
+  [--streams-id gyld.streams] [--stream-id gyld.stream] \
+  [--decisions-id gyld.decisions] [--lens-id gyld.lens] [--static-base /gyld] \
   [--principal gianni] [--python /opt/homebrew/bin/python3.13] \
   [--timeout-secs 600] [--max-output-bytes 1048576]
 ```
@@ -137,19 +139,66 @@ closed by a terminal marker:
 A consumer subscribes `(share, gyld.output, run_id)` and folds the log to follow
 the run.
 
+## Results (value surfaces `gyld.streams`, `gyld.stream`, `gyld.decisions`, `gyld.lens`)
+
+After a successful build the supplier appends the bundle's documents to value
+surfaces, so every mount in the UI converges without a second round trip:
+
+| surface | key | value |
+| --- | --- | --- |
+| `gyld.streams` | none | the build's `streams.json` |
+| `gyld.stream` | stream id | that stream's `stream.json` |
+| `gyld.decisions` | stream id | that stream's `decide-now.json` |
+| `gyld.lens` | `<stream>/<perspective>` | a `{path, digest, bytes}` pointer |
+
+The stream listing is the authority for which streams exist: a stream the bundle
+does not list is not published, even if a directory for it is lying around.
+
+Lens files are the large ones, so they travel as **pointer plus digest** (owner
+ruling O5) and are fetched over HTTP from grazel's static path:
+
+```json
+{ "path": "/gyld/builds/build-1789247615547/streams/base/lenses/decisions.lens.json",
+  "digest": "ba7816bf…", "bytes": 47911 }
+```
+
+`path` is the bundle-root-relative path under `--static-base`, which is the URL
+grazel serves that file at. The consumer checks the digest; it never trusts the
+pointer. A document over 256 KiB is left off its share with a logged note rather
+than pushed through the fold: it is on the static path like any other large file.
+
+Publication happens off the exchange's own thread — the answer already carried
+the build directory — and a publication failure is logged, never fatal: a build
+that succeeded stays a build that succeeded.
+
+## Declarations and grazel
+
+The surfaces and the `gyld.ops` service are declared in a **separate**
+`grazel/apps/gyld-app.glade` (owner ruling O5), not in a grown
+`grazel-app.glade`. `glade-node` has always accepted `--app FILE.glade` more
+than once, so grazel passes both files and `grazel-app.glade` stays exactly as it
+is, byte-identical in both of its homes. Registration is idempotent by diff, so
+the `workspace ws-razel razel` entry both files declare registers once.
+
+grazel spawns this supplier as a composed child exactly the way it spawns
+`glade-gwz`, with one difference: the gyld leg is **default off**, and
+`--gyld-supplier-bin` is the switch that both spawns the supplier and loads
+`gyld-app.glade`. grazel serves the bundle root at `/gyld/`, which is what a
+lens pointer's `path` names.
+
 ## Tests
 
 ```sh
-cargo test                              # 32 unit + 6 integration
+cargo test                              # 36 unit + 7 integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 The integration suite spawns the real `glade-node` binary booted with
 `tests/fixtures/gyld-test-app.glade`, under a temp `GLADE_HOME` and `HOME`
-(never the real `~/.glade`). Five of its six tests drive a **recording runner
+(never the real `~/.glade`). Six of its seven tests drive a **recording runner
 double**, so the whole verb path is exercised with no interpreter and no Gyld
-checkout in sight. The sixth runs one real subprocess,
+checkout in sight. The seventh runs one real subprocess,
 `emit_decision_streams.py --help`, out of a Gyld checkout found at
 `../../gyld-wz/gyld` or at `GLADE_GYLD_TEST_GYLD_ROOT`; it skips loudly when
 that checkout or its interpreter is absent.

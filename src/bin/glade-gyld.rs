@@ -4,7 +4,10 @@
 //! ```text
 //! glade-gyld --node ws://127.0.0.1:PORT --gyld-root DIR --bundle-root DIR
 //!            [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output]
-//!            [--principal P] [--python /opt/homebrew/bin/python3.13]
+//!            [--streams-id gyld.streams] [--stream-id gyld.stream]
+//!            [--decisions-id gyld.decisions] [--lens-id gyld.lens]
+//!            [--static-base /gyld] [--principal P]
+//!            [--python /opt/homebrew/bin/python3.13]
 //!            [--timeout-secs 600] [--max-output-bytes 1048576]
 //! ```
 //!
@@ -16,14 +19,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gyld::{
-    serve, GyldConfig, Limits, DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID,
-    DEFAULT_PYTHON, DEFAULT_SHARE, DEFAULT_TIMEOUT_SECS,
+    serve, GyldConfig, Limits, Surfaces, DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, DEFAULT_TIMEOUT_SECS,
 };
 
 const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --bundle-root DIR \
 [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
-[--principal P] [--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] \
-[--max-output-bytes 1048576]";
+[--streams-id gyld.streams] [--stream-id gyld.stream] [--decisions-id gyld.decisions] \
+[--lens-id gyld.lens] [--static-base /gyld] [--principal P] \
+[--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576]";
 
 /// The parsed CLI: the supplier config plus the interpreter to run the hosts.
 struct Args {
@@ -97,6 +101,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut share = DEFAULT_SHARE.to_string();
     let mut glade_id = DEFAULT_GLADE_ID.to_string();
     let mut output_id = DEFAULT_OUTPUT_ID.to_string();
+    let mut surfaces = Surfaces::default();
     let mut principal: Option<String> = None;
     let mut python = PathBuf::from(DEFAULT_PYTHON);
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
@@ -112,6 +117,11 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--share" => share = take("--share")?,
             "--glade-id" => glade_id = take("--glade-id")?,
             "--output-id" => output_id = take("--output-id")?,
+            "--streams-id" => surfaces.streams_id = take("--streams-id")?,
+            "--stream-id" => surfaces.stream_id = take("--stream-id")?,
+            "--decisions-id" => surfaces.decisions_id = take("--decisions-id")?,
+            "--lens-id" => surfaces.lens_id = take("--lens-id")?,
+            "--static-base" => surfaces.static_base = take("--static-base")?,
             "--principal" => principal = Some(take("--principal")?),
             "--python" => python = PathBuf::from(take("--python")?),
             "--timeout-secs" => {
@@ -141,6 +151,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     config.share = share;
     config.glade_id = glade_id;
     config.output_id = output_id;
+    config.surfaces = surfaces;
     config.principal = principal;
     config.limits = Limits {
         timeout: Duration::from_secs(timeout_secs),

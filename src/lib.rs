@@ -24,11 +24,13 @@
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
 //!   invocation, or a refusal, with no filesystem effect.
 //! * [`exec`] — the bounded runner (wall clock and output bytes).
+//! * [`publish`] — what a successful build puts on the value surfaces.
 //! * [`supplier`] — [`serve`], [`GyldConfig`], [`GyldSupplier`]: attach and serve.
 
 pub mod bundle;
 pub mod envelope;
 pub mod exec;
+pub mod publish;
 pub mod supplier;
 pub mod verbs;
 
@@ -37,6 +39,7 @@ pub use envelope::{GyldArgs, GyldOutputRecord, GyldRequest, GyldResponse};
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
+pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID,
     DEFAULT_PYTHON, DEFAULT_SHARE,

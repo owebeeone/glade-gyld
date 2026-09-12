@@ -1,0 +1,21 @@
+# gyld-test-app.glade — the minimal app declaration the glade-gyld tests boot
+# the node with. Declares exactly the surfaces glade-gyld stands behind, plus the
+# workspace share that makes them routable (the loading node mints the
+# WorkspaceEntry + ServeClaim, so `(ws-razel, gyld.ops)` routes Local).
+#
+# This mirrors the `service … gyld.ops` + `workspace ws-razel razel` legs of
+# grazel's gyld-app.glade; it is a fixture, not that file.
+glade-app v0
+app gyld-test
+
+# the verb surface: a directed exchange, answered by the attached provider.
+service gyld gyld.ops
+
+# the long-op output surface: appended ops fold + replicate to subscribers.
+binding gyld.output log share commons from-cursor
+
+# bootstrap grant (data only — enforcement is stage-2).
+seed owner gyld gyld.*
+
+# the workspace share this app serves from; the booted loader is its host.
+workspace ws-razel razel

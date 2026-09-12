@@ -1,0 +1,26 @@
+[package]
+name = "glade-gyld"
+version = "0.0.0"
+edition = "2021"
+description = "a glade supplier: Gyld decision-stream verbs over an EXCHANGE surface, bundle results published to VALUE surfaces, long-op output on a LOG surface (GyldGrythPlugins.md phase 4). Wraps the frozen wire via glade-client; no node internals (P00-a)."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "glade-gyld"
+path = "src/bin/glade-gyld.rs"
+
+[dependencies]
+glade-client = { path = "../glade/client-rs" }
+glade-wire = { path = "../glade/wire-rs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
+
+[dev-dependencies]
+# integration tests spawn the glade-node BINARY (no node internals — P00-a) and
+# the glade-gyld binary, and run ONE real Gyld subprocess
+# (`emit_decision_streams.py --help`) when a Gyld checkout is present.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }

@@ -1,0 +1,743 @@
+//! Integration: the glade-gyld supplier against a SPAWNED glade-node booted with
+//! an app file that declares the gyld exchange and output surfaces (never the
+//! real `~/.glade`: temp GLADE_HOME/HOME and a temp store). The crate holds no
+//! node internals; the tests talk to the shipped binaries exactly as a
+//! deployment would. Coverage step 4.1 names:
+//!
+//!   1. a RECORDING runner double sees exactly one invocation per verb, with the
+//!      argv the planner promised, and `answer` writes its overlay first.
+//!   2. a refused verb, a bad envelope, a malformed stream id and a path that
+//!      leaves the bundle root are failure as DATA, and no host is invoked.
+//!   3. a streaming run's output appends reach a log subscriber in sequence,
+//!      closed by a `done:true` marker carrying the exit code.
+//!   4. ONE real subprocess: `emit_decision_streams.py --help` out of a Gyld
+//!      checkout, skipped loudly when that checkout or its interpreter is absent.
+//!   5. the `glade-gyld` BINARY attaches, answers, and shuts down on SIGTERM.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+
+use glade_client::GladeClient;
+use glade_gyld::{
+    serve_with, GyldConfig, GyldOutputRecord, GyldResponse, Limits, Plan, RunOutput, Runner,
+};
+
+// ---- harness --------------------------------------------------------------
+
+fn manifest() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn node_bin() -> PathBuf {
+    manifest().join("../glade/node/target/debug/glade-node")
+}
+
+fn app_file() -> PathBuf {
+    manifest().join("tests/fixtures/gyld-test-app.glade")
+}
+
+/// The gate pre-builds the node; build once if absent so the suite is
+/// self-sufficient (the node has its own target dir — no lock clash).
+fn ensure_node_built() {
+    let bin = node_bin();
+    if bin.exists() {
+        return;
+    }
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--bin", "glade-node"])
+        .current_dir(manifest().join("../glade/node"))
+        .status()
+        .expect("build glade-node");
+    assert!(
+        status.success() && bin.exists(),
+        "glade-node missing after build"
+    );
+}
+
+/// A temp dir that removes itself on drop (never the real `~/.glade`).
+struct Tmp(PathBuf);
+
+impl Tmp {
+    fn new(tag: &str) -> Tmp {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        );
+        let p = std::env::temp_dir().join(format!("glade-gyld-{tag}-{uniq}"));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Tmp(p)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read the node's `listening <port>` line (bounded), then drain stdout.
+async fn wait_listening(child: &mut Child) -> u16 {
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let port = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(line) = lines.next_line().await.ok().flatten() {
+            if let Some(rest) = line.strip_prefix("listening ") {
+                if let Ok(p) = rest.trim().parse::<u16>() {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+    .expect("node printed a listening port");
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    port
+}
+
+/// Boot the node with the gyld-test app under a temp GLADE_HOME/HOME.
+async fn boot(tmp: &Tmp) -> (Child, u16) {
+    ensure_node_built();
+    let mut child = Command::new(node_bin())
+        .args(["--profile", "local", "--name", "gyldit", "--app"])
+        .arg(app_file())
+        .arg("0")
+        .arg(tmp.path().join("store"))
+        .env("GLADE_HOME", tmp.path().join("gh"))
+        .env("HOME", tmp.path().join("h"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn booted glade-node");
+    let port = wait_listening(&mut child).await;
+    (child, port)
+}
+
+/// The two roots the supplier is configured with: a Gyld checkout stand-in that
+/// the supplier only ever reads, and the app-owned bundle root it owns.
+fn roots(tmp: &Tmp) -> (PathBuf, PathBuf) {
+    let gyld = tmp.path().join("gyld");
+    std::fs::create_dir_all(gyld.join("scripts")).unwrap();
+    std::fs::create_dir_all(gyld.join("examples")).unwrap();
+    std::fs::write(gyld.join("examples/glade-decisions.gyld.py"), "# base\n").unwrap();
+    let bundle = tmp.path().join("bundle");
+    std::fs::create_dir_all(&bundle).unwrap();
+    (gyld, bundle)
+}
+
+/// Seed a bundle so the verbs that need one have one. Returns its directory.
+fn seed_bundle(bundle_root: &Path) -> PathBuf {
+    let dir = bundle_root.join("builds/build-0000000000001");
+    std::fs::create_dir_all(dir.join("streams/base")).unwrap();
+    std::fs::write(
+        dir.join("streams.json"),
+        r#"{"format":"gyld.streams.v1","lineage":"glade-decision-graph","streams":[{"id":"base"}]}"#,
+    )
+    .unwrap();
+    dir
+}
+
+fn config_for(url: &str, gyld: PathBuf, bundle: PathBuf) -> GyldConfig {
+    let mut c = GyldConfig::new(url, gyld, bundle);
+    c.principal = Some("gianni".into());
+    c.limits = Limits {
+        timeout: Duration::from_secs(30),
+        max_output_bytes: 64 * 1024,
+    };
+    c
+}
+
+/// A runner double: records every plan it is handed, replays scripted output
+/// lines, and (when asked) leaves a `streams.json` in the plan's output
+/// directory so the success path is reachable with no Python in sight.
+#[derive(Default)]
+struct Recorder {
+    plans: Mutex<Vec<Plan>>,
+    lines: Vec<(&'static str, &'static str)>,
+    exit: i32,
+    build: bool,
+    fail: Option<String>,
+    /// Held closed until the test has a subscriber on the output surface, so no
+    /// line can be appended before there is anybody to see it (the log surface
+    /// is `from-cursor`: a late subscriber misses what it did not ask for).
+    gate: Option<Arc<Barrier>>,
+}
+
+impl Recorder {
+    fn argvs(&self) -> Vec<Vec<String>> {
+        self.plans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.argv.clone())
+            .collect()
+    }
+
+    fn count(&self) -> usize {
+        self.plans.lock().unwrap().len()
+    }
+}
+
+impl Runner for Recorder {
+    fn run(
+        &self,
+        plan: &Plan,
+        _limits: Limits,
+        on_line: &mut dyn FnMut(&str, &str),
+    ) -> Result<RunOutput, String> {
+        self.plans.lock().unwrap().push(plan.clone());
+        if let Some(gate) = self.gate.as_ref() {
+            gate.wait();
+        }
+        if let Some(e) = self.fail.as_deref() {
+            return Err(e.to_string());
+        }
+        for (stream, line) in self.lines.iter() {
+            on_line(stream, line);
+        }
+        if self.build {
+            if let Some(dir) = plan.output_dir.as_ref() {
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(dir.join("streams.json"), "{\"format\":\"gyld.streams.v1\"}")
+                    .unwrap();
+            }
+        }
+        Ok(RunOutput {
+            exit: self.exit,
+            stdout: "out\n".into(),
+            stderr: String::new(),
+            truncated: false,
+        })
+    }
+}
+
+async fn poll<F, Fut>(mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if f().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Issue an envelope and decode the `GyldResponse`. Asserts the WIRE ok is true
+/// (the exchange always produces a structured answer).
+async fn request(requester: &GladeClient, envelope: &str) -> GyldResponse {
+    let out = requester
+        .exchange("ws-razel", "gyld.ops", envelope.as_bytes().to_vec())
+        .await
+        .expect("exchange");
+    assert!(
+        out.ok,
+        "wire ExchangeRes.ok is always true (failure is in the payload); error={:?}",
+        out.error
+    );
+    serde_json::from_slice(&out.payload.expect("payload")).expect("GyldResponse json")
+}
+
+/// Wait until the supplier is the attached provider.
+async fn attached(requester: &GladeClient) {
+    let r = requester.clone();
+    let ready = poll(|| {
+        let r = r.clone();
+        async move {
+            r.exchange("ws-razel", "gyld.ops", br#"{"verb":"list"}"#.to_vec())
+                .await
+                .map(|o| o.ok)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    assert!(ready, "the gyld supplier attached and answered");
+}
+
+// ---- 1. one host invocation per verb, with the promised argv ---------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_verb_maps_to_one_recorded_host_invocation() {
+    let tmp = Tmp::new("argv");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let seeded = seed_bundle(&bundle);
+
+    let runner = Arc::new(Recorder {
+        build: true,
+        ..Default::default()
+    });
+    let _sup = serve_with(
+        config_for(&url, gyld.clone(), bundle.clone()),
+        runner.clone(),
+    )
+    .await
+    .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    // `list` is the one verb with no subprocess: it reads the bundle listing.
+    let listed = request(&requester, r#"{"verb":"list"}"#).await;
+    assert!(listed.ok, "{listed:?}");
+    assert!(listed.stdout.contains("gyld.streams.v1"), "{listed:?}");
+    assert_eq!(runner.count(), 0, "list ran no host");
+    assert_eq!(listed.attributed_to.as_deref(), Some("gianni"));
+
+    let host = gyld
+        .join("scripts/manage_decision_streams.py")
+        .display()
+        .to_string();
+    let stage = bundle.join("stage").display().to_string();
+
+    let forked = request(
+        &requester,
+        r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a","note":"why"}}"#,
+    )
+    .await;
+    assert!(forked.ok, "{forked:?}");
+    assert_eq!(
+        runner.argvs().last().unwrap(),
+        &vec![
+            host.clone(),
+            "--repository".into(),
+            stage.clone(),
+            "fork".into(),
+            "base".into(),
+            "keys-a".into(),
+            "--note".into(),
+            "why".into()
+        ]
+    );
+
+    let linked = request(
+        &requester,
+        r#"{"verb":"link","args":{"parent":"base","stream":"keys-b"}}"#,
+    )
+    .await;
+    assert!(linked.ok, "{linked:?}");
+    assert_eq!(runner.argvs().last().unwrap()[3], "link");
+
+    let diffed = request(
+        &requester,
+        r#"{"verb":"diff","args":{"left":"base","right":"keys-a"}}"#,
+    )
+    .await;
+    assert!(diffed.ok, "{diffed:?}");
+    let argv = runner.argvs().last().unwrap().clone();
+    assert_eq!(
+        argv[3..8].to_vec(),
+        vec![
+            "diff",
+            "base",
+            "keys-a",
+            "--bundle",
+            &seeded.display().to_string()
+        ]
+    );
+
+    // `answer` writes the exported overlay module into the bundle root's
+    // overlays tree FIRST, then rebuilds into a directory that did not exist.
+    let answered = request(
+        &requester,
+        r##"{"verb":"answer","args":{"stream":"keys-a","overlay":"# ruled\n"}}"##,
+    )
+    .await;
+    assert!(answered.ok, "{answered:?}");
+    let overlay = bundle.join("overlays/glade-decisions-keys-a.gyld.py");
+    assert_eq!(std::fs::read_to_string(&overlay).unwrap(), "# ruled\n");
+    let built = answered.output_dir.clone().expect("a new build directory");
+    assert!(
+        built.starts_with(&bundle.join("builds").display().to_string()),
+        "{built}"
+    );
+    assert_ne!(
+        built,
+        seeded.display().to_string(),
+        "never built over the previous bundle"
+    );
+
+    // and the build becomes the bundle root's latest, so the next verb uses it.
+    let rebuilt = request(&requester, r#"{"verb":"rebuild"}"#).await;
+    assert!(rebuilt.ok, "{rebuilt:?}");
+    let argv = runner.argvs().last().unwrap().clone();
+    assert_eq!(
+        argv[5], built,
+        "the rebuild started from the build answer left behind"
+    );
+
+    // `ask` appends the question fragment to the exported module.
+    let asked = request(
+        &requester,
+        r##"{"verb":"ask","args":{"stream":"keys-a","overlay":"# ruled","question":"class Q: pass"}}"##,
+    )
+    .await;
+    assert!(asked.ok, "{asked:?}");
+    assert_eq!(
+        std::fs::read_to_string(&overlay).unwrap(),
+        "# ruled\n\nclass Q: pass\n"
+    );
+
+    // The Gyld checkout is untouched throughout: one example file, no writes.
+    let examples: Vec<_> = std::fs::read_dir(gyld.join("examples")).unwrap().collect();
+    assert_eq!(
+        examples.len(),
+        1,
+        "the Gyld checkout's examples are read only"
+    );
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 2. refusals are data, and no host is invoked --------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_are_data_and_never_reach_a_host() {
+    let tmp = Tmp::new("deny");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+
+    let runner = Arc::new(Recorder::default());
+    let _sup = serve_with(config_for(&url, gyld, bundle), runner.clone())
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let cases: &[(&str, &str)] = &[
+        (r#"{"verb":"capture"}"#, "allow-list"),
+        (r#"{"verb":"occurred"}"#, "allow-list"),
+        ("not json", "bad envelope"),
+        (
+            r#"{"verb":"fork","args":{"parent":"base","stream":"../../etc"}}"#,
+            "not a stream id",
+        ),
+        (
+            r#"{"verb":"fork","args":{"parent":"base","stream":"keys a"}}"#,
+            "not a stream id",
+        ),
+        (
+            r#"{"verb":"diff","args":{"left":"base"}}"#,
+            "`right` is required",
+        ),
+        (
+            r#"{"verb":"answer","args":{"stream":"keys-a"}}"#,
+            "`overlay`",
+        ),
+    ];
+    for (envelope, expected) in cases {
+        let r = request(&requester, envelope).await;
+        assert!(!r.ok, "{envelope} must be refused: {r:?}");
+        assert!(
+            r.error.as_deref().unwrap_or("").contains(expected),
+            "{envelope} -> {r:?} (wanted {expected})"
+        );
+        assert!(r.exit.is_none(), "{envelope}: no host ran: {r:?}");
+    }
+    assert_eq!(runner.count(), 0, "not one refusal reached a host");
+
+    // A host failure is data too, not a hang and not a panic.
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 3. a spawn failure answers as data ------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_failure_answers_as_data() {
+    let tmp = Tmp::new("hostfail");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+
+    let runner = Arc::new(Recorder {
+        fail: Some("timed out after 200ms".into()),
+        ..Default::default()
+    });
+    let _sup = serve_with(config_for(&url, gyld, bundle), runner)
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let r = request(&requester, r#"{"verb":"rebuild"}"#).await;
+    assert!(
+        !r.ok && r.error.as_deref().unwrap_or("").contains("timed out"),
+        "{r:?}"
+    );
+    assert!(r.output_dir.is_none(), "a failed run built nothing: {r:?}");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 4. streaming output reaches a subscriber, in sequence -----------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_output_reaches_a_subscriber_in_sequence() {
+    let tmp = Tmp::new("stream");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+
+    let gate = Arc::new(Barrier::new(2));
+    let runner = Arc::new(Recorder {
+        lines: vec![
+            ("stdout", "capturing base"),
+            ("stdout", "wrote streams.json"),
+            ("stderr", "note"),
+        ],
+        build: true,
+        gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let _sup = serve_with(config_for(&url, gyld, bundle), runner)
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let accepted = request(&requester, r#"{"verb":"rebuild","stream_output":true}"#).await;
+    assert!(
+        accepted.ok && accepted.done == Some(false),
+        "streaming accept: {accepted:?}"
+    );
+    let run_id = accepted.run_id.expect("run_id on the accept");
+
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+        .await
+        .unwrap();
+
+    // The subscriber is up; let the run produce its lines.
+    tokio::task::spawn_blocking(move || gate.wait())
+        .await
+        .unwrap();
+
+    let s = sub.clone();
+    let key = run_id.clone();
+    let converged = poll(|| {
+        let s = s.clone();
+        let key = key.clone();
+        async move {
+            s.fold_log("ws-razel", "gyld.output", Some(key.as_bytes()))
+                .await
+                .iter()
+                .any(|e| {
+                    serde_json::from_slice::<GyldOutputRecord>(e)
+                        .map(|r| r.done == Some(true))
+                        .unwrap_or(false)
+                })
+        }
+    })
+    .await;
+    assert!(
+        converged,
+        "the streaming output and its done marker reached the subscriber"
+    );
+
+    let entries = sub
+        .fold_log("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+        .await;
+    let records: Vec<GyldOutputRecord> = entries
+        .iter()
+        .filter_map(|e| serde_json::from_slice(e).ok())
+        .collect();
+
+    // Every record is keyed by the run, attributed, and numbered from one with
+    // the terminal marker last.
+    assert_eq!(
+        records.len(),
+        4,
+        "three lines and one end marker: {records:?}"
+    );
+    assert!(records.iter().all(|r| r.run_id == run_id));
+    assert!(records
+        .iter()
+        .all(|r| r.principal.as_deref() == Some("gianni")));
+    assert_eq!(
+        records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "sequence numbers run 1..n: {records:?}"
+    );
+    assert_eq!(records[0].line.as_deref(), Some("capturing base"));
+    assert_eq!(records[0].stream, "stdout");
+    assert_eq!(records[2].stream, "stderr");
+    let end = records.last().unwrap();
+    assert_eq!(end.stream, "end");
+    assert_eq!(end.exit, Some(0));
+    assert_eq!(end.done, Some(true));
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 5. ONE real subprocess against a Gyld checkout ------------------------
+
+/// The Gyld checkout the real-subprocess test runs against, if one is here.
+fn gyld_checkout() -> Option<PathBuf> {
+    let candidate = match std::env::var_os("GLADE_GYLD_TEST_GYLD_ROOT") {
+        Some(v) => PathBuf::from(v),
+        None => manifest().join("../../gyld-wz/gyld"),
+    };
+    if candidate.join("scripts/emit_decision_streams.py").is_file() {
+        return Some(candidate);
+    }
+    None
+}
+
+#[test]
+fn the_emit_host_answers_help_as_a_real_subprocess() {
+    let root = match gyld_checkout() {
+        Some(r) => r,
+        None => {
+            eprintln!("SKIP: no Gyld checkout (set GLADE_GYLD_TEST_GYLD_ROOT)");
+            return;
+        }
+    };
+    let python = PathBuf::from(glade_gyld::DEFAULT_PYTHON);
+    if !python.exists() {
+        eprintln!("SKIP: {} is absent", python.display());
+        return;
+    }
+    let layout =
+        glade_gyld::Layout::new(root.clone(), std::env::temp_dir().join("glade-gyld-help"));
+    let plan = Plan {
+        verb: "help".into(),
+        write: None,
+        argv: vec![
+            layout
+                .script("emit_decision_streams.py")
+                .display()
+                .to_string(),
+            "--help".into(),
+        ],
+        cwd: root,
+        pythonpath: layout.pythonpath(),
+        output_dir: None,
+        read: None,
+    };
+    let limits = Limits {
+        timeout: Duration::from_secs(60),
+        max_output_bytes: 1 << 20,
+    };
+    let out = glade_gyld::exec::run_bounded(&python, &plan, limits, &mut |_, _| {})
+        .expect("the emit host ran");
+    assert_eq!(out.exit, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains("usage: emit_decision_streams.py"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("--output"), "{}", out.stdout);
+}
+
+// ---- 6. the binary attaches, answers, and shuts down on SIGTERM ------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_serves_and_shuts_down_on_sigterm() {
+    let tmp = Tmp::new("bin");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+
+    let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
+        .args(["--node", &url, "--gyld-root"])
+        .arg(&gyld)
+        .arg("--bundle-root")
+        .arg(&bundle)
+        .args(["--share", "ws-razel", "--principal", "tester"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn glade-gyld binary");
+    let pid = supplier.id().expect("binary pid");
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+
+    // The binary attached: `list` answers, and with no bundle built yet that
+    // answer is a readable refusal rather than a hang.
+    let answered = poll(|| {
+        let r = requester.clone();
+        async move {
+            match r
+                .exchange("ws-razel", "gyld.ops", br#"{"verb":"list"}"#.to_vec())
+                .await
+            {
+                Ok(o) if o.ok => {
+                    let resp: GyldResponse =
+                        serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    !resp.ok
+                        && resp.attributed_to.as_deref() == Some("tester")
+                        && resp.error.as_deref().unwrap_or("").contains("no bundle")
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+    assert!(answered, "the glade-gyld binary attached and answered");
+
+    // It laid out its app-owned bundle root on the way, and touched nothing else.
+    assert!(bundle.join("overlays").is_dir(), "the overlays tree exists");
+    assert!(
+        bundle.join("stage/examples").exists(),
+        "the staging repository exists"
+    );
+    assert!(
+        bundle.join("overlays/glade-decisions.gyld.py").exists(),
+        "the checkout's examples seeded the overlays tree"
+    );
+
+    let killed = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "sent SIGTERM");
+    let status = tokio::time::timeout(Duration::from_secs(10), supplier.wait())
+        .await
+        .expect("binary exited after SIGTERM")
+        .expect("wait");
+    assert!(status.success(), "clean shutdown exit 0, got {status:?}");
+
+    requester.close().await;
+    node.kill().await.ok();
+}

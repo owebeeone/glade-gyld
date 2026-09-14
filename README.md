@@ -26,7 +26,8 @@ glade-gyld --node ws://127.0.0.1:9099 \
   --gyld-root /path/to/gyld-wz/gyld --bundle-root /path/to/data/files/gyld \
   [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
   [--streams-id gyld.streams] [--stream-id gyld.stream] \
-  [--decisions-id gyld.decisions] [--lens-id gyld.lens] [--static-base /gyld] \
+  [--decisions-id gyld.decisions] [--lens-id gyld.lens] [--file-id gyld.file] \
+  [--static-base /gyld] \
   [--principal gianni] [--python /opt/homebrew/bin/python3.13] \
   [--timeout-secs 600] [--max-output-bytes 1048576]
 ```
@@ -197,7 +198,7 @@ closed by a terminal marker:
 A consumer subscribes `(share, gyld.output, run_id)` and folds the log to follow
 the run.
 
-## Results (value surfaces `gyld.streams`, `gyld.stream`, `gyld.decisions`, `gyld.lens`)
+## Results (value surfaces `gyld.streams`, `gyld.stream`, `gyld.decisions`, `gyld.lens`, `gyld.file`)
 
 After a successful build **and once more when the supplier attaches**, the
 supplier appends the current bundle's documents to value surfaces, so every
@@ -209,6 +210,7 @@ mount in the UI converges without a second round trip:
 | `gyld.stream` | stream id | that stream's `stream.json` |
 | `gyld.decisions` | stream id | that stream's `decide-now.json` |
 | `gyld.lens` | `<stream>/<perspective>` | a `{path, digest, bytes}` pointer |
+| `gyld.file` | `<stream>/<file>` | a `{path, digest, bytes}` pointer |
 
 The stream listing is the authority for which streams exist: a stream the bundle
 does not list is not published, even if a directory for it is lying around.
@@ -225,6 +227,13 @@ ruling O5) and are fetched over HTTP from grazel's static path:
 grazel serves that file at. The consumer checks the digest; it never trusts the
 pointer. A document over 256 KiB is left off its share with a logged note rather
 than pushed through the fold: it is on the static path like any other large file.
+
+`gyld.file` carries each listed stream's `projection.json` (the records) and
+`validation.json` the same way, keyed `<stream>/<file>`. Without them a glade
+root could not read a single record: the only way in was to add the build
+directory as a static root by hand and re-point it after every build. A stream
+that has neither file publishes neither — that is data, not a fault, as with
+`decide-now.json`.
 
 Publication happens off the exchange's own thread — the answer already carried
 the build directory — and a publication failure is logged, never fatal: a build

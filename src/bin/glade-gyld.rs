@@ -6,7 +6,7 @@
 //!            [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output]
 //!            [--streams-id gyld.streams] [--stream-id gyld.stream]
 //!            [--decisions-id gyld.decisions] [--lens-id gyld.lens]
-//!            [--static-base /gyld] [--principal P]
+//!            [--file-id gyld.file] [--static-base /gyld] [--principal P]
 //!            [--python /opt/homebrew/bin/python3.13]
 //!            [--timeout-secs 600] [--max-output-bytes 1048576]
 //! ```
@@ -26,7 +26,7 @@ use glade_gyld::{
 const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --bundle-root DIR \
 [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
 [--streams-id gyld.streams] [--stream-id gyld.stream] [--decisions-id gyld.decisions] \
-[--lens-id gyld.lens] [--static-base /gyld] [--principal P] \
+[--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
 [--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576]";
 
 /// The parsed CLI: the supplier config plus the interpreter to run the hosts.
@@ -121,6 +121,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--stream-id" => surfaces.stream_id = take("--stream-id")?,
             "--decisions-id" => surfaces.decisions_id = take("--decisions-id")?,
             "--lens-id" => surfaces.lens_id = take("--lens-id")?,
+            "--file-id" => surfaces.file_id = take("--file-id")?,
             "--static-base" => surfaces.static_base = take("--static-base")?,
             "--principal" => principal = Some(take("--principal")?),
             "--python" => python = PathBuf::from(take("--python")?),

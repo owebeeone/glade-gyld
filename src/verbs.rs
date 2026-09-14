@@ -33,6 +33,19 @@ pub const ALLOWED_VERBS: &[&str] = &["list", "answer", "ask", "fork", "link", "r
 /// The Gyld host that owns the four stream-manager verbs.
 pub const MANAGER_HOST: &str = "manage_decision_streams.py";
 
+/// The Gyld host that WRITES a bundle. Every other verb reaches it through
+/// `manage_decision_streams.py rebuild`, which re-captures an existing bundle;
+/// the FIRST build has no bundle to re-capture, so the supplier runs the writer
+/// itself ([`first_build_plan`]).
+pub const EMIT_HOST: &str = "emit_decision_streams.py";
+
+/// The refusal a verb that needs a bundle gets before there is one.
+///
+/// Named rather than repeated because the supplier REWRITES it while it is
+/// running its own first build: "no bundle has been built yet" is the wrong
+/// thing to say when one is on its way.
+pub const NO_BUNDLE: &str = "no bundle has been built yet";
+
 /// The base entry module every generated stream's module name extends.
 const ENTRY: &str = "glade_decisions";
 
@@ -167,13 +180,13 @@ pub fn plan(
 
     match request.verb.as_str() {
         "list" => {
-            let bundle = latest.ok_or("no bundle has been built yet")?;
+            let bundle = latest.ok_or(NO_BUNDLE)?;
             plan.read = Some(bundle.join("streams.json"));
         }
         "answer" | "ask" => {
             let stream = require_stream(args.stream.as_deref(), "stream")?;
             let text = overlay_text(&request.verb, args)?;
-            let bundle = latest.ok_or("no bundle has been built yet")?;
+            let bundle = latest.ok_or(NO_BUNDLE)?;
             let output = layout.new_build_dir(stamp);
             plan.write = Some(PlannedWrite {
                 path: layout.overlays().join(overlay_file(stream)),
@@ -205,7 +218,7 @@ pub fn plan(
             plan.argv = base(argv);
         }
         "rebuild" => {
-            let bundle = latest.ok_or("no bundle has been built yet")?;
+            let bundle = latest.ok_or(NO_BUNDLE)?;
             let output = layout.new_build_dir(stamp);
             plan.argv = base(rebuild_argv(bundle, &output, args.built.as_deref()));
             plan.output_dir = Some(output);
@@ -216,7 +229,7 @@ pub fn plan(
             if left == right {
                 return Err("a diff needs two different streams".into());
             }
-            let bundle = latest.ok_or("no bundle has been built yet")?;
+            let bundle = latest.ok_or(NO_BUNDLE)?;
             let mut argv = vec![
                 "diff".into(),
                 left.to_string(),
@@ -265,6 +278,100 @@ pub fn plan(
         }
     }
     Ok(plan)
+}
+
+/// Ask the Gyld checkout which streams the staging repository declares.
+///
+/// `manage_decision_streams.py rebuild` is one line of exactly this —
+/// `streams = discover(repository)` — and it then hands each id to the emit host
+/// as `--stream`. Nothing is reimplemented here: the checkout owns the answer to
+/// "which streams are there", so the checkout is asked, with its own `discover`.
+/// Ask it any other way and the first build lists two streams where a Rebuild
+/// lists five.
+///
+/// The snippet is a CONSTANT and its one operand is the staging repository, an
+/// app-owned path the supplier composed itself. No request reaches it.
+const DISCOVER: &str = "import json\n\
+     import sys\n\
+     from pathlib import Path\n\
+     from scripts.capture_decision_stream import discover\n\
+     from scripts.emit_decision_streams import STREAM_ID\n\
+     found = discover(Path(sys.argv[1]))\n\
+     print(json.dumps(sorted(n for n in found if n != STREAM_ID)))\n";
+
+/// The plan that runs [`DISCOVER`]. Builds nothing, writes nothing and reads
+/// nothing of the bundle root but its staging repository.
+pub fn discover_plan(layout: &Layout) -> Plan {
+    Plan {
+        verb: "discover".into(),
+        write: None,
+        argv: vec![
+            "-c".into(),
+            DISCOVER.into(),
+            layout.stage().display().to_string(),
+        ],
+        cwd: layout.gyld_root.clone(),
+        pythonpath: layout.pythonpath(),
+        output_dir: None,
+        read: None,
+    }
+}
+
+/// The stream ids a [`discover_plan`] run printed: the LAST line of its stdout
+/// that is a JSON array of ids, so a host that says something on the way still
+/// answers. Every id is checked against [`valid_stream_id`] before it can reach
+/// an argv — the checkout is trusted to be honest, not to be well-formed.
+pub fn declared_streams(stdout: &str) -> Vec<String> {
+    for line in stdout.lines().rev() {
+        let parsed: Vec<String> = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                continue;
+            }
+        };
+        return parsed
+            .into_iter()
+            .filter(|id| valid_stream_id(id))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// The FIRST build of a bundle root that has none.
+///
+/// `rebuild` re-captures a bundle and so needs one; with nothing to re-capture
+/// the writer host is run directly over the staging repository, naming every
+/// declared stream the way `rebuild` names them. `--architecture` emits the
+/// architecture lineage beside the decision one, which is what a later `rebuild`
+/// carries forward on its own (it adds the flag back whenever the bundle it
+/// replaces holds a record of another lineage), so the first build and every
+/// build after it list the same streams.
+///
+/// PURE, like [`plan`], and it needs no containment check: the output is
+/// [`Layout::new_build_dir`] and the repository is [`Layout::stage`], both of
+/// them the supplier's own paths under its own root, with no request in sight.
+pub fn first_build_plan(layout: &Layout, stamp: &str, declared: &[String]) -> Plan {
+    let mut argv = vec![
+        layout.script(EMIT_HOST).display().to_string(),
+        "--repository".into(),
+        layout.stage().display().to_string(),
+        "--output".into(),
+        layout.new_build_dir(stamp).display().to_string(),
+        "--architecture".into(),
+    ];
+    for stream in declared.iter().filter(|id| valid_stream_id(id)) {
+        argv.push("--stream".into());
+        argv.push(stream.clone());
+    }
+    Plan {
+        verb: "rebuild".into(),
+        write: None,
+        argv,
+        cwd: layout.gyld_root.clone(),
+        pythonpath: layout.pythonpath(),
+        output_dir: Some(layout.new_build_dir(stamp)),
+        read: None,
+    }
 }
 
 /// `rebuild --bundle <latest> --output <new> [--built ISO]` — the one host call
@@ -592,6 +699,82 @@ mod tests {
             "b1",
         );
         assert!(p.is_ok(), "{p:?}");
+    }
+
+    #[test]
+    fn discovery_asks_the_checkout_rather_than_reimplementing_it() {
+        let p = discover_plan(&layout());
+        assert_eq!(p.argv[0], "-c");
+        assert_eq!(
+            p.argv[2], "/b/stage",
+            "the staging repository is the operand"
+        );
+        assert!(
+            p.argv[1].contains("from scripts.capture_decision_stream import discover"),
+            "the checkout's own discover answers: {}",
+            p.argv[1]
+        );
+        assert!(p.output_dir.is_none() && p.write.is_none() && p.read.is_none());
+        assert_eq!(p.cwd, PathBuf::from("/g"));
+        assert_eq!(p.pythonpath, "/g/src:/g");
+    }
+
+    #[test]
+    fn declared_streams_reads_the_last_json_line_and_drops_a_bad_id() {
+        assert_eq!(
+            declared_streams("[\"fork-a\", \"stream-a\", \"stream-b\"]\n"),
+            vec!["fork-a", "stream-a", "stream-b"]
+        );
+        // A host that says something on the way still answers.
+        assert_eq!(
+            declared_streams("warning: something\n[\"stream-a\"]\n"),
+            vec!["stream-a"]
+        );
+        assert_eq!(declared_streams("[]\n"), Vec::<String>::new());
+        assert_eq!(declared_streams("not json at all\n"), Vec::<String>::new());
+        assert_eq!(declared_streams(""), Vec::<String>::new());
+        // An id that is not an id never reaches an argv, whoever said it.
+        assert_eq!(
+            declared_streams("[\"stream-a\", \"../etc\", \"--force\"]\n"),
+            vec!["stream-a"]
+        );
+    }
+
+    #[test]
+    fn the_first_build_runs_the_writer_host_over_every_declared_stream() {
+        let declared = vec!["fork-a".to_string(), "stream-a".to_string()];
+        let p = first_build_plan(&layout(), "build-1", &declared);
+        assert_eq!(
+            p.argv,
+            vec![
+                "/g/scripts/emit_decision_streams.py",
+                "--repository",
+                "/b/stage",
+                "--output",
+                "/b/builds/build-1",
+                "--architecture",
+                "--stream",
+                "fork-a",
+                "--stream",
+                "stream-a",
+            ],
+            "the first build has no bundle to re-capture, so it runs the writer"
+        );
+        assert_eq!(p.output_dir, Some(PathBuf::from("/b/builds/build-1")));
+        assert!(p.write.is_none() && p.read.is_none());
+
+        // A checkout that declares nothing but the base still builds.
+        let bare = first_build_plan(&layout(), "build-1", &[]);
+        assert_eq!(bare.argv.last().unwrap(), "--architecture");
+    }
+
+    #[test]
+    fn verbs_that_need_a_bundle_all_name_the_same_refusal() {
+        for verb in ["list", "rebuild"] {
+            let body = format!("{{\"verb\":\"{verb}\"}}");
+            let e = plan(&layout(), &request(&body), None, "b1").expect_err("refusal");
+            assert_eq!(e, NO_BUNDLE, "{verb}");
+        }
     }
 
     #[test]

@@ -120,11 +120,13 @@ pub async fn serve_with(config: GyldConfig, runner: Arc<dyn Runner>) -> io::Resu
         },
     );
 
+    let first = Arc::new(FirstBuild::new());
     let handler = make_handler(
         client.clone(),
         config.clone(),
         runner.clone(),
         Handle::current(),
+        first.clone(),
     );
     supplier
         .serve_exchange(
@@ -133,17 +135,25 @@ pub async fn serve_with(config: GyldConfig, runner: Arc<dyn Runner>) -> io::Resu
         )
         .await?;
 
-    // Serving now, so whatever the bundle root already holds can go onto the
-    // value shares. A build made by a previous session of this data directory,
-    // or seeded by hand, is a build a mount should see: without this it sat
-    // there unpublished until somebody pressed Rebuild.
-    if let AtAttach::Publish(dir) = at_attach(&config.layout) {
-        spawn_publish(
-            client.clone(),
-            config.clone(),
-            Handle::current(),
-            dir.clone(),
-        );
+    // Serving NOW, and only then is the bundle root's own state acted on: the
+    // supplier answers throughout, whether it is publishing a build it found or
+    // making the first one.
+    match at_attach(&config.layout) {
+        AtAttach::Publish(dir) => {
+            // A build made by a previous session of this data directory, or
+            // seeded by hand, is a build a mount should see: without this it sat
+            // there unpublished until somebody pressed Rebuild.
+            spawn_publish(client.clone(), config.clone(), Handle::current(), dir);
+        }
+        AtAttach::Bootstrap => {
+            spawn_first_build(
+                client.clone(),
+                config.clone(),
+                runner,
+                Handle::current(),
+                first,
+            );
+        }
     }
 
     Ok(GyldSupplier { client, supplier })
@@ -171,6 +181,53 @@ fn at_attach(layout: &Layout) -> AtAttach {
     }
 }
 
+/// The run id the supplier's own first build takes. Deliberately not `run-N`:
+/// nobody asked for this run, so it is not numbered among the ones that were.
+pub const FIRST_BUILD_RUN_ID: &str = "boot-1";
+
+/// The first build the supplier makes for itself, and whether it is still
+/// running.
+///
+/// While it is, a verb that needs a bundle is refused with a message that names
+/// the run instead of the flat [`verbs::NO_BUNDLE`]: one IS on its way, and a UI
+/// that is told so can wait for it rather than conclude the root is broken.
+#[derive(Debug)]
+struct FirstBuild {
+    run_id: String,
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl FirstBuild {
+    fn new() -> FirstBuild {
+        FirstBuild {
+            run_id: FIRST_BUILD_RUN_ID.to_string(),
+            running: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self) {
+        self.running.store(true, Ordering::SeqCst);
+    }
+
+    /// Landed, or failed: either way it is no longer on its way, and a verb
+    /// that still finds no bundle gets the plain refusal back.
+    fn ended(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Say what the no-bundle refusal really means right now. Every other
+    /// refusal passes through untouched.
+    fn explain(&self, refusal: String) -> String {
+        if refusal == verbs::NO_BUNDLE && self.running.load(Ordering::SeqCst) {
+            return format!(
+                "the first build is in progress (run {}); nothing has landed yet",
+                self.run_id
+            );
+        }
+        refusal
+    }
+}
+
 /// Build the exchange handler. It is a synchronous `Fn` (the kit's contract) and
 /// never returns `Err`, so the WIRE `ExchangeRes.ok` stays `true` and the PAYLOAD
 /// carries success or failure.
@@ -179,22 +236,33 @@ fn make_handler(
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
     handle: Handle,
+    first: Arc<FirstBuild>,
 ) -> impl Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static {
     let runs = Arc::new(AtomicU64::new(0));
     move |req: &ExchangeReq| -> Result<Vec<u8>, String> {
-        let response = answer(&client, &config, &runner, &handle, &runs, &req.payload);
+        let response = answer(
+            &client,
+            &config,
+            &runner,
+            &handle,
+            &runs,
+            &first,
+            &req.payload,
+        );
         Ok(response.to_bytes())
     }
 }
 
 /// Parse, plan, prepare, then run or accept. Every branch resolves to a
 /// [`GyldResponse`].
+#[allow(clippy::too_many_arguments)]
 fn answer(
     client: &GladeClient,
     config: &Arc<GyldConfig>,
     runner: &Arc<dyn Runner>,
     handle: &Handle,
     runs: &Arc<AtomicU64>,
+    first: &Arc<FirstBuild>,
     payload: &[u8],
 ) -> GyldResponse {
     let request = match GyldRequest::parse(payload) {
@@ -217,7 +285,10 @@ fn answer(
     let plan = match verbs::plan(&config.layout, &request, latest.as_deref(), &stamp) {
         Ok(p) => p,
         Err(e) => {
-            return GyldResponse::failed(e, who);
+            // `fork` and `link` need no bundle and are unaffected; the five that
+            // do are told the first build is on its way rather than that there
+            // is none.
+            return GyldResponse::failed(first.explain(e), who);
         }
     };
     let run_id = format!("run-{}", runs.fetch_add(1, Ordering::SeqCst) + 1);
@@ -376,10 +447,7 @@ fn read_bounded(path: &std::path::Path, max: usize) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
-/// Run the plan on a blocking task, appending every output line to the log
-/// surface keyed by `run_id`, then a terminal `{done:true, exit}` record.
-/// Best effort: an append failure (a link drop mid-run) is dropped, because the
-/// exchange answer already carried the run id.
+/// Accept a streaming run and answer at once: [`stream_run`] on its own task.
 fn spawn_stream(
     client: GladeClient,
     config: Arc<GyldConfig>,
@@ -390,59 +458,208 @@ fn spawn_stream(
     who: Option<String>,
 ) {
     let inner = handle.clone();
-    handle.spawn(async move {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(String, String)>();
-        let limits = config.limits;
-        let work = {
-            let runner = runner.clone();
-            tokio::task::spawn_blocking(move || {
-                let result = runner.run(&plan, limits, &mut |stream, line| {
-                    let _ = tx.send((stream.to_string(), line.to_string()));
-                });
-                (plan, result)
-            })
-        };
+    handle.spawn(stream_run(client, config, runner, inner, run_id, plan, who));
+}
 
-        let mut seq: u64 = 0;
-        while let Some((stream, line)) = rx.recv().await {
-            seq += 1;
-            let record = GyldOutputRecord::line(&run_id, seq, &who, &stream, line);
-            append(&client, &config, &run_id, &record).await;
+/// Run the plan on a blocking task, appending every output line to the log
+/// surface keyed by `run_id`, then a terminal `{done:true, exit}` record.
+/// Best effort: an append failure (a link drop mid-run) is dropped, because the
+/// exchange answer already carried the run id.
+///
+/// Resolves when the run has landed and its terminal record is on the log, so a
+/// caller that must know when a build finished — the first build — can await it.
+async fn stream_run(
+    client: GladeClient,
+    config: Arc<GyldConfig>,
+    runner: Arc<dyn Runner>,
+    handle: Handle,
+    run_id: String,
+    plan: Plan,
+    who: Option<String>,
+) {
+    let inner = handle;
+    let (tx, mut rx) = mpsc::unbounded_channel::<(String, String)>();
+    let limits = config.limits;
+    let work = {
+        let runner = runner.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = runner.run(&plan, limits, &mut |stream, line| {
+                let _ = tx.send((stream.to_string(), line.to_string()));
+            });
+            (plan, result)
+        })
+    };
+
+    let mut seq: u64 = 0;
+    while let Some((stream, line)) = rx.recv().await {
+        seq += 1;
+        let record = GyldOutputRecord::line(&run_id, seq, &who, &stream, line);
+        append(&client, &config, &run_id, &record).await;
+    }
+
+    let exit = match work.await {
+        Ok((plan, Ok(out))) => {
+            finish(&client, &config, &inner, &plan, &out);
+            out.exit
         }
+        Ok((_, Err(e))) => {
+            seq += 1;
+            let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", e);
+            append(&client, &config, &run_id, &record).await;
+            -1
+        }
+        Err(e) => {
+            seq += 1;
+            let record = GyldOutputRecord::line(
+                &run_id,
+                seq,
+                &who,
+                "stderr",
+                format!("run task failed: {e}"),
+            );
+            append(&client, &config, &run_id, &record).await;
+            -1
+        }
+    };
+    seq += 1;
+    append(
+        &client,
+        &config,
+        &run_id,
+        &GyldOutputRecord::end(&run_id, seq, &who, exit),
+    )
+    .await;
+}
 
-        let exit = match work.await {
-            Ok((plan, Ok(out))) => {
-                finish(&client, &config, &inner, &plan, &out);
-                out.exit
+/// Lay the bundle root and give it its first build, as a STREAMING run on the
+/// output surface keyed by [`FIRST_BUILD_RUN_ID`] — the same path a `rebuild`
+/// takes, so the build lands, `latest.json` is swapped and the census is
+/// published by the code that already does all three.
+///
+/// The supplier keeps serving throughout: this is a task, and the verbs that
+/// need a bundle are refused meanwhile with a message that names the run
+/// ([`FirstBuild::explain`]). `fork` and `link` are unaffected — they need no
+/// bundle. A first build that fails is failure as DATA on the run and one log
+/// line; the supplier stays up and the root simply still has no build.
+fn spawn_first_build(
+    client: GladeClient,
+    config: Arc<GyldConfig>,
+    runner: Arc<dyn Runner>,
+    handle: Handle,
+    first: Arc<FirstBuild>,
+) {
+    first.begin();
+    let run_id = first.run_id.clone();
+    let who = config.principal.clone();
+    eprintln!(
+        "glade-gyld: first build of {} — the bundle root holds none (run {run_id})",
+        config.layout.bundle_root.display()
+    );
+
+    let inner = handle.clone();
+    handle.spawn(async move {
+        let prepared = {
+            let config = config.clone();
+            let runner = runner.clone();
+            tokio::task::spawn_blocking(move || prepare_first_build(&config, &runner)).await
+        };
+        match prepared {
+            Ok(Ok(plan)) => {
+                stream_run(
+                    client.clone(),
+                    config.clone(),
+                    runner,
+                    inner,
+                    run_id.clone(),
+                    plan,
+                    who.clone(),
+                )
+                .await;
             }
-            Ok((_, Err(e))) => {
-                seq += 1;
-                let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", e);
-                append(&client, &config, &run_id, &record).await;
-                -1
+            Ok(Err(e)) => {
+                fail_first_build(&client, &config, &run_id, &who, e).await;
             }
             Err(e) => {
-                seq += 1;
-                let record = GyldOutputRecord::line(
+                fail_first_build(
+                    &client,
+                    &config,
                     &run_id,
-                    seq,
                     &who,
-                    "stderr",
                     format!("run task failed: {e}"),
-                );
-                append(&client, &config, &run_id, &record).await;
-                -1
+                )
+                .await;
             }
-        };
-        seq += 1;
-        append(
-            &client,
-            &config,
-            &run_id,
-            &GyldOutputRecord::end(&run_id, seq, &who, exit),
-        )
-        .await;
+        }
+        first.ended();
     });
+}
+
+/// Lay the stage, ask the checkout which streams it declares, and plan the first
+/// build. Blocking: it touches the filesystem and runs one short host.
+fn prepare_first_build(config: &GyldConfig, runner: &Arc<dyn Runner>) -> Result<Plan, String> {
+    bundle::ensure_stage(&config.layout).map_err(|e| format!("bundle root unusable: {e}"))?;
+    let declared = declared_streams(config, runner);
+    Ok(verbs::first_build_plan(
+        &config.layout,
+        &bundle::build_stamp(),
+        &declared,
+    ))
+}
+
+/// Which streams the staging repository declares, asked of the Gyld host that
+/// owns the answer. A checkout that cannot answer degrades to the base build
+/// rather than failing the start: a bundle root with a small build in it is
+/// still a bundle root a UI can work from.
+fn declared_streams(config: &GyldConfig, runner: &Arc<dyn Runner>) -> Vec<String> {
+    let plan = verbs::discover_plan(&config.layout);
+    let found = match runner.run(&plan, config.limits, &mut |_, _| {}) {
+        Ok(out) if out.exit == 0 => verbs::declared_streams(&out.stdout),
+        Ok(out) => {
+            eprintln!(
+                "glade-gyld: stream discovery exited {}; the first build takes the base streams \
+                 only",
+                out.exit
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!(
+                "glade-gyld: stream discovery failed ({e}); the first build takes the base \
+                 streams only"
+            );
+            Vec::new()
+        }
+    };
+    eprintln!(
+        "glade-gyld: the checkout declares {}",
+        if found.is_empty() {
+            "no stream but the base".to_string()
+        } else {
+            found.join(", ")
+        }
+    );
+    found
+}
+
+/// A first build that never got as far as a host: the reason goes on the run,
+/// closed by the terminal record, exactly as a failed run's would.
+async fn fail_first_build(
+    client: &GladeClient,
+    config: &GyldConfig,
+    run_id: &str,
+    who: &Option<String>,
+    reason: String,
+) {
+    eprintln!("glade-gyld: first build failed: {reason}");
+    let record = GyldOutputRecord::line(run_id, 1, who, "stderr", reason);
+    append(client, config, run_id, &record).await;
+    append(
+        client,
+        config,
+        run_id,
+        &GyldOutputRecord::end(run_id, 2, who, -1),
+    )
+    .await;
 }
 
 /// Append one output record to the log surface, keyed by run id.
@@ -507,6 +724,29 @@ mod tests {
         bundle::write_latest(&layout, &empty).unwrap();
         assert_eq!(at_attach(&layout), AtAttach::Bootstrap);
         let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
+    fn the_no_bundle_refusal_names_the_first_build_while_it_is_running() {
+        let first = FirstBuild::new();
+        // Before it starts, and after it ends, the plain refusal stands: there
+        // really is no bundle and nothing is coming.
+        assert_eq!(first.explain(verbs::NO_BUNDLE.into()), verbs::NO_BUNDLE);
+
+        first.begin();
+        let said = first.explain(verbs::NO_BUNDLE.into());
+        assert!(
+            said.contains("the first build is in progress") && said.contains("run boot-1"),
+            "{said}"
+        );
+        assert_ne!(said, verbs::NO_BUNDLE);
+
+        // Every other refusal passes through untouched, running or not.
+        let other = "verb `forall` not in the allow-list".to_string();
+        assert_eq!(first.explain(other.clone()), other);
+
+        first.ended();
+        assert_eq!(first.explain(verbs::NO_BUNDLE.into()), verbs::NO_BUNDLE);
     }
 
     #[test]

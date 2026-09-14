@@ -49,11 +49,69 @@ Python 3.13 and the system `python3` is 3.10, on which they fail.
                       successful build.
 ```
 
+The supplier lays all of it. An empty `--bundle-root`, or one that does not
+exist yet, is the ordinary starting state: the supplier lays the tree and gives
+it its first build itself (below), and a root a previous session left behind is
+picked up as it stands.
+
 The staging repository exists because the Gyld capture hosts read every overlay
 module from `<repository>/examples` and `manage_decision_streams.py` writes a
 generated overlay to that same directory. Pointing `--repository` at the staging
 root gives the hosts a writable examples tree that is entirely inside the bundle
 root.
+
+### The first build is the supplier's own
+
+A bundle root with no build in it is a deadlock: `list`, `rebuild`, `answer`,
+`ask` and `diff` all resolve the latest build first, and `fork` and `link` write
+an overlay module rather than a bundle, so nothing a UI can press produces the
+census the stream manager needs. The supplier breaks it itself. **The first
+build is no longer seeded by hand**; nothing outside `glade-gyld` has to lay the
+bundle root or run a host to make a fresh `--data` directory usable.
+
+The moment it is serving, a supplier that finds no build lays the stage
+(`ensure_stage`) and runs the first one as a streaming run on `gyld.output`
+under the run id `boot-1`:
+
+```text
+[gyld] glade-gyld: first build of /…/files/gyld — the bundle root holds none (run boot-1)
+[gyld] glade-gyld: the checkout declares fork-a, stream-a, stream-b
+[gyld] glade-gyld: published builds/build-1789363954989 (5 streams)
+```
+
+Two host invocations and no more. The first asks the CHECKOUT which streams the
+staging repository declares, with the checkout's own
+`capture_decision_stream.discover` — the one line `manage_decision_streams.py
+rebuild` runs before it builds. Nothing is reimplemented here: ask it any other
+way and the first build lists two streams where a Rebuild lists five. The second
+is the build. `rebuild` re-captures an existing bundle and so cannot make the
+first one, so the writer host is run directly:
+
+```sh
+emit_decision_streams.py --repository <bundle-root>/stage \
+  --output <bundle-root>/builds/<stamp> --architecture \
+  --stream fork-a --stream stream-a --stream stream-b
+```
+
+`--architecture` is what a later `rebuild` carries forward on its own, so the
+first build and every build after it list the same streams. Everything after
+the run is the ordinary build path: `latest.json` is swapped and the census is
+published by the same code a `rebuild` uses.
+
+While that run is in flight the supplier **keeps serving**. A verb that needs a
+bundle is refused with the run rather than with a flat denial:
+
+```text
+the first build is in progress (run boot-1); nothing has landed yet
+```
+
+`fork` and `link` work throughout — they never needed a bundle. A first build
+that fails is failure as **data** on run `boot-1` (its reason on the log, closed
+by the usual `{done:true, exit}` marker) plus one log line; the supplier stays
+up, `latest.json` is not written, and the plain `no bundle has been built yet`
+refusal comes back, because at that point one really has not. A checkout that
+cannot answer the discovery question degrades to the base build rather than
+failing the start.
 
 ## Command surface (exchange `gyld.ops`)
 
@@ -219,18 +277,19 @@ lens pointer's `path` names.
 ## Tests
 
 ```sh
-cargo test                              # 38 unit + 8 integration
+cargo test                              # 43 unit + 9 integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 The integration suite spawns the real `glade-node` binary booted with
 `tests/fixtures/gyld-test-app.glade`, under a temp `GLADE_HOME` and `HOME`
-(never the real `~/.glade`). Seven of its eight tests drive a **recording runner
-double**, so the whole verb path is exercised with no interpreter and no Gyld
-checkout in sight — the attach-time publication is checked with a runner that
-panics if it is called at all, because that path runs no host. The eighth runs
-one real subprocess,
+(never the real `~/.glade`). Eight of its nine tests drive a **runner double**,
+so the whole verb path is exercised with no interpreter and no Gyld checkout in
+sight — the attach-time publication is checked with a runner that panics if it
+is called at all, because that path runs no host, and the first build with one
+that answers the discovery run the way a checkout would and then writes a
+bundle. The ninth runs one real subprocess,
 `emit_decision_streams.py --help`, out of a Gyld checkout found at
 `../../gyld-wz/gyld` or at `GLADE_GYLD_TEST_GYLD_ROOT`; it skips loudly when
 that checkout or its interpreter is absent.

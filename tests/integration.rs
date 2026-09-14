@@ -12,7 +12,12 @@
 //!      closed by a `done:true` marker carrying the exit code.
 //!   4. ONE real subprocess: `emit_decision_streams.py --help` out of a Gyld
 //!      checkout, skipped loudly when that checkout or its interpreter is absent.
-//!   5. the `glade-gyld` BINARY attaches, answers, and shuts down on SIGTERM.
+//!   5. the `glade-gyld` BINARY attaches, answers, and shuts down on SIGTERM,
+//!      with a first build that fails staying failure as data under it.
+//!   6. a build ALREADY in the bundle root reaches the value shares when the
+//!      supplier attaches, with no verb issued and no host invoked at all.
+//!   7. a bundle root with NO build gets its first build for itself, keeps
+//!      answering while it runs, and lands its own census.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -703,12 +708,23 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
     let url = format!("ws://127.0.0.1:{port}");
     let (gyld, bundle) = roots(&tmp);
 
+    // `--python` names an interpreter that is not there, so the first build the
+    // binary starts for itself on this fresh root fails at once and on every
+    // machine: the point here is that a FAILED first build is data and the
+    // supplier stays up answering, not what a real Gyld host would have done.
     let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
         .args(["--node", &url, "--gyld-root"])
         .arg(&gyld)
         .arg("--bundle-root")
         .arg(&bundle)
-        .args(["--share", "ws-razel", "--principal", "tester"])
+        .args([
+            "--share",
+            "ws-razel",
+            "--principal",
+            "tester",
+            "--python",
+            "/nonexistent/python3",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -719,8 +735,9 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
 
-    // The binary attached: `list` answers, and with no bundle built yet that
-    // answer is a readable refusal rather than a hang.
+    // The binary attached: `list` answers, and once the failed first build has
+    // ended that answer is the plain refusal again — the supplier never claims a
+    // build is on its way when none is.
     let answered = poll(|| {
         let r = requester.clone();
         async move {
@@ -733,7 +750,7 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
                         serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
                     !resp.ok
                         && resp.attributed_to.as_deref() == Some("tester")
-                        && resp.error.as_deref().unwrap_or("").contains("no bundle")
+                        && resp.error.as_deref() == Some(glade_gyld::NO_BUNDLE)
                 }
                 _ => false,
             }
@@ -741,6 +758,10 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
     })
     .await;
     assert!(answered, "the glade-gyld binary attached and answered");
+    assert!(
+        !bundle.join("latest.json").exists(),
+        "a failed first build advertises nothing"
+    );
 
     // It laid out its app-owned bundle root on the way, and touched nothing else.
     assert!(bundle.join("overlays").is_dir(), "the overlays tree exists");
@@ -1008,5 +1029,221 @@ async fn a_build_already_in_the_bundle_root_is_published_when_the_supplier_attac
     assert_eq!(builds, vec![seeded], "the build was reused, never rebuilt");
 
     sub.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 9. a bundle root with NO build gets its first build at attach ---------
+
+/// A runner that plays both halves of the bootstrap: it answers the discovery
+/// run with the ids a Gyld checkout would print, and writes a whole bundle for
+/// the build itself. `gate`, when it is there, holds the BUILD closed (never
+/// the discovery) so the test can see the supplier answering mid-flight.
+struct Bootstrapper {
+    plans: Mutex<Vec<Plan>>,
+    gate: Option<Arc<Barrier>>,
+}
+
+impl Runner for Bootstrapper {
+    fn run(
+        &self,
+        plan: &Plan,
+        _limits: Limits,
+        on_line: &mut dyn FnMut(&str, &str),
+    ) -> Result<RunOutput, String> {
+        self.plans.lock().unwrap().push(plan.clone());
+        let dir = match plan.output_dir.clone() {
+            Some(d) => d,
+            None => {
+                // The discovery run: the checkout's own answer, on stdout.
+                return Ok(RunOutput {
+                    exit: 0,
+                    stdout: "[\"fork-a\", \"stream-a\", \"stream-b\"]\n".into(),
+                    stderr: String::new(),
+                    truncated: false,
+                });
+            }
+        };
+        if let Some(gate) = self.gate.as_ref() {
+            gate.wait();
+        }
+        on_line("stdout", "capturing base");
+        let lenses = dir.join("streams/base/lenses");
+        std::fs::create_dir_all(&lenses).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("streams.json"),
+            br#"{"format":"gyld.streams.v1","streams":[{"id":"base"},{"id":"architecture"},{"id":"fork-a"},{"id":"stream-a"},{"id":"stream-b"}]}"#,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("streams/base/stream.json"), br#"{"id":"base"}"#)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(lenses.join("decisions.lens.json"), b"abc").map_err(|e| e.to_string())?;
+        Ok(RunOutput {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
+    let tmp = Tmp::new("bootstrap");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    // No seed at all: this is a fresh data directory.
+    assert!(!bundle.join("latest.json").exists());
+
+    let gate = Arc::new(Barrier::new(2));
+    let runner = Arc::new(Bootstrapper {
+        plans: Mutex::new(Vec::new()),
+        gate: Some(gate.clone()),
+    });
+    let _sup = serve_with(
+        config_for(&url, gyld.clone(), bundle.clone()),
+        runner.clone(),
+    )
+    .await
+    .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+
+    // The supplier keeps SERVING while it builds, and a verb that needs a
+    // bundle is told the first build is on its way rather than that there is
+    // none. `fork` needs no bundle and is accepted throughout.
+    let refused = poll(|| {
+        let r = requester.clone();
+        async move {
+            match r
+                .exchange("ws-razel", "gyld.ops", br#"{"verb":"list"}"#.to_vec())
+                .await
+            {
+                Ok(o) if o.ok => {
+                    let resp: GyldResponse =
+                        serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    !resp.ok
+                        && resp
+                            .error
+                            .as_deref()
+                            .unwrap_or("")
+                            .contains("the first build is in progress (run boot-1)")
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        refused,
+        "the refusal names the run in flight, not `no bundle has been built yet`"
+    );
+
+    let forked = request(
+        &requester,
+        r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#,
+    )
+    .await;
+    assert!(
+        forked.ok,
+        "fork needs no bundle and still works: {forked:?}"
+    );
+
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.streams", None)
+        .await
+        .unwrap();
+
+    gate.wait(); // let the first build finish
+
+    let s = sub.clone();
+    let landed = poll(|| {
+        let s = s.clone();
+        async move {
+            s.fold_value("ws-razel", "gyld.streams", None)
+                .await
+                .is_some()
+        }
+    })
+    .await;
+    assert!(landed, "the first build published its own census");
+
+    let listing = sub
+        .fold_value("ws-razel", "gyld.streams", None)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listing).contains("\"stream-b\""),
+        "the census is the first build's whole listing"
+    );
+
+    // The bundle root is a bundle root now: a stage, a build and the pointer.
+    assert!(bundle.join("stage/examples").exists());
+    let pointed = std::fs::read_to_string(bundle.join("latest.json")).expect("latest.json");
+    assert!(pointed.contains("builds/build-"), "{pointed}");
+
+    // The bootstrap is two host invocations and no more: ask the checkout which
+    // streams it declares, then build exactly what it said. (The `fork` above is
+    // the third plan the runner saw; it is the test's, not the bootstrap's.)
+    let plans = runner.plans.lock().unwrap().clone();
+    let emit = gyld
+        .join("scripts/emit_decision_streams.py")
+        .display()
+        .to_string();
+    let asked = plans.iter().position(|p| p.argv[0] == "-c");
+    let built = plans.iter().position(|p| p.argv[0] == emit);
+    assert!(
+        asked == Some(0) && built.is_some() && asked < built,
+        "the checkout is asked with its own discover, and only then built: {plans:?}"
+    );
+    assert_eq!(
+        plans.iter().filter(|p| p.argv[0] == emit).count(),
+        1,
+        "one first build, never two"
+    );
+    let build = &plans[built.unwrap()];
+    assert_eq!(
+        build.argv,
+        vec![
+            emit,
+            "--repository".into(),
+            bundle.join("stage").display().to_string(),
+            "--output".into(),
+            build.output_dir.clone().unwrap().display().to_string(),
+            "--architecture".into(),
+            "--stream".into(),
+            "fork-a".into(),
+            "--stream".into(),
+            "stream-a".into(),
+            "--stream".into(),
+            "stream-b".into(),
+        ],
+        "every declared stream reached the writer host"
+    );
+
+    // And now that a build exists, `list` is accepted with no Rebuild pressed.
+    let listed = poll(|| {
+        let r = requester.clone();
+        async move {
+            match r
+                .exchange("ws-razel", "gyld.ops", br#"{"verb":"list"}"#.to_vec())
+                .await
+            {
+                Ok(o) if o.ok => {
+                    let resp: GyldResponse =
+                        serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    resp.ok && resp.stdout.contains("gyld.streams.v1")
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+    assert!(listed, "`list` is accepted the first time it is pressed");
+
+    sub.close().await;
+    requester.close().await;
     node.kill().await.ok();
 }

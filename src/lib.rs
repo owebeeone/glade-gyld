@@ -25,7 +25,9 @@
 //!   invocation, or a refusal, with no filesystem effect.
 //! * [`exec`] — the bounded runner (wall clock and output bytes).
 //! * [`publish`] — what a successful build puts on the value surfaces.
-//! * [`supplier`] — [`serve`], [`GyldConfig`], [`GyldSupplier`]: attach and serve.
+//! * [`supplier`] — [`serve`], [`GyldConfig`], [`GyldSupplier`]: attach and serve,
+//!   publishing the bundle root's current build the moment it is serving and
+//!   making the first build itself when the root has none.
 
 pub mod bundle;
 pub mod envelope;
@@ -42,6 +44,6 @@ pub use exec::{
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID,
-    DEFAULT_PYTHON, DEFAULT_SHARE,
+    DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_ID,
 };
-pub use verbs::{Plan, PlannedWrite, ALLOWED_VERBS};
+pub use verbs::{Plan, PlannedWrite, ALLOWED_VERBS, NO_BUNDLE};

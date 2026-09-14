@@ -141,8 +141,9 @@ the run.
 
 ## Results (value surfaces `gyld.streams`, `gyld.stream`, `gyld.decisions`, `gyld.lens`)
 
-After a successful build the supplier appends the bundle's documents to value
-surfaces, so every mount in the UI converges without a second round trip:
+After a successful build **and once more when the supplier attaches**, the
+supplier appends the current bundle's documents to value surfaces, so every
+mount in the UI converges without a second round trip:
 
 | surface | key | value |
 | --- | --- | --- |
@@ -171,6 +172,35 @@ Publication happens off the exchange's own thread — the answer already carried
 the build directory — and a publication failure is logged, never fatal: a build
 that succeeded stays a build that succeeded.
 
+### At attach, not only after a build
+
+The moment the supplier is serving it reads the bundle root and publishes the
+build already there, reusing the one publication path rather than rebuilding
+anything. A build a previous session of the same data directory left behind, or
+one seeded by hand, is a build a mount should see; before this it sat there
+unpublished and a glade root said `nothing has landed on gyld.streams for
+streams.json` until somebody pressed Rebuild, even though `latest.json` named a
+perfectly good build. Which build that is, is the same question every verb
+asks: `latest.json` first, and failing that the newest `builds/` directory
+holding a `streams.json`.
+
+Every publication — after a build, at attach, and after the first build the
+supplier makes for itself — logs one line:
+
+```text
+[gyld] glade-gyld: published builds/build-1789341052425 (5 streams)
+```
+
+The count is what the build's `streams.json` LISTS, which is the census figure
+the stream manager shows. Publishing is idempotent **in the value**, not in the
+op log: [`publications`] is a pure function of the build directory, so a second
+publication of the same build appends the same bytes and every consumer folds to
+exactly the value it already had. The node dedups by `(origin, seq)` and folds
+`value` last-writer-wins by `(lamport, origin)` — never by content — so those
+appends are new ops on the writer's chain. Re-attaching over the same build
+therefore costs one op per document once per attach, and changes no value
+anybody reads.
+
 ## Declarations and grazel
 
 The surfaces and the `gyld.ops` service are declared in a **separate**
@@ -189,16 +219,18 @@ lens pointer's `path` names.
 ## Tests
 
 ```sh
-cargo test                              # 36 unit + 7 integration
+cargo test                              # 38 unit + 8 integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 The integration suite spawns the real `glade-node` binary booted with
 `tests/fixtures/gyld-test-app.glade`, under a temp `GLADE_HOME` and `HOME`
-(never the real `~/.glade`). Six of its seven tests drive a **recording runner
+(never the real `~/.glade`). Seven of its eight tests drive a **recording runner
 double**, so the whole verb path is exercised with no interpreter and no Gyld
-checkout in sight. The seventh runs one real subprocess,
+checkout in sight — the attach-time publication is checked with a runner that
+panics if it is called at all, because that path runs no host. The eighth runs
+one real subprocess,
 `emit_decision_streams.py --help`, out of a Gyld checkout found at
 `../../gyld-wz/gyld` or at `GLADE_GYLD_TEST_GYLD_ROOT`; it skips loudly when
 that checkout or its interpreter is absent.

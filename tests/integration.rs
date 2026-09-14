@@ -155,6 +155,33 @@ fn seed_bundle(bundle_root: &Path) -> PathBuf {
     dir
 }
 
+/// Seed a WHOLE bundle — a listing, a stream's two documents and one lens —
+/// plus the `latest.json` that names it, so the bundle root looks exactly like
+/// one a previous session (or a hand seed) left behind. Returns its directory.
+fn seed_whole_bundle(bundle_root: &Path) -> PathBuf {
+    let dir = bundle_root.join("builds/build-0000000000009");
+    let lenses = dir.join("streams/base/lenses");
+    std::fs::create_dir_all(&lenses).unwrap();
+    std::fs::write(
+        dir.join("streams.json"),
+        br#"{"format":"gyld.streams.v1","streams":[{"id":"base"},{"id":"stream-a"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("streams/base/stream.json"), br#"{"id":"base"}"#).unwrap();
+    std::fs::write(
+        dir.join("streams/base/decide-now.json"),
+        br#"{"format":"gyld.decide-now.v1","questions":[]}"#,
+    )
+    .unwrap();
+    std::fs::write(lenses.join("decisions.lens.json"), b"abc").unwrap();
+    std::fs::write(
+        bundle_root.join("latest.json"),
+        br#"{"output_dir":"builds/build-0000000000009"}"#,
+    )
+    .unwrap();
+    dir
+}
+
 fn config_for(url: &str, gyld: PathBuf, bundle: PathBuf) -> GyldConfig {
     let mut c = GyldConfig::new(url, gyld, bundle);
     c.principal = Some("gianni".into());
@@ -881,5 +908,105 @@ async fn a_successful_build_publishes_the_bundle_onto_the_value_surfaces() {
 
     sub.close().await;
     requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 8. the build already in the bundle root is published at ATTACH --------
+
+/// A runner that refuses to run: the point of this test is that NO verb is
+/// issued and no host is invoked, and the census still lands.
+struct NeverRuns;
+
+impl Runner for NeverRuns {
+    fn run(
+        &self,
+        _plan: &Plan,
+        _limits: Limits,
+        _on_line: &mut dyn FnMut(&str, &str),
+    ) -> Result<RunOutput, String> {
+        panic!("the attach-time publication runs no host");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_already_in_the_bundle_root_is_published_when_the_supplier_attaches() {
+    let tmp = Tmp::new("attach-publish");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let seeded = seed_whole_bundle(&bundle);
+
+    let _sup = serve_with(config_for(&url, gyld, bundle.clone()), Arc::new(NeverRuns))
+        .await
+        .unwrap();
+
+    // The subscriber arrives AFTER the supplier attached, which is the case
+    // that was broken: a page opened on a running composition, no Rebuild
+    // pressed, nothing on `gyld.streams` for streams.json.
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    for (id, key) in [
+        ("gyld.streams", None),
+        ("gyld.stream", Some("base")),
+        ("gyld.decisions", Some("base")),
+        ("gyld.lens", Some("base/decisions")),
+    ] {
+        sub.subscribe("ws-razel", id, key.map(str::as_bytes))
+            .await
+            .unwrap();
+    }
+
+    let s = sub.clone();
+    let landed = poll(|| {
+        let s = s.clone();
+        async move {
+            s.fold_value("ws-razel", "gyld.streams", None)
+                .await
+                .is_some()
+        }
+    })
+    .await;
+    assert!(landed, "the census landed with no verb issued at all");
+
+    let listing = sub
+        .fold_value("ws-razel", "gyld.streams", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        listing,
+        std::fs::read(seeded.join("streams.json")).unwrap(),
+        "the bytes on the share are the build's own streams.json"
+    );
+
+    let stream = sub
+        .fold_value("ws-razel", "gyld.stream", Some(b"base"))
+        .await
+        .expect("stream.json");
+    assert_eq!(String::from_utf8_lossy(&stream), r#"{"id":"base"}"#);
+    assert!(sub
+        .fold_value("ws-razel", "gyld.decisions", Some(b"base"))
+        .await
+        .is_some());
+
+    let pointer = sub
+        .fold_value("ws-razel", "gyld.lens", Some(b"base/decisions"))
+        .await
+        .expect("a lens pointer");
+    let pointer: glade_gyld::FilePointer = serde_json::from_slice(&pointer).unwrap();
+    assert_eq!(
+        pointer.path,
+        "/gyld/builds/build-0000000000009/streams/base/lenses/decisions.lens.json"
+    );
+
+    // The build it found is the build it published: nothing was rebuilt, and
+    // no second directory appeared.
+    let builds: Vec<_> = std::fs::read_dir(bundle.join("builds"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(builds, vec![seeded], "the build was reused, never rebuilt");
+
+    sub.close().await;
     node.kill().await.ok();
 }

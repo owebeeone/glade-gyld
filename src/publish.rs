@@ -73,6 +73,11 @@ pub struct Publication {
 pub struct Plan {
     pub publications: Vec<Publication>,
     pub notes: Vec<String>,
+    /// How many streams the build's listing named — the census figure, which is
+    /// what the supplier's `published …` log line reports. It counts the
+    /// LISTING, not the documents found for it: a stream the bundle lists but
+    /// holds no directory for is still a stream the census shows.
+    pub streams: usize,
 }
 
 /// Read an emitted bundle and decide everything to publish for it.
@@ -91,6 +96,7 @@ pub fn publications(layout: &Layout, output_dir: &Path, surfaces: &Surfaces) -> 
         }
     };
     let ids = stream_ids(&bytes);
+    plan.streams = ids.len();
     plan.publications.push(Publication {
         glade_id: surfaces.streams_id.clone(),
         key: None,
@@ -243,6 +249,10 @@ mod tests {
             ],
             "a stream the bundle lists but has no directory for publishes nothing"
         );
+        assert_eq!(
+            plan.streams, 2,
+            "the census figure is what the LISTING names, directory or not"
+        );
         let _ = std::fs::remove_dir_all(layout.bundle_root);
     }
 
@@ -305,6 +315,7 @@ mod tests {
         let layout = Layout::new(root.join("gyld"), root.clone());
         let plan = publications(&layout, &root.join("builds/gone"), &Surfaces::default());
         assert!(plan.publications.is_empty());
+        assert_eq!(plan.streams, 0, "no listing, no census figure");
         assert!(
             plan.notes.len() == 1 && plan.notes[0].contains("cannot read"),
             "{:?}",

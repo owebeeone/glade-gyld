@@ -120,7 +120,12 @@ pub async fn serve_with(config: GyldConfig, runner: Arc<dyn Runner>) -> io::Resu
         },
     );
 
-    let handler = make_handler(client.clone(), config.clone(), runner, Handle::current());
+    let handler = make_handler(
+        client.clone(),
+        config.clone(),
+        runner.clone(),
+        Handle::current(),
+    );
     supplier
         .serve_exchange(
             SupplierSurface::new(&config.share, &config.glade_id, "exchange"),
@@ -128,7 +133,42 @@ pub async fn serve_with(config: GyldConfig, runner: Arc<dyn Runner>) -> io::Resu
         )
         .await?;
 
+    // Serving now, so whatever the bundle root already holds can go onto the
+    // value shares. A build made by a previous session of this data directory,
+    // or seeded by hand, is a build a mount should see: without this it sat
+    // there unpublished until somebody pressed Rebuild.
+    if let AtAttach::Publish(dir) = at_attach(&config.layout) {
+        spawn_publish(
+            client.clone(),
+            config.clone(),
+            Handle::current(),
+            dir.clone(),
+        );
+    }
+
     Ok(GyldSupplier { client, supplier })
+}
+
+/// What the supplier does with the bundle root it finds when it starts serving.
+/// A pure reading of the root: no request has been answered yet, and nothing
+/// here writes.
+#[derive(Debug, Clone, PartialEq)]
+enum AtAttach {
+    /// A build is already there — publish it onto the value shares.
+    Publish(PathBuf),
+    /// The root holds no build at all.
+    Bootstrap,
+}
+
+/// Read the bundle root and decide. [`bundle::latest_build`] is the supplier's
+/// own authority for "which build is current": `latest.json` first, and failing
+/// that the newest `builds/` directory holding a `streams.json`, so a
+/// hand-seeded root with no pointer is still a root with a build.
+fn at_attach(layout: &Layout) -> AtAttach {
+    match bundle::latest_build(layout) {
+        Some(dir) => AtAttach::Publish(dir),
+        None => AtAttach::Bootstrap,
+    }
 }
 
 /// Build the exchange handler. It is a synchronous `Fn` (the kit's contract) and
@@ -266,6 +306,10 @@ fn finish(
 /// Publish the build's documents onto the value surfaces (step 4.2), off the
 /// exchange's own thread: the answer already carried the build directory, and a
 /// mount converges when the ops land.
+///
+/// The ONE publication path. A build the supplier just ran, a build it found in
+/// the bundle root when it attached and the first build it made for itself all
+/// arrive here, so all three land the same documents and log the same line.
 fn spawn_publish(
     client: GladeClient,
     config: Arc<GyldConfig>,
@@ -295,7 +339,26 @@ fn spawn_publish(
                 );
             }
         }
+        if !plan.publications.is_empty() {
+            eprintln!(
+                "glade-gyld: published {} ({} streams)",
+                named(&config.layout, &output_dir),
+                plan.streams
+            );
+        }
     });
+}
+
+/// A build directory as the bundle root names it — `builds/<stamp>` — which is
+/// what `latest.json` records and what the static path serves it under. The
+/// absolute path is the fallback for a directory that is somehow not under the
+/// root, so a log line never silently drops where it was.
+fn named(layout: &Layout, output_dir: &std::path::Path) -> String {
+    output_dir
+        .strip_prefix(&layout.bundle_root)
+        .unwrap_or(output_dir)
+        .display()
+        .to_string()
 }
 
 /// Read a bundle document, bounded. A document larger than the budget is a
@@ -404,6 +467,47 @@ async fn append(
 mod tests {
     use super::*;
     use crate::envelope::GyldRequest;
+
+    /// A bundle root of its own, removed by the caller.
+    fn root(tag: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("glade-gyld-attach-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_bundle_root_that_already_holds_a_build_is_published_at_attach() {
+        let bundle = root("has-build");
+        let layout = Layout::new(bundle.join("gyld"), bundle.clone());
+        let build = layout.new_build_dir("build-0000000000001");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("streams.json"), "{}").unwrap();
+
+        // No pointer yet — the hand-seeded case. The build is still the build.
+        assert_eq!(at_attach(&layout), AtAttach::Publish(build.clone()));
+
+        bundle::write_latest(&layout, &build).unwrap();
+        assert_eq!(at_attach(&layout), AtAttach::Publish(build.clone()));
+        assert_eq!(named(&layout, &build), "builds/build-0000000000001");
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
+    fn a_bundle_root_with_no_build_is_bootstrapped() {
+        let bundle = root("no-build");
+        let layout = Layout::new(bundle.join("gyld"), bundle.clone());
+        assert_eq!(at_attach(&layout), AtAttach::Bootstrap);
+
+        // A build directory with no `streams.json` in it is not a build: the
+        // pointer names it, and it is still nothing to publish.
+        let empty = layout.new_build_dir("build-0000000000002");
+        std::fs::create_dir_all(&empty).unwrap();
+        bundle::write_latest(&layout, &empty).unwrap();
+        assert_eq!(at_attach(&layout), AtAttach::Bootstrap);
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
 
     #[test]
     fn a_planned_write_refuses_to_clobber_unless_forced() {

@@ -32,6 +32,7 @@ glade-gyld --node ws://127.0.0.1:9099 \
   [--principal gianni] [--python /opt/homebrew/bin/python3.13] \
   [--timeout-secs 600] [--max-output-bytes 1048576] \
   [--agent-model claude-opus-5] [--agent-key-file FILE] \
+  [--agent-base-url https://api.anthropic.com] [--agent-compat anthropic|ollama] \
   [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]
 ```
 
@@ -214,7 +215,7 @@ The planner validates it and refuses as data, before anything starts:
 | refusal | what it says |
 | --- | --- |
 | a bad envelope | the field and what is wrong with it, never a flat `bad envelope` |
-| no model key | set `ANTHROPIC_API_KEY` in the supplier's environment, or write the key file |
+| no model key | set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the supplier's environment, or write the key file |
 | no source index | the build's missing `sources.json`, and the `--sources-root` flag that emits one |
 | a stream the build does not list | the stream it named and the streams there are |
 
@@ -224,11 +225,130 @@ once per request and handed to the pure planner as data. A key VALUE is read by
 the model client at the moment of the call and by nothing else — it never
 reaches a plan, a prompt, a record, a log line or the browser.
 
-The key is `ANTHROPIC_API_KEY` in the supplier's environment, else the file
-`--agent-key-file` names, else `<bundle-root>/agent/api-key`. A key file any
-other account on the machine can read is **refused rather than used** — `chmod
-600` it — because a supplier that quietly accepts one teaches everybody that it
-is fine.
+The key is `ANTHROPIC_API_KEY` in the supplier's environment, else
+`ANTHROPIC_AUTH_TOKEN`, else the file `--agent-key-file` names, else
+`<bundle-root>/agent/api-key`. The second variable is there because it is what
+Claude-shaped clients and the dabeest launchers already export, and a local
+endpoint's token is a dummy value that must nonetheless be present. A key file
+any other account on the machine can read is **refused rather than used** —
+`chmod 600` it — because a supplier that quietly accepts one teaches everybody
+that it is fine.
+
+### Configuration, for a supplier nobody can pass a flag to
+
+grazel composes this binary's argv itself (`grazel/src/lib.rs`,
+`gyld_supplier_argv`) and passes **none** of the `--agent-*` flags, and the
+owner starts grazel through `gryth-ui/gyld-ui.py`. So the flags are the one
+channel that cannot reach a running desk. Two that can, in increasing
+authority:
+
+1. **`<bundle-root>/agent/config.json`** — beside the key file, in the one
+   directory the app already owns. Read at attach and again at **every call**,
+   so a model changed there takes effect on the next question rather than on
+   the next restart. Every field is optional:
+
+   ```json
+   {
+     "base_url": "http://127.0.0.1:11434",
+     "model": "qwen3.8-96k",
+     "compat": "ollama",
+     "max_tokens": 32768,
+     "max_input_tokens": 65536,
+     "max_conversation_tokens": 1000000,
+     "timeout_secs": 300,
+     "key_file": "agent/api-key",
+     "strict": true,
+     "cache_control": true,
+     "count_tokens": false
+   }
+   ```
+
+   `max_tokens` is the request's own output budget; `key_file` is resolved
+   against the bundle root unless it is absolute; `strict`, `cache_control` and
+   `count_tokens` start the profile degraded instead of letting it discover the
+   refusal. A file that does not decode, or that names a setting nobody has
+   heard of, is a **note on the run** and not a refusal — the desk still has an
+   environment and a set of defaults, and a supplier that refused to attach over
+   a stray comma would take the whole app down.
+
+2. **The environment**: `ANTHROPIC_BASE_URL`, `GYLD_AGENT_MODEL`,
+   `GYLD_AGENT_COMPAT`, and the two key variables. The model variable is ours
+   rather than `ANTHROPIC_MODEL`, which is Claude Code's own and would otherwise
+   be inherited by accident on any desk that has it set for a different client.
+   A blank variable is treated as unset.
+
+3. **The flags**, for a supplier somebody can pass flags to.
+
+A field nobody set is not a field: the flags are collected as options, so an
+unpassed flag's default cannot overrule a file. The defaults are applied last,
+because they depend on the profile, which depends on the base URL. The
+effective endpoint, model and profile are logged once at attach — never the key,
+and never whether there is one:
+
+```text
+[gyld] glade-gyld: agent base-url http://127.0.0.1:11434 model qwen3.8-96k
+       compat ollama (max_tokens 32768, max input 65536)
+```
+
+### The compatibility profile
+
+`compat` is not a vendor list. It is the answer to "what may I assume is
+there?", and everything it decides is a STARTING assumption the client then
+corrects from what the endpoint actually says.
+
+| | `anthropic` (default) | `ollama` |
+| --- | --- | --- |
+| when | the base URL's host is `anthropic.com` or under it | any other host |
+| `count_tokens` | `POST /v1/messages/count_tokens` before the call | there is none: the budget is ESTIMATED |
+| auth | `x-api-key` | `x-api-key` **and** `Authorization: Bearer` |
+| `strict` on the draft tool | sent | sent, then dropped if rejected |
+| `cache_control` | sent | sent, then dropped if rejected |
+| default `max_tokens` | 64000 | **32768** |
+| default `max_input_tokens` | 200000 | **65536** |
+
+The profile is auto-detected from the base URL and naming it always wins, so a
+desk is pointed at a local endpoint with one variable and no config file at
+all. **The Anthropic path is unchanged, header for header.**
+
+The two local defaults come from the dabeest client guide, not from memory.
+These are thinking models and thought tokens count against `max_tokens`, so a
+small cap returns empty content with the answer never emitted; the guide's own
+launchers export 32768 and warn against going below 32000. `qwen3.8-96k` has a
+96K window (98,304 tokens) and the output budget has to fit inside it beside the
+input, which leaves 65,536 — a budget larger than the window is not a budget,
+because Ollama would silently truncate instead.
+
+Everything else is **discovered**. A 400 is retried in a smaller shape —
+`strict` dropped first, then `cache_control`, then the 400 is the answer — at
+most two degradations, so a request the endpoint simply dislikes cannot be
+retried at forever. A message naming the field goes straight to that rung. The
+transcript, the schema and the prompt are untouched by a drop; only the feature
+goes. What is learned is remembered for the turns after it, and dropped with
+the base URL it was learned for.
+
+**No fallback is silent.** Each one — the estimate, each drop, and a config file
+that did not decode — is a `note` record on the ask surface, appended before the
+answer it weakened, so a reader looking at a weaker answer can see what weakened
+it in the same place as the answer.
+
+### Against dabeest, the owner's local server
+
+`gollama-wz/gollama/dev-docs/DABEEST-CLIENT.md` is the whole story; what this
+supplier needs is three things:
+
+1. The SSH tunnel up — `dabeest-tunnel up`, which is idempotent.
+   `curl -s http://127.0.0.1:11434/api/version` answers `0.33.0-dabeest`.
+2. `agent/config.json` with `base_url: "http://127.0.0.1:11434"` and
+   `model: "qwen3.8-96k"` — the daily driver, 96K context, best quality. The
+   `ollama` profile is detected from the base URL; naming it is optional.
+3. `agent/api-key` containing `ollama`, mode `600`. The value is ignored by the
+   server and must be present all the same.
+
+Observed there: `count_tokens` 404s, as the guide says, so every turn's budget
+is an estimate and says so. `strict` on the draft tool and both `cache_control`
+breakpoints are ACCEPTED — that endpoint needs neither degradation — and the
+draft tool is called and validates, so an offer comes back from a local model
+exactly as it does from Anthropic's.
 
 ### Grounding: the build's own source index
 
@@ -270,8 +390,9 @@ propose and draft, but you never rule and never submit.
 
 There is no official Anthropic SDK for Rust, so the call is raw HTTPS: `POST
 /v1/messages` with `x-api-key` and `anthropic-version`, `"stream": true`, and
-the SSE events folded into text chunks as they arrive. `--agent-model` defaults
-to **`claude-opus-5`**, taken from the `claude-api` skill's model table rather
+the SSE events folded into text chunks as they arrive. The same request goes to
+a non-Anthropic endpoint under a compatibility profile — see *The compatibility
+profile* above. The model defaults to **`claude-opus-5`**, taken from the `claude-api` skill's model table rather
 than from this file's memory. Thinking is not configured: on this model family
 it is on and adaptive by default, and its display stays at the default, so no
 reasoning text can reach a log record.
@@ -284,7 +405,10 @@ Both bounds are **refusal boundaries, not hopes**:
 
 - `--agent-max-input-tokens` is checked with `POST /v1/messages/count_tokens`
   BEFORE the call, so an over-budget turn is refused with both numbers and costs
-  nothing.
+  nothing. Where the endpoint has no `count_tokens`, the budget is still
+  CHECKED — against an estimate of the body about to be sent, deliberately
+  pessimistic at three characters a token, and the run says it was an estimate
+  (see *The compatibility profile*).
 - `--agent-max-output-tokens` is the request's `max_tokens`. A turn that stops
   there keeps its partial text and **says it is partial**: half an answer that
   says so is data; half an answer presented as a whole one is not.
@@ -363,6 +487,7 @@ run id instead would need one mount per question asked.
 | `question` | `line`: the question, as the reader typed it | the turn's opening, appended before anything is asked of a model |
 | `citation` | `record`: the resolved source, whole | one cited passage with its tag, document, heading, lines and digest — or `resolved: false` with the reason |
 | `answer` | `line`: one text chunk | the prose, as the model streams it |
+| `note` | `line`: one thing the call had to do differently | a compatibility fallback — an estimated budget, a dropped `strict`, a config file that did not decode — said beside the answer it weakened |
 | `draft` | `record`: the offer, with `drafted_by` | an alternative and a one-sentence ruling a human may take |
 | `end` | `done: true`, `exit`, and a `line` on anything but a clean end | the turn's close |
 
@@ -557,7 +682,7 @@ lens pointer's `path` names.
 ## Tests
 
 ```sh
-cargo test                              # 91 unit + 18 integration
+cargo test                              # 106 unit + 25 integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -573,3 +698,10 @@ bundle. One test runs one real subprocess,
 `emit_decision_streams.py --help`, out of a Gyld checkout found at
 `../../gyld-wz/gyld` or at `GLADE_GYLD_TEST_GYLD_ROOT`; it skips loudly when
 that checkout or its interpreter is absent.
+
+The compatibility profile is tested against a **scripted endpoint** rather than
+a model-client double: one thread on loopback, one canned answer per request,
+and every request kept whole, with no dependency added. Headers, statuses and
+retries are exactly what a client double cannot say anything about, so the
+bearer header, the 404 on `count_tokens`, the 400 on `strict` and the 400 on
+`cache_control` are asserted on the bytes that actually went over a socket.

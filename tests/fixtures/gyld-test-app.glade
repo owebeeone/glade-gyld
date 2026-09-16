@@ -14,6 +14,9 @@ service gyld gyld.ops
 # the long-op output surface: appended ops fold + replicate to subscribers.
 binding gyld.output log share commons from-cursor
 
+# the ask agent's reply surface, keyed by CONVERSATION rather than by run id.
+binding gyld.ask log share commons from-cursor
+
 # the result surfaces a successful build publishes onto (step 4.2).
 binding gyld.streams   value share commons latest
 binding gyld.stream    value share commons latest

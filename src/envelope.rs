@@ -10,6 +10,12 @@
 //! * [`GyldOutputRecord`] rides each LOG op appended to the output surface for
 //!   a streaming run — `{run_id, seq, principal?, stream, line?, done?, exit?}`,
 //!   the `gwz.output` record shape exactly.
+//! * [`GyldAskRecord`] rides each LOG op appended to the ASK surface for a
+//!   consultation — the same field set plus two: the `conversation` it belongs
+//!   to, which is the surface's KEY, and the `record` a citation carries. A
+//!   consumer that has never heard of `citation` shows nothing for it, which is
+//!   the rule the plugin already follows: absent records are absent lines,
+//!   never blank ones.
 //!
 //! Failure is DATA: a bad envelope, a refused verb, a stream id that is not a
 //! stream id, a path that leaves the bundle root, a spawn error, a timeout, or
@@ -223,6 +229,109 @@ impl GyldOutputRecord {
     }
 }
 
+/// One appended record on the ASK surface for a consultation
+/// (GyldAskAgent.md section 4, "The reply").
+///
+/// The [`GyldOutputRecord`] field set, plus `conversation` and `record`. Keyed
+/// by the CONVERSATION and not by the run: that is what makes a conversation
+/// one fold, one mount and one key, while each turn keeps its own `run_id` on
+/// every record for the audit trail and closes with its own `end`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GyldAskRecord {
+    pub run_id: String,
+    pub seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub principal: Option<String>,
+    /// The conversation this turn belongs to, and the surface's key.
+    pub conversation: String,
+    /// `"answer" | "citation" | "end"`.
+    pub stream: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<String>,
+    /// A `citation`'s resolved source, as the index emitted it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub record: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub done: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exit: Option<i32>,
+}
+
+/// The three record streams a consultation emits. `draft` is phase 3.
+pub const ASK_ANSWER: &str = "answer";
+pub const ASK_CITATION: &str = "citation";
+pub const ASK_END: &str = "end";
+
+impl GyldAskRecord {
+    fn of(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        stream: &str,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            run_id: run_id.into(),
+            seq,
+            principal: who.clone(),
+            conversation: conversation.into(),
+            stream: stream.into(),
+            ..Default::default()
+        }
+    }
+
+    /// One chunk of the answer, as the model streamed it.
+    pub fn answer(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        chunk: String,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            line: Some(chunk),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_ANSWER)
+        }
+    }
+
+    /// One cited source, as the build's index resolved it — or as it failed to.
+    /// The `record` is the index's own entry, never the model's rendering of it.
+    pub fn citation(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        source: serde_json::Value,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            record: Some(source),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_CITATION)
+        }
+    }
+
+    /// The turn's close: `done`, the exit, and — on anything but a clean end —
+    /// the one line saying why.
+    pub fn end(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        exit: i32,
+        said: Option<String>,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            line: said,
+            done: Some(true),
+            exit: Some(exit),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_END)
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +402,53 @@ mod tests {
     fn accepted_carries_run_id_and_done_false() {
         let a = GyldResponse::accepted("run-1".into(), Some("p".into()));
         assert!(a.ok && a.run_id.as_deref() == Some("run-1") && a.done == Some(false));
+    }
+
+    #[test]
+    fn ask_records_are_the_gwz_shape_plus_the_conversation() {
+        let who = Some("gianni".into());
+        let a = GyldAskRecord::answer("run-3", 1, &who, "conv-1", "It is blocked ".into());
+        let s = String::from_utf8(a.to_bytes()).unwrap();
+        for field in [
+            "\"run_id\":\"run-3\"",
+            "\"seq\":1",
+            "\"principal\":\"gianni\"",
+            "\"conversation\":\"conv-1\"",
+            "\"stream\":\"answer\"",
+            "\"line\":\"It is blocked \"",
+        ] {
+            assert!(s.contains(field), "{field} missing from {s}");
+        }
+        assert!(!s.contains("\"record\"") && !s.contains("\"done\""), "{s}");
+
+        let c = GyldAskRecord::citation(
+            "run-3",
+            2,
+            &who,
+            "conv-1",
+            serde_json::json!({"tag": "AZ-7", "resolved": false, "reason": "nothing declares it"}),
+        );
+        assert_eq!(c.stream, ASK_CITATION);
+        assert_eq!(c.record.as_ref().unwrap()["tag"], "AZ-7");
+        assert!(c.line.is_none(), "a citation is a record, not a line");
+
+        // A clean end says nothing beyond how it ended.
+        let e = GyldAskRecord::end("run-3", 3, &who, "conv-1", 0, None);
+        assert_eq!(
+            (e.stream.as_str(), e.done, e.exit),
+            (ASK_END, Some(true), Some(0))
+        );
+        assert!(e.line.is_none());
+
+        // A refused one carries the reason on the close, where the ops panel
+        // already prints it.
+        let e = GyldAskRecord::end("run-3", 3, &who, "conv-1", 1, Some("declined".into()));
+        assert_eq!(e.exit, Some(1));
+        assert_eq!(e.line.as_deref(), Some("declined"));
+
+        // And it round-trips: one consumer folds these and `gyld.output` both.
+        let held: GyldAskRecord = serde_json::from_slice(&e.to_bytes()).unwrap();
+        assert_eq!(held, e);
     }
 
     #[test]

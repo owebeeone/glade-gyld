@@ -4,6 +4,7 @@
 //! ```text
 //! glade-gyld --node ws://127.0.0.1:PORT --gyld-root DIR --bundle-root DIR
 //!            [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output]
+//!            [--ask-id gyld.ask]
 //!            [--streams-id gyld.streams] [--stream-id gyld.stream]
 //!            [--decisions-id gyld.decisions] [--lens-id gyld.lens]
 //!            [--file-id gyld.file] [--static-base /gyld] [--principal P]
@@ -21,12 +22,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gyld::{
-    serve, GyldConfig, Limits, ModelConfig, Surfaces, DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, DEFAULT_TIMEOUT_SECS,
+    serve, GyldConfig, Limits, ModelConfig, Surfaces, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
+    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE,
+    DEFAULT_TIMEOUT_SECS,
 };
 
 const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --bundle-root DIR \
-[--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
+[--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] [--ask-id gyld.ask] \
 [--streams-id gyld.streams] [--stream-id gyld.stream] [--decisions-id gyld.decisions] \
 [--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
 [--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576] \
@@ -107,6 +109,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut share = DEFAULT_SHARE.to_string();
     let mut glade_id = DEFAULT_GLADE_ID.to_string();
     let mut output_id = DEFAULT_OUTPUT_ID.to_string();
+    let mut ask_id = DEFAULT_ASK_ID.to_string();
     let mut surfaces = Surfaces::default();
     let mut principal: Option<String> = None;
     let mut python = PathBuf::from(DEFAULT_PYTHON);
@@ -124,6 +127,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--share" => share = take("--share")?,
             "--glade-id" => glade_id = take("--glade-id")?,
             "--output-id" => output_id = take("--output-id")?,
+            "--ask-id" => ask_id = take("--ask-id")?,
             "--streams-id" => surfaces.streams_id = take("--streams-id")?,
             "--stream-id" => surfaces.stream_id = take("--stream-id")?,
             "--decisions-id" => surfaces.decisions_id = take("--decisions-id")?,
@@ -171,6 +175,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     config.share = share;
     config.glade_id = glade_id;
     config.output_id = output_id;
+    config.ask_id = ask_id;
     config.surfaces = surfaces;
     config.principal = principal;
     config.limits = Limits {

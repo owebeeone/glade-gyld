@@ -38,8 +38,8 @@ use tokio::process::{Child, Command};
 
 use glade_client::GladeClient;
 use glade_gyld::{
-    serve_with, Declined, GyldConfig, GyldOutputRecord, GyldResponse, Limits, ModelClient,
-    ModelEvent, ModelOutcome, ModelRequest, Plan, RunOutput, Runner,
+    serve_with, Declined, GyldAskRecord, GyldConfig, GyldOutputRecord, GyldResponse, Limits,
+    ModelClient, ModelEvent, ModelOutcome, ModelRequest, Plan, RunOutput, Runner,
 };
 
 // ---- harness --------------------------------------------------------------
@@ -700,10 +700,13 @@ async fn explain_refusals_are_data_and_the_supplier_keeps_answering() {
 
 // ---- 2c. the whole consult path, against a scripted model ------------------
 
+/// The conversation every `explain` in these tests is keyed by.
+const CONVERSATION: &str = "conv-tab1-key_custody-1789";
+
 /// Seed a build's source index and an app-owned key file, so `explain` gets
-/// past every guard. The key file is never READ here — the supplier only asks
-/// whether it exists until the model client reads it — and it is mode 600, the
-/// only mode the client accepts.
+/// past every guard. The key is never read by the double — the supplier only
+/// asks whether a key EXISTS until the model client reads one — and the file is
+/// mode 600, the only mode the real client accepts.
 fn seed_agent(bundle_root: &Path, build: &Path) {
     std::fs::write(
         build.join("sources.json"),
@@ -734,29 +737,30 @@ fn seed_agent(bundle_root: &Path, build: &Path) {
     std::fs::create_dir_all(&agent).unwrap();
     let key = agent.join("api-key");
     std::fs::write(&key, "unused-by-the-double\n").unwrap();
+    key_mode_600(&key);
 }
 
-/// Fold the output log for one run, waiting for its terminal record.
-async fn run_records(sub: &GladeClient, run_id: &str) -> Vec<GyldOutputRecord> {
+/// Fold the ASK surface for one conversation, waiting for the turn's close.
+async fn ask_records(sub: &GladeClient, conversation: &str) -> Vec<GyldAskRecord> {
     let s = sub.clone();
-    let key = run_id.to_string();
+    let key = conversation.to_string();
     let closed = poll(|| {
         let s = s.clone();
         let key = key.clone();
         async move {
-            s.fold_log("ws-razel", "gyld.output", Some(key.as_bytes()))
+            s.fold_log("ws-razel", "gyld.ask", Some(key.as_bytes()))
                 .await
                 .iter()
                 .any(|e| {
-                    serde_json::from_slice::<GyldOutputRecord>(e)
+                    serde_json::from_slice::<GyldAskRecord>(e)
                         .map(|r| r.done == Some(true))
                         .unwrap_or(false)
                 })
         }
     })
     .await;
-    assert!(closed, "the run {run_id} closed with a terminal record");
-    sub.fold_log("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+    assert!(closed, "the turn on {conversation} closed");
+    sub.fold_log("ws-razel", "gyld.ask", Some(conversation.as_bytes()))
         .await
         .iter()
         .filter_map(|e| serde_json::from_slice(e).ok())
@@ -764,7 +768,7 @@ async fn run_records(sub: &GladeClient, run_id: &str) -> Vec<GyldOutputRecord> {
 }
 
 /// One consultation, end to end, against a scripted model.
-async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldOutputRecord> {
+async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldAskRecord> {
     let tmp = Tmp::new(tag);
     let (mut node, port) = boot(&tmp).await;
     let url = format!("ws://127.0.0.1:{port}");
@@ -785,9 +789,11 @@ async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldOutputRecord
     requester.connect(&url).await.unwrap();
     attached(&requester).await;
 
+    // The reply is keyed by the CONVERSATION, so one mount is up before the
+    // turn is asked for and stays up across turns.
     let sub = GladeClient::new("subscriber");
     sub.connect(&url).await.unwrap();
-    sub.subscribe("ws-razel", "gyld.output", None)
+    sub.subscribe("ws-razel", "gyld.ask", Some(CONVERSATION.as_bytes()))
         .await
         .unwrap();
 
@@ -799,16 +805,25 @@ async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldOutputRecord
     assert_eq!(accepted.attributed_to.as_deref(), Some("gianni"));
     let run_id = accepted.run_id.clone().expect("a run id");
 
-    sub.subscribe("ws-razel", "gyld.output", Some(run_id.as_bytes()))
-        .await
-        .unwrap();
-    let records = run_records(&sub, &run_id).await;
+    let records = ask_records(&sub, CONVERSATION).await;
 
     assert_eq!(runner.count(), 0, "`explain` runs no host, ever");
-    assert!(records.iter().all(|r| r.run_id == run_id));
+    assert!(
+        records.iter().all(|r| r.conversation == CONVERSATION),
+        "every record is keyed by the conversation: {records:?}"
+    );
+    assert!(
+        records.iter().all(|r| r.run_id == run_id),
+        "and carries this turn's own run id for the audit trail: {records:?}"
+    );
     assert!(records
         .iter()
         .all(|r| r.principal.as_deref() == Some("gianni")));
+    assert_eq!(
+        records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (1..=records.len() as u64).collect::<Vec<_>>(),
+        "sequence numbers run 1..n: {records:?}"
+    );
 
     sub.close().await;
     requester.close().await;
@@ -817,7 +832,7 @@ async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldOutputRecord
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_normal_consultation_streams_its_answer_and_closes_clean() {
+async fn a_normal_consultation_cites_then_answers_and_closes_clean() {
     let model = Arc::new(ScriptedModel {
         chunks: vec!["It is blocked ", "by proof_family (Q11)."],
         ..Default::default()
@@ -825,16 +840,40 @@ async fn a_normal_consultation_streams_its_answer_and_closes_clean() {
     let records = consulted(model.clone(), "consult-ok").await;
     assert_eq!(model.calls.load(Ordering::SeqCst), 1, "one call, one turn");
 
+    // The citations come FIRST, so a reader sees what the answer is grounded in
+    // before the prose arrives: the resolved passage the index emitted, and the
+    // unresolved tag said to resolve to nothing.
+    let citations: Vec<&GyldAskRecord> = records
+        .iter()
+        .filter(|r| r.stream == glade_gyld::ASK_CITATION)
+        .collect();
+    assert_eq!(citations.len(), 2, "{records:?}");
+    let q11 = citations[0].record.as_ref().expect("a citation record");
+    assert_eq!(q11["tag"], "Q11");
+    assert_eq!(q11["resolved"], true);
+    assert_eq!(q11["document"], "GladeBuyBuildMatrix");
+    assert_eq!(q11["digest"], "d8eb379e");
+    assert!(q11["passage"].as_str().unwrap().contains("Key custody"));
+    let az = citations[1].record.as_ref().expect("a citation record");
+    assert_eq!(az["tag"], "AZ-7");
+    assert_eq!(az["resolved"], false);
+    assert_eq!(az["reason"], "no document in this index declares it");
+
     let answers: Vec<&str> = records
         .iter()
-        .filter(|r| r.stream == "answer")
+        .filter(|r| r.stream == glade_gyld::ASK_ANSWER)
         .filter_map(|r| r.line.as_deref())
         .collect();
     assert_eq!(answers, vec!["It is blocked ", "by proof_family (Q11)."]);
+
     let end = records.last().expect("a terminal record");
-    assert_eq!(end.stream, "end");
+    assert_eq!(end.stream, glade_gyld::ASK_END);
     assert_eq!(end.exit, Some(0));
     assert_eq!(end.done, Some(true));
+    assert!(
+        end.line.is_none(),
+        "a clean end says nothing beyond how it ended"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -852,13 +891,11 @@ async fn a_declined_turn_a_budget_stop_and_a_transport_failure_are_all_data() {
         "consult-refuse",
     )
     .await;
-    let said = records
-        .iter()
-        .filter_map(|r| r.line.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let end = records.last().expect("a terminal record");
+    let said = end.line.clone().unwrap_or_default();
     assert!(said.contains("the model declined (cyber)"), "{said}");
-    assert_eq!(records.last().unwrap().exit, Some(1));
+    assert!(said.contains("declined to continue"), "{said}");
+    assert_eq!(end.exit, Some(1));
 
     // The output budget stopped it: the partial text is KEPT and said to be.
     let records = consulted(
@@ -873,21 +910,21 @@ async fn a_declined_turn_a_budget_stop_and_a_transport_failure_are_all_data() {
     assert_eq!(
         records
             .iter()
-            .filter(|r| r.stream == "answer")
+            .filter(|r| r.stream == glade_gyld::ASK_ANSWER)
             .filter_map(|r| r.line.as_deref())
             .collect::<Vec<_>>(),
         vec!["It is blo"],
         "half an answer that says it is half an answer is data"
     );
-    let said = records
-        .iter()
-        .filter_map(|r| r.line.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(said.contains("is partial"), "{said}");
-    assert_eq!(records.last().unwrap().exit, Some(1));
+    let end = records.last().expect("a terminal record");
+    assert!(
+        end.line.clone().unwrap_or_default().contains("is partial"),
+        "{end:?}"
+    );
+    assert_eq!(end.exit, Some(1));
 
-    // The call broke: failure as data, not a hang and not a panic.
+    // The call broke: failure as data, not a hang and not a panic — and the
+    // grounding is still said.
     let records = consulted(
         Arc::new(ScriptedModel {
             transport: Some("connection reset by peer"),
@@ -896,13 +933,23 @@ async fn a_declined_turn_a_budget_stop_and_a_transport_failure_are_all_data() {
         "consult-transport",
     )
     .await;
-    let said = records
-        .iter()
-        .filter_map(|r| r.line.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(said.contains("connection reset by peer"), "{said}");
-    assert_eq!(records.last().unwrap().exit, Some(1));
+    let end = records.last().expect("a terminal record");
+    assert!(
+        end.line
+            .clone()
+            .unwrap_or_default()
+            .contains("connection reset by peer"),
+        "{end:?}"
+    );
+    assert_eq!(end.exit, Some(1));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.stream == glade_gyld::ASK_CITATION)
+            .count(),
+        2,
+        "the grounding is said even when the call fails: {records:?}"
+    );
 }
 
 /// The REAL HTTPS client, driven where the supplier drives it: on a blocking

@@ -25,6 +25,7 @@ stream verbs by invoking the Gyld hosts as subprocesses. It is the write path of
 glade-gyld --node ws://127.0.0.1:9099 \
   --gyld-root /path/to/gyld-wz/gyld --bundle-root /path/to/data/files/gyld \
   [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
+  [--ask-id gyld.ask] \
   [--streams-id gyld.streams] [--stream-id gyld.stream] \
   [--decisions-id gyld.decisions] [--lens-id gyld.lens] [--file-id gyld.file] \
   [--static-base /gyld] \
@@ -295,9 +296,32 @@ is one line and a non-zero exit, never a hang and never a panic.
 
 `explain` is **always** a streaming run, whatever `stream_output` said: a
 consultation is model time, and its reply is a stream by nature. The exchange
-answers at once with `{ok: true, run_id, done: false}` and the chunks arrive on
-the reply surface as `answer` records, closed by the usual `{done: true, exit}`
-marker.
+answers at once with `{ok: true, run_id, done: false}` and the reply arrives on
+the surface below.
+
+### The reply (log `gyld.ask`)
+
+Keyed by the **conversation**, not by the run id. That one deviation from
+`gyld.output`'s shape is what makes a conversation one fold, one mount and one
+key: each turn keeps its own `run_id` on every record for the audit trail, and
+each turn's `end` closes that turn without closing the conversation. Keying by
+run id instead would need one mount per question asked.
+
+| `stream` | carries | what it is |
+| --- | --- | --- |
+| `citation` | `record`: the resolved source, whole | one cited passage with its tag, document, heading, lines and digest — or `resolved: false` with the reason |
+| `answer` | `line`: one text chunk | the prose, as the model streams it |
+| `end` | `done: true`, `exit`, and a `line` on anything but a clean end | the turn's close |
+
+Every record carries `run_id`, `seq`, `principal` and `conversation`, in the
+`gwz.output` field set plus those two, so one consumer folds this surface and
+`gyld.output` both. A consumer that has never heard of `citation` shows nothing
+for it: absent records are absent lines, never blank ones.
+
+The **citations come first**, before the prose, so a reader sees what the answer
+is grounded in as soon as there is anything to see — and sees it even when the
+call then fails. A citation's `record` is the index's own entry, never the
+model's rendering of it.
 
 ## Long-op output (log `gyld.output`)
 

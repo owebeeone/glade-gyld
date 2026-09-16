@@ -34,7 +34,7 @@ use glade_wire::generated::ExchangeReq;
 
 use crate::ask::{self, AgentState, Consultation};
 use crate::bundle::{self, Layout};
-use crate::envelope::{GyldOutputRecord, GyldRequest, GyldResponse};
+use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
 use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
 use crate::prompt::{self, Prompt};
@@ -42,14 +42,13 @@ use crate::publish::{self, Surfaces};
 use crate::sources::{self, ResolvedSource};
 use crate::verbs::{self, Plan};
 
-/// The record stream one chunk of a model's answer takes, as it streams
-/// (GyldAskAgent.md section 4, "The reply").
-pub const ANSWER_STREAM: &str = "answer";
-
 /// The default surfaces a gyld supplier stands behind (`gyld-app.glade`).
 pub const DEFAULT_SHARE: &str = "ws-razel";
 pub const DEFAULT_GLADE_ID: &str = "gyld.ops";
 pub const DEFAULT_OUTPUT_ID: &str = "gyld.output";
+/// The ask agent's reply surface, keyed by CONVERSATION and not by run id
+/// (GyldAskAgent.md sections 4 and 6).
+pub const DEFAULT_ASK_ID: &str = "gyld.ask";
 /// The interpreter the Gyld hosts require: the default `python3` is 3.10 and
 /// fails on them.
 pub const DEFAULT_PYTHON: &str = "/opt/homebrew/bin/python3.13";
@@ -61,6 +60,8 @@ pub struct GyldConfig {
     pub share: String,
     pub glade_id: String,
     pub output_id: String,
+    /// The log surface a consultation's reply lands on, keyed by conversation.
+    pub ask_id: String,
     pub layout: Layout,
     /// The value surfaces a successful build publishes onto, and the static
     /// base the lens pointers are written against (step 4.2).
@@ -86,6 +87,7 @@ impl GyldConfig {
             share: DEFAULT_SHARE.into(),
             glade_id: DEFAULT_GLADE_ID.into(),
             output_id: DEFAULT_OUTPUT_ID.into(),
+            ask_id: DEFAULT_ASK_ID.into(),
             layout: Layout::new(gyld_root, bundle_root),
             surfaces: Surfaces::default(),
             principal: None,
@@ -674,66 +676,75 @@ async fn consult_run(
     consult: Consultation,
     who: Option<String>,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let conversation = consult.conversation.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Reply>();
     let model_config = config.model_config();
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
-            let (_sources, prompt) = ground(&consult)?;
+            let (sources, prompt) = ground(&consult)?;
+            // The citations first, so a reader sees what the answer is grounded in
+            // before the prose arrives — and sees it even when the call then fails.
+            for source in sources.iter() {
+                let _ = tx.send(Reply::Citation(
+                    serde_json::to_value(source).unwrap_or_default(),
+                ));
+            }
             let request = ModelRequest {
                 config: model_config,
                 prompt,
             };
             model::consult(model.as_ref(), &request, &mut |event| {
                 let ModelEvent::Text(chunk) = event;
-                let _ = tx.send(chunk);
+                let _ = tx.send(Reply::Answer(chunk));
             })
             .map_err(|refusal| refusal.says())
         });
 
     let mut seq: u64 = 0;
-    while let Some(chunk) = rx.recv().await {
+    while let Some(reply) = rx.recv().await {
         seq += 1;
-        let record = GyldOutputRecord::line(&run_id, seq, &who, ANSWER_STREAM, chunk);
-        append(&client, &config, &run_id, &record).await;
+        let record = match reply {
+            Reply::Citation(source) => {
+                GyldAskRecord::citation(&run_id, seq, &who, &conversation, source)
+            }
+            Reply::Answer(chunk) => GyldAskRecord::answer(&run_id, seq, &who, &conversation, chunk),
+        };
+        append_ask(&client, &config, &conversation, &record).await;
     }
 
     let budget = config.agent.max_output_tokens;
-    let exit = match work.await {
-        Ok(Ok(outcome)) => {
-            if let Some(said) = outcome.says(budget) {
-                seq += 1;
-                let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", said);
-                append(&client, &config, &run_id, &record).await;
-            }
-            outcome.exit()
-        }
-        Ok(Err(refused)) => {
-            seq += 1;
-            let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", refused);
-            append(&client, &config, &run_id, &record).await;
-            1
-        }
-        Err(e) => {
-            seq += 1;
-            let record = GyldOutputRecord::line(
-                &run_id,
-                seq,
-                &who,
-                "stderr",
-                format!("the consultation task failed: {e}"),
-            );
-            append(&client, &config, &run_id, &record).await;
-            -1
-        }
+    let (exit, said) = match work.await {
+        Ok(Ok(outcome)) => (outcome.exit(), outcome.says(budget)),
+        Ok(Err(refused)) => (1, Some(refused)),
+        Err(e) => (-1, Some(format!("the consultation task failed: {e}"))),
     };
     seq += 1;
-    append(
-        &client,
-        &config,
-        &run_id,
-        &GyldOutputRecord::end(&run_id, seq, &who, exit),
-    )
-    .await;
+    let end = GyldAskRecord::end(&run_id, seq, &who, &conversation, exit, said);
+    append_ask(&client, &config, &conversation, &end).await;
+}
+
+/// One thing a consultation produces, on its way to a record.
+enum Reply {
+    Citation(serde_json::Value),
+    Answer(String),
+}
+
+/// Append one reply record to the ask surface, keyed by CONVERSATION.
+async fn append_ask(
+    client: &GladeClient,
+    config: &GyldConfig,
+    conversation: &str,
+    record: &GyldAskRecord,
+) {
+    let _ = client
+        .append(
+            &config.share,
+            &config.ask_id,
+            "log",
+            record.to_bytes(),
+            Some(conversation.as_bytes()),
+        )
+        .await;
 }
 
 /// Lay the bundle root and give it its first build, as a STREAMING run on the

@@ -50,7 +50,10 @@ pub mod verbs;
 
 pub use ask::{AgentState, AskContext, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE};
 pub use bundle::{FilePointer, Layout};
-pub use envelope::{GyldArgs, GyldOutputRecord, GyldRequest, GyldResponse};
+pub use envelope::{
+    GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, ASK_ANSWER, ASK_CITATION,
+    ASK_END,
+};
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
@@ -63,7 +66,7 @@ pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
 pub use sources::{ResolvedSource, SourceIndex, SOURCES_FORMAT};
 pub use supplier::{
-    serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID,
-    DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_ID,
+    serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
+    DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_ID,
 };
 pub use verbs::{Plan, PlannedWrite, ALLOWED_VERBS, NO_BUNDLE};

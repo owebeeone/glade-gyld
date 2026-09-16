@@ -27,6 +27,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::ask::{AskRefusal, KEY_ENV};
+use crate::conversation::{self, Turn};
 use crate::prompt::Prompt;
 
 /// The model `--agent-model` defaults to. Taken from the `claude-api` skill's
@@ -51,6 +52,16 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
 /// The wall clock one consultation gets.
 pub const DEFAULT_MODEL_TIMEOUT_SECS: u64 = 300;
 
+/// The per-CONVERSATION ceiling: every token every turn of one conversation
+/// spent, summed. A turn that would cross it is refused before it is sent.
+///
+/// The per-run budgets bound one question. This one bounds the thread: prior
+/// turns are replayed into every follow-up, so a conversation left running is
+/// the one thing here that grows on its own. The default is this model's own
+/// context window, which is the largest a single turn could ever be — several
+/// turns of it, not one. `0` lifts the ceiling.
+pub const DEFAULT_MAX_CONVERSATION_TOKENS: u64 = 1_000_000;
+
 /// Everything the model call is configured with. No key: see the module note.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
@@ -58,6 +69,9 @@ pub struct ModelConfig {
     pub base_url: String,
     pub max_input_tokens: u64,
     pub max_output_tokens: u64,
+    /// The running total one conversation may spend across its turns; `0` is
+    /// no ceiling.
+    pub max_conversation_tokens: u64,
     pub timeout: Duration,
     /// Where a key is read from when the environment carries none.
     pub key_file: PathBuf,
@@ -70,28 +84,46 @@ impl Default for ModelConfig {
             base_url: DEFAULT_BASE_URL.into(),
             max_input_tokens: DEFAULT_MAX_INPUT_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_conversation_tokens: DEFAULT_MAX_CONVERSATION_TOKENS,
             timeout: Duration::from_secs(DEFAULT_MODEL_TIMEOUT_SECS),
             key_file: PathBuf::new(),
         }
     }
 }
 
-/// One turn's request: the configuration and the two-part prompt.
-#[derive(Clone, Debug, PartialEq)]
+/// One turn's request: the configuration, the two-part prompt, and the prior
+/// turns of this conversation as its own records tell them.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelRequest {
     pub config: ModelConfig,
     pub prompt: Prompt,
+    /// The conversation so far, oldest first. Empty on a conversation's first
+    /// turn (GyldAskAgent.md section 6).
+    pub turns: Vec<Turn>,
 }
 
 impl ModelRequest {
     /// The Messages API body.
     ///
-    /// The system block is the STABLE prefix — stance, emitted context and
-    /// passages — and it is the block that carries
-    /// `cache_control: {"type": "ephemeral"}`, so a follow-up on the same
-    /// envelope reads the cache rather than paying for the passages again
-    /// (phase 2 sends the follow-ups; the shape is here now so the prefix never
-    /// has to move to get it).
+    /// **Two cache breakpoints, and both on things that cannot move.**
+    ///
+    /// 1. The system block is the STABLE prefix — the constant stance, the
+    ///    emitted facts of the envelope and every resolved passage. None of it
+    ///    changes across the turns of one conversation, so it is byte-identical
+    ///    from turn to turn and every follow-up reads it rather than paying for
+    ///    the passages again.
+    /// 2. The last PRIOR assistant turn, when there is one: settled history,
+    ///    already written to the log and unable to change. The question this
+    ///    turn asks is deliberately NOT marked — it is the one thing that
+    ///    differs every turn, and a breakpoint after it writes an entry whose
+    ///    tail is never read back.
+    ///
+    /// Render order is `tools` → `system` → `messages`, so the marker on the
+    /// system block caches the tool declarations with it. Two of the four
+    /// breakpoints a request may carry are ever spent.
+    ///
+    /// `usage.cache_read_input_tokens` staying at zero across a conversation is
+    /// the symptom that something in that prefix is moving.
     ///
     /// `thinking` is not sent: on this model family thinking is ON by default
     /// and adaptive, and `display` stays at its default, so no reasoning text
@@ -103,11 +135,24 @@ impl ModelRequest {
         body
     }
 
-    /// The `count_tokens` body: the same prompt, with neither `max_tokens` nor
-    /// `stream`. Counting the body that is about to be SENT is the whole point:
-    /// a count of something else is not a budget.
+    /// The `count_tokens` body: the same prompt and the same prior turns, with
+    /// neither `max_tokens` nor `stream`. Counting the body that is about to be
+    /// SENT is the whole point: a count of something else is not a budget, and
+    /// a count that forgot the conversation is not this turn's count.
     pub fn count_body(&self) -> serde_json::Value {
         self.shared()
+    }
+
+    /// The bytes the cache is keyed on, up to and including the system block:
+    /// what must be byte-identical from one turn of a conversation to the next.
+    /// Asserting on this is how a silent invalidator is caught by a test rather
+    /// than by a bill.
+    pub fn cached_prefix(&self) -> serde_json::Value {
+        let body = self.shared();
+        serde_json::json!({
+            "model": body["model"],
+            "system": body["system"],
+        })
     }
 
     fn shared(&self) -> serde_json::Value {
@@ -118,7 +163,7 @@ impl ModelRequest {
                 "text": self.prompt.system,
                 "cache_control": {"type": "ephemeral"},
             }],
-            "messages": [{"role": "user", "content": self.prompt.user}],
+            "messages": conversation::messages(&self.turns, &self.prompt.user),
         })
     }
 }
@@ -161,6 +206,19 @@ impl ModelOutcome {
     /// The turn ended because the answer ended.
     pub fn complete(&self) -> bool {
         self.stop_reason == END_TURN
+    }
+
+    /// What this turn cost, whole: the prompt however it was served — uncached,
+    /// written to the cache, or read back from it — plus what came out.
+    ///
+    /// `input_tokens` is the uncached REMAINDER only, so summing the three is
+    /// the only honest reading of a turn's size. A conversation's running total
+    /// is these, added up.
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.output_tokens)
     }
 
     /// What to say about how it ended, when that is not simply "it ended".
@@ -210,13 +268,20 @@ pub trait ModelClient: Send + Sync + 'static {
     ) -> Result<ModelOutcome, String>;
 }
 
-/// One consultation: count, check the input budget, then stream.
+/// One consultation: count, check both input budgets, then stream.
 ///
 /// The count happens BEFORE the call, so an over-budget turn is refused with
-/// both numbers and costs nothing.
+/// its numbers and costs nothing. `spent` is what this CONVERSATION has already
+/// spent across its earlier turns — the running total of section 7 — and the
+/// turn that would cross the ceiling is refused here rather than sent and
+/// regretted.
+///
+/// The per-run budget is checked first: it is about this question, and a
+/// question too big to ask is too big whatever the conversation has spent.
 pub fn consult(
     client: &dyn ModelClient,
     request: &ModelRequest,
+    spent: u64,
     on_event: &mut dyn FnMut(ModelEvent),
 ) -> Result<ModelOutcome, AskRefusal> {
     let counted = client
@@ -226,6 +291,14 @@ pub fn consult(
         return Err(AskRefusal::OverInputBudget {
             counted,
             budget: request.config.max_input_tokens,
+        });
+    }
+    let budget = request.config.max_conversation_tokens;
+    if budget > 0 && spent.saturating_add(counted) > budget {
+        return Err(AskRefusal::OverConversationBudget {
+            spent,
+            counted,
+            budget,
         });
     }
     client
@@ -637,6 +710,7 @@ pub(crate) mod tests {
                 system: "the stance and the passages".into(),
                 user: "why is this blocked?".into(),
             },
+            turns: Vec::new(),
         }
     }
 
@@ -669,7 +743,16 @@ pub(crate) mod tests {
             "the stable prefix is what is cached"
         );
         assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "why is this blocked?");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "why is this blocked?"
+        );
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "the question is the volatile tail: it is never the breakpoint"
+        );
         assert!(
             body.get("thinking").is_none(),
             "thinking is adaptive by default and its display stays default"
@@ -681,6 +764,116 @@ pub(crate) mod tests {
         assert_eq!(count["system"], body["system"]);
         assert_eq!(count["messages"], body["messages"]);
         assert!(count.get("max_tokens").is_none() && count.get("stream").is_none());
+    }
+
+    #[test]
+    fn the_cached_prefix_is_byte_identical_across_the_turns_of_one_conversation() {
+        let first = request();
+        let mut third = request();
+        third.prompt.user = "and what unlocks it?".into();
+        third.turns = crate::conversation::turns(&{
+            let mut records = crate::conversation::tests::turn(
+                "run-1",
+                "why is this blocked?",
+                &["It is."],
+                None,
+            );
+            records.extend(crate::conversation::tests::turn(
+                "run-2",
+                "by what?",
+                &["By proof_family."],
+                None,
+            ));
+            records
+        });
+
+        // The whole of what the cache is keyed on, to the byte.
+        assert_eq!(
+            serde_json::to_string(&first.cached_prefix()).unwrap(),
+            serde_json::to_string(&third.cached_prefix()).unwrap(),
+            "the stable prefix moved between turns of one conversation"
+        );
+
+        // And the third turn carries both prior turns, in order, with the
+        // second breakpoint on the settled history rather than on the question.
+        let body = third.body(true);
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 5, "two prior turns, then this one");
+        assert_eq!(messages[0]["content"][0]["text"], "why is this blocked?");
+        assert_eq!(messages[2]["content"][0]["text"], "by what?");
+        assert_eq!(messages[4]["content"][0]["text"], "and what unlocks it?");
+        let marked = messages
+            .iter()
+            .filter(|m| m["content"][0].get("cache_control").is_some())
+            .count();
+        assert_eq!(marked, 1, "{messages:?}");
+        assert_eq!(
+            messages[3]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Two breakpoints in the whole request, of the four one may carry.
+        assert_eq!(
+            serde_json::to_string(&body)
+                .unwrap()
+                .matches("cache_control")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_conversation_budget_refuses_the_turn_that_would_cross_it() {
+        let mut request = request();
+        request.config.max_conversation_tokens = 5_000;
+        let client = Scripted {
+            counted: Ok(1_200),
+            transcript: NORMAL.into(),
+            ..Default::default()
+        };
+
+        // Room for it: the turn goes.
+        let outcome = consult(&client, &request, 3_000, &mut |_| {}).expect("within budget");
+        assert!(outcome.complete());
+
+        // One more turn would cross it, so nothing is sent.
+        let e = consult(&client, &request, 3_900, &mut |_| {}).expect_err("a refusal");
+        assert_eq!(
+            e,
+            AskRefusal::OverConversationBudget {
+                spent: 3_900,
+                counted: 1_200,
+                budget: 5_000
+            }
+        );
+        let said = e.says();
+        assert!(
+            said.contains("3900") && said.contains("1200") && said.contains("5000"),
+            "{said}"
+        );
+        assert!(said.contains("--agent-max-conversation-tokens"), "{said}");
+        assert_eq!(
+            client.count(),
+            2,
+            "the count happened, the second call did not"
+        );
+
+        // Zero is no ceiling.
+        request.config.max_conversation_tokens = 0;
+        assert!(consult(&client, &request, u64::MAX, &mut |_| {}).is_ok());
+    }
+
+    #[test]
+    fn a_turns_cost_is_the_prompt_however_it_was_served_plus_the_output() {
+        let outcome = ModelOutcome {
+            input_tokens: 300,
+            cache_creation_input_tokens: 50,
+            cache_read_input_tokens: 900,
+            output_tokens: 42,
+            ..Default::default()
+        };
+        assert_eq!(outcome.tokens(), 1292);
+        assert_eq!(ModelOutcome::default().tokens(), 0);
     }
 
     #[test]
@@ -741,13 +934,13 @@ pub(crate) mod tests {
             transcript: NORMAL.into(),
             ..Default::default()
         };
-        let e = consult(&client, &request, &mut |_| {}).expect_err("a refusal");
+        let e = consult(&client, &request, 0, &mut |_| {}).expect_err("a refusal");
         let said = e.says();
         assert!(said.contains("1001") && said.contains("1000"), "{said}");
         assert_eq!(client.count(), 1, "the count happened, the call did not");
 
         request.config.max_input_tokens = 1001;
-        let outcome = consult(&client, &request, &mut |_| {}).expect("within budget");
+        let outcome = consult(&client, &request, 0, &mut |_| {}).expect("within budget");
         assert!(outcome.complete());
     }
 
@@ -758,14 +951,14 @@ pub(crate) mod tests {
             transport: Some("connection reset".into()),
             ..Default::default()
         };
-        let e = consult(&client, &request(), &mut |_| {}).expect_err("a refusal");
+        let e = consult(&client, &request(), 0, &mut |_| {}).expect_err("a refusal");
         assert!(e.says().contains("connection reset"), "{e}");
 
         let counting = Scripted {
             counted: Err("dns failure".into()),
             ..Default::default()
         };
-        let e = consult(&counting, &request(), &mut |_| {}).expect_err("a refusal");
+        let e = consult(&counting, &request(), 0, &mut |_| {}).expect_err("a refusal");
         assert!(e.says().contains("dns failure"), "{e}");
     }
 

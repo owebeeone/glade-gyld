@@ -23,6 +23,9 @@
 //!   and its refusals (GyldAskAgent.md sections 3 and 4).
 //! * [`sources`] — the emitted source index (`gyld.sources.v1`) and the
 //!   resolver that grounds an answer in it (section 5).
+//! * [`conversation`] — the prior turns a follow-up replays, folded back out of
+//!   the ask surface's own records, and what one conversation has spent
+//!   (sections 6 and 7).
 //! * [`prompt`] — the stance, the emitted context and the passages, composed
 //!   into the one stable prefix a turn is cached on (section 7).
 //! * [`model`] — the [`model::ModelClient`] trait and its raw-HTTPS
@@ -39,6 +42,7 @@
 
 pub mod ask;
 pub mod bundle;
+pub mod conversation;
 pub mod envelope;
 pub mod exec;
 pub mod model;
@@ -50,17 +54,18 @@ pub mod verbs;
 
 pub use ask::{AgentState, AskContext, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE};
 pub use bundle::{FilePointer, Layout};
+pub use conversation::{Ledger, Turn};
 pub use envelope::{
     GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, ASK_ANSWER, ASK_CITATION,
-    ASK_END,
+    ASK_END, ASK_QUESTION,
 };
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
 pub use model::{
     Declined, ModelClient, ModelConfig, ModelEvent, ModelOutcome, ModelRequest,
-    DEFAULT_AGENT_MODEL, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, END_TURN, MAX_TOKENS,
-    REFUSAL,
+    DEFAULT_AGENT_MODEL, DEFAULT_MAX_CONVERSATION_TOKENS, DEFAULT_MAX_INPUT_TOKENS,
+    DEFAULT_MAX_OUTPUT_TOKENS, END_TURN, MAX_TOKENS, REFUSAL,
 };
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};

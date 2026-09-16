@@ -244,7 +244,7 @@ pub struct GyldAskRecord {
     pub principal: Option<String>,
     /// The conversation this turn belongs to, and the surface's key.
     pub conversation: String,
-    /// `"answer" | "citation" | "end"`.
+    /// `"question" | "answer" | "citation" | "end"`.
     pub stream: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub line: Option<String>,
@@ -257,7 +257,15 @@ pub struct GyldAskRecord {
     pub exit: Option<i32>,
 }
 
-/// The three record streams a consultation emits. `draft` is phase 3.
+/// The record streams a consultation emits. `draft` is phase 3.
+///
+/// `question` is the reader's own turn, appended before anything the model
+/// produces. Section 6 says the transcript IS the log share; without the
+/// question on it the surface carries answers to questions nobody kept, and a
+/// follow-up could not replay the conversation from the records the supplier
+/// wrote. A consumer that has never heard of it shows nothing for it, which is
+/// the rule this surface already follows.
+pub const ASK_QUESTION: &str = "question";
 pub const ASK_ANSWER: &str = "answer";
 pub const ASK_CITATION: &str = "citation";
 pub const ASK_END: &str = "end";
@@ -277,6 +285,22 @@ impl GyldAskRecord {
             conversation: conversation.into(),
             stream: stream.into(),
             ..Default::default()
+        }
+    }
+
+    /// The reader's question, as they typed it and before anything is asked of
+    /// a model. It opens the turn, so the fold reads a turn even when the call
+    /// then fails outright.
+    pub fn question(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        question: String,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            line: Some(question),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_QUESTION)
         }
     }
 

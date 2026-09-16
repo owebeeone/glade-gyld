@@ -12,6 +12,7 @@
 //!            [--timeout-secs 600] [--max-output-bytes 1048576]
 //!            [--agent-model claude-opus-5] [--agent-key-file FILE]
 //!            [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]
+//!            [--agent-max-conversation-tokens 1000000]
 //! ```
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
@@ -33,7 +34,8 @@ const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --b
 [--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
 [--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576] \
 [--agent-model claude-opus-5] [--agent-key-file FILE] \
-[--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]";
+[--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000] \
+[--agent-max-conversation-tokens 1000000]";
 
 /// The parsed CLI: the supplier config plus the interpreter to run the hosts.
 struct Args {
@@ -141,6 +143,13 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
                 agent.max_input_tokens = take("--agent-max-input-tokens")?
                     .parse()
                     .map_err(|_| "--agent-max-input-tokens must be an integer".to_string())?;
+            }
+            "--agent-max-conversation-tokens" => {
+                agent.max_conversation_tokens = take("--agent-max-conversation-tokens")?
+                    .parse()
+                    .map_err(|_| {
+                        "--agent-max-conversation-tokens must be an integer".to_string()
+                    })?;
             }
             "--agent-max-output-tokens" => {
                 agent.max_output_tokens = take("--agent-max-output-tokens")?

@@ -24,6 +24,9 @@
 //!   9. the WHOLE consult path against a scripted model double: a normal
 //!      stream, a refusal, a budget stop and a transport error, each reaching a
 //!      subscriber as records closed by a terminal marker.
+//!  10. a CONVERSATION of three turns on one key: the supplier reads its own
+//!      records back as prior turns, the cached prefix is byte-identical across
+//!      them, and the per-conversation budget refuses the turn that crosses it.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -314,9 +317,13 @@ struct ScriptedModel {
     chunks: Vec<&'static str>,
     stop_reason: &'static str,
     declined: Option<Declined>,
+    input_tokens: u64,
     output_tokens: u64,
     transport: Option<&'static str>,
     calls: AtomicU64,
+    /// Every request it was handed, in order — so a conversation's prefix can
+    /// be diffed between turns rather than taken on trust.
+    seen: Mutex<Vec<ModelRequest>>,
 }
 
 impl Default for ScriptedModel {
@@ -326,15 +333,27 @@ impl Default for ScriptedModel {
             chunks: Vec::new(),
             stop_reason: glade_gyld::END_TURN,
             declined: None,
+            input_tokens: 1200,
             output_tokens: 42,
             transport: None,
             calls: AtomicU64::new(0),
+            seen: Mutex::new(Vec::new()),
         }
     }
 }
 
+impl ScriptedModel {
+    /// The requests it was handed, oldest first.
+    fn seen(&self) -> Vec<ModelRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
 impl ModelClient for ScriptedModel {
-    fn count_tokens(&self, _request: &ModelRequest) -> Result<u64, String> {
+    fn count_tokens(&self, request: &ModelRequest) -> Result<u64, String> {
+        // Recorded HERE, not in `stream`: a turn the budget refuses is counted
+        // and never sent, and it is still a turn this double was asked about.
+        self.seen.lock().unwrap().push(request.clone());
         Ok(self.counted)
     }
 
@@ -358,6 +377,7 @@ impl ModelClient for ScriptedModel {
         Ok(ModelOutcome {
             stop_reason: self.stop_reason.into(),
             declined: self.declined.clone(),
+            input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             ..Default::default()
         })
@@ -740,8 +760,10 @@ fn seed_agent(bundle_root: &Path, build: &Path) {
     key_mode_600(&key);
 }
 
-/// Fold the ASK surface for one conversation, waiting for the turn's close.
-async fn ask_records(sub: &GladeClient, conversation: &str) -> Vec<GyldAskRecord> {
+/// Fold the ASK surface for one conversation, waiting until `turns` of them
+/// have closed. A conversation is one key and one fold however many turns it
+/// holds, which is the whole point of keying by it.
+async fn ask_turns(sub: &GladeClient, conversation: &str, turns: usize) -> Vec<GyldAskRecord> {
     let s = sub.clone();
     let key = conversation.to_string();
     let closed = poll(|| {
@@ -751,20 +773,76 @@ async fn ask_records(sub: &GladeClient, conversation: &str) -> Vec<GyldAskRecord
             s.fold_log("ws-razel", "gyld.ask", Some(key.as_bytes()))
                 .await
                 .iter()
-                .any(|e| {
+                .filter(|e| {
                     serde_json::from_slice::<GyldAskRecord>(e)
                         .map(|r| r.done == Some(true))
                         .unwrap_or(false)
                 })
+                .count()
+                >= turns
         }
     })
     .await;
-    assert!(closed, "the turn on {conversation} closed");
+    assert!(closed, "{turns} turn(s) on {conversation} closed");
     sub.fold_log("ws-razel", "gyld.ask", Some(conversation.as_bytes()))
         .await
         .iter()
         .filter_map(|e| serde_json::from_slice(e).ok())
         .collect()
+}
+
+/// Fold the ASK surface for one conversation, waiting for one turn's close.
+async fn ask_records(sub: &GladeClient, conversation: &str) -> Vec<GyldAskRecord> {
+    ask_turns(sub, conversation, 1).await
+}
+
+/// A whole conversation against one supplier: each question asked in turn, each
+/// answered before the next is sent. Answers the records and the requests the
+/// model was handed, so the prefix can be diffed between turns.
+async fn conversed(
+    model: Arc<ScriptedModel>,
+    tag: &str,
+    config: impl FnOnce(&mut GyldConfig),
+    questions: &[&str],
+) -> (Vec<GyldAskRecord>, Vec<ModelRequest>) {
+    let tmp = Tmp::new(tag);
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let build = seed_bundle(&bundle);
+    seed_agent(&bundle, &build);
+
+    let mut settings = config_for(&url, gyld, bundle);
+    config(&mut settings);
+    let runner = Arc::new(Recorder::default());
+    let _sup = serve_with(settings, runner.clone(), model.clone())
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.ask", Some(CONVERSATION.as_bytes()))
+        .await
+        .unwrap();
+
+    for (i, question) in questions.iter().enumerate() {
+        let accepted = request(&requester, &explain("base", question)).await;
+        assert!(accepted.ok, "turn {} was accepted: {accepted:?}", i + 1);
+        // One turn at a time: the follow-up is composed from what the previous
+        // turn WROTE, so it must have finished writing it.
+        ask_turns(&sub, CONVERSATION, i + 1).await;
+    }
+    let records = ask_turns(&sub, CONVERSATION, questions.len()).await;
+
+    assert_eq!(runner.count(), 0, "`explain` runs no host, ever");
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+    (records, model.seen())
 }
 
 /// One consultation, end to end, against a scripted model.
@@ -952,6 +1030,151 @@ async fn a_declined_turn_a_budget_stop_and_a_transport_failure_are_all_data() {
     );
 }
 
+// ---- 2d. the conversation: prior turns, one cached prefix, one budget ------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_third_turn_replays_both_prior_turns_in_order_behind_one_cached_prefix() {
+    let model = Arc::new(ScriptedModel {
+        chunks: vec!["It is blocked ", "by proof_family (Q11)."],
+        ..Default::default()
+    });
+    let (records, seen) = conversed(
+        model.clone(),
+        "consult-thread",
+        |_| {},
+        &[
+            "why is this blocked?",
+            "by what exactly?",
+            "and what unlocks it?",
+        ],
+    )
+    .await;
+    assert_eq!(seen.len(), 3, "three turns, three requests");
+
+    // The reader's own turn is on the surface, in order: without it the log is
+    // not the transcript, and a follow-up has nothing to replay.
+    let asked: Vec<&str> = records
+        .iter()
+        .filter(|r| r.stream == glade_gyld::ASK_QUESTION)
+        .filter_map(|r| r.line.as_deref())
+        .collect();
+    assert_eq!(
+        asked,
+        vec![
+            "why is this blocked?",
+            "by what exactly?",
+            "and what unlocks it?"
+        ]
+    );
+
+    // Three turns, three run ids, ONE conversation key and one fold.
+    let runs: Vec<&str> = records
+        .iter()
+        .filter(|r| r.stream == glade_gyld::ASK_END)
+        .map(|r| r.run_id.as_str())
+        .collect();
+    assert_eq!(runs.len(), 3, "{records:?}");
+    assert!(runs[0] != runs[1] && runs[1] != runs[2], "{runs:?}");
+    assert!(records.iter().all(|r| r.conversation == CONVERSATION));
+
+    // The FIRST turn replays nothing; the third replays both prior turns, in
+    // order, each question with the answer it got.
+    assert!(seen[0].turns.is_empty(), "{:?}", seen[0].turns);
+    assert_eq!(seen[1].turns.len(), 1);
+    let third = &seen[2];
+    assert_eq!(third.turns.len(), 2, "{:?}", third.turns);
+    assert_eq!(third.turns[0].question, "why is this blocked?");
+    assert_eq!(third.turns[1].question, "by what exactly?");
+    assert!(
+        third
+            .turns
+            .iter()
+            .all(|t| t.answer == "It is blocked by proof_family (Q11)."),
+        "the chunks rejoin into the prose that was streamed: {:?}",
+        third.turns
+    );
+    assert_eq!(
+        third.turns[0].run_id, runs[0],
+        "each replayed turn keeps its own run id"
+    );
+    assert_eq!(third.prompt.user, "and what unlocks it?");
+
+    // The cached prefix is byte-identical across all three turns. If it ever
+    // moves, `cache_read_input_tokens` collapses to zero and the passages are
+    // paid for again on every follow-up.
+    let prefixes: Vec<String> = seen
+        .iter()
+        .map(|r| serde_json::to_string(&r.cached_prefix()).unwrap())
+        .collect();
+    assert_eq!(prefixes[0], prefixes[1], "the prefix moved on turn 2");
+    assert_eq!(prefixes[1], prefixes[2], "the prefix moved on turn 3");
+
+    // And the turns themselves sit AFTER it, with the one message breakpoint on
+    // the settled history rather than on the question just asked.
+    let body = third.body(true);
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[4]["content"][0]["text"], "and what unlocks it?");
+    assert!(messages[4]["content"][0].get("cache_control").is_none());
+    assert_eq!(
+        messages[3]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_per_conversation_budget_refuses_the_turn_that_would_cross_it() {
+    // The first turn counts 1200 in and costs 1242 all told; a 2000-token
+    // conversation has no room for a second.
+    let model = Arc::new(ScriptedModel {
+        chunks: vec!["It is blocked."],
+        ..Default::default()
+    });
+    let (records, seen) = conversed(
+        model.clone(),
+        "consult-conv-budget",
+        |c| c.agent.max_conversation_tokens = 2_000,
+        &["why is this blocked?", "and what unlocks it?"],
+    )
+    .await;
+
+    assert_eq!(seen.len(), 2, "both turns were COUNTED");
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        1,
+        "only the first was sent: an over-budget turn costs nothing"
+    );
+
+    // Both turns are on the surface — the refused one as its own turn, closed
+    // with the refusal as data and all three numbers.
+    let ends: Vec<&GyldAskRecord> = records
+        .iter()
+        .filter(|r| r.stream == glade_gyld::ASK_END)
+        .collect();
+    assert_eq!(ends.len(), 2, "{records:?}");
+    assert_eq!(ends[0].exit, Some(0));
+    assert!(ends[0].line.is_none(), "the first turn ended clean");
+    assert_eq!(ends[1].exit, Some(1));
+    let said = ends[1].line.clone().unwrap_or_default();
+    assert!(said.contains("1242") && said.contains("1200"), "{said}");
+    assert!(said.contains("2000"), "{said}");
+    assert!(
+        said.contains("--agent-max-conversation-tokens"),
+        "the refusal says what to do about it: {said}"
+    );
+
+    // The refused turn is still a turn: its question is on the surface, and so
+    // is the grounding it was refused with.
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.stream == glade_gyld::ASK_QUESTION)
+            .count(),
+        2,
+        "{records:?}"
+    );
+}
+
 /// The REAL HTTPS client, driven where the supplier drives it: on a blocking
 /// task, against a port nothing is listening on.
 ///
@@ -979,6 +1202,7 @@ async fn the_real_model_client_answers_with_data_from_a_blocking_task() {
             system: "the stance".into(),
             user: "why?".into(),
         },
+        turns: Vec::new(),
     };
     let said = tokio::task::spawn_blocking(move || client.count_tokens(&request))
         .await

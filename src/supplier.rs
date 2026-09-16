@@ -34,6 +34,7 @@ use glade_wire::generated::ExchangeReq;
 
 use crate::ask::{self, AgentState, Consultation};
 use crate::bundle::{self, Layout};
+use crate::conversation::{self, Ledger};
 use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
 use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
@@ -309,12 +310,16 @@ fn make_handler(
     first: Arc<FirstBuild>,
 ) -> impl Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static {
     let runs = Arc::new(AtomicU64::new(0));
+    // One running total per conversation, for the supplier's lifetime
+    // (GyldAskAgent.md section 7).
+    let ledger = Arc::new(Ledger::default());
     move |req: &ExchangeReq| -> Result<Vec<u8>, String> {
         let response = answer(
             &client,
             &config,
             &runner,
             &model,
+            &ledger,
             &handle,
             &runs,
             &first,
@@ -332,6 +337,7 @@ fn answer(
     config: &Arc<GyldConfig>,
     runner: &Arc<dyn Runner>,
     model: &Arc<dyn ModelClient>,
+    ledger: &Arc<Ledger>,
     handle: &Handle,
     runs: &Arc<AtomicU64>,
     first: &Arc<FirstBuild>,
@@ -381,6 +387,7 @@ fn answer(
             client.clone(),
             config.clone(),
             model.clone(),
+            ledger.clone(),
             handle.clone(),
             run_id.clone(),
             consult,
@@ -645,16 +652,20 @@ async fn stream_run(
 }
 
 /// Accept a consultation and answer at once: [`consult_run`] on its own task.
+#[allow(clippy::too_many_arguments)]
 fn spawn_consult(
     client: GladeClient,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
+    ledger: Arc<Ledger>,
     handle: Handle,
     run_id: String,
     consult: Consultation,
     who: Option<String>,
 ) {
-    handle.spawn(consult_run(client, config, model, run_id, consult, who));
+    handle.spawn(consult_run(
+        client, config, model, ledger, run_id, consult, who,
+    ));
 }
 
 /// Run one consultation and stream its reply.
@@ -672,13 +683,35 @@ async fn consult_run(
     client: GladeClient,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
+    ledger: Arc<Ledger>,
     run_id: String,
     consult: Consultation,
     who: Option<String>,
 ) {
     let conversation = consult.conversation.clone();
+    let question = consult.context.question.trim().to_string();
+
+    // The transcript IS the log share (section 6): the supplier reads back its
+    // own records for this conversation and replays them as prior turns. This
+    // happens BEFORE anything of this turn is appended, so what comes back is
+    // exactly the turns that came before.
+    let prior = conversation::turns(
+        &client
+            .fold_log(&config.share, &config.ask_id, Some(conversation.as_bytes()))
+            .await,
+    );
+    let mut seq: u64 = 1;
+    append_ask(
+        &client,
+        &config,
+        &conversation,
+        &GyldAskRecord::question(&run_id, seq, &who, &conversation, question),
+    )
+    .await;
+
     let (tx, mut rx) = mpsc::unbounded_channel::<Reply>();
     let model_config = config.model_config();
+    let spent = ledger.spent(&conversation);
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
             let (sources, prompt) = ground(&consult)?;
@@ -692,15 +725,15 @@ async fn consult_run(
             let request = ModelRequest {
                 config: model_config,
                 prompt,
+                turns: prior,
             };
-            model::consult(model.as_ref(), &request, &mut |event| {
+            model::consult(model.as_ref(), &request, spent, &mut |event| {
                 let ModelEvent::Text(chunk) = event;
                 let _ = tx.send(Reply::Answer(chunk));
             })
             .map_err(|refusal| refusal.says())
         });
 
-    let mut seq: u64 = 0;
     while let Some(reply) = rx.recv().await {
         seq += 1;
         let record = match reply {
@@ -714,7 +747,12 @@ async fn consult_run(
 
     let budget = config.agent.max_output_tokens;
     let (exit, said) = match work.await {
-        Ok(Ok(outcome)) => (outcome.exit(), outcome.says(budget)),
+        Ok(Ok(outcome)) => {
+            // What the turn cost joins the conversation's running total, so the
+            // NEXT turn is measured against what this one actually spent.
+            ledger.spend(&conversation, outcome.tokens());
+            (outcome.exit(), outcome.says(budget))
+        }
         Ok(Err(refused)) => (1, Some(refused)),
         Err(e) => (-1, Some(format!("the consultation task failed: {e}"))),
     };

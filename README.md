@@ -288,11 +288,62 @@ Both bounds are **refusal boundaries, not hopes**:
 - `--agent-max-output-tokens` is the request's `max_tokens`. A turn that stops
   there keeps its partial text and **says it is partial**: half an answer that
   says so is data; half an answer presented as a whole one is not.
+- `--agent-max-conversation-tokens` bounds the whole thread, not one turn — see
+  *The conversation* below.
 
 `stop_reason` is data too. `end_turn` closes the run with exit 0; `max_tokens`
 and every other ending close it with a non-zero exit and a line saying which;
 `refusal` carries the model's own category and explanation. A transport failure
 is one line and a non-zero exit, never a hang and never a panic.
+
+### The conversation: prior turns, and what they cost
+
+A follow-up is the SAME verb with the same conversation id and a new question.
+The supplier replays the turns before it, and **it reads them back out of its
+own records**: `gyld.ask` is keyed by the conversation, so folding that key is
+folding the transcript. Nothing is kept beside it — no file, no second copy of
+the same words — and nothing survives the supplier's own lifetime, which is the
+same thing section 10 says about the desk that asks the questions.
+
+That is why the reader's question is a record. `question` is a fifth record
+stream, appended before anything is asked of a model, and without it the surface
+would carry answers to questions nobody kept: a follow-up could replay half of
+each turn. A consumer that has never heard of it shows nothing for it.
+
+A turn that did not end clean is replayed SAYING so — a partial answer carries
+`[this turn ended: ...]`, a turn that produced no prose at all is replayed as
+that fact rather than as an empty assistant turn. A turn with no `question`
+record is not replayed at all: half a turn is not a turn, and inventing the
+other half is the one thing this agent must not do.
+
+**Two cache breakpoints, and both on things that cannot move.** Render order is
+`tools` → `system` → `messages`, so:
+
+1. the **system block** — the constant stance, the emitted facts of the
+   envelope and every resolved passage. None of it changes across the turns of
+   one conversation, so it is byte-identical from turn to turn and a follow-up
+   reads it rather than paying for the passages again.
+2. the **last prior assistant turn**, when there is one: settled history,
+   already on the log and unable to change.
+
+The question this turn asks is deliberately NOT marked. It is the one thing that
+differs every turn, and a breakpoint after it writes an entry whose tail is
+never read back. Two of the four breakpoints a request may carry are ever spent,
+and `tests/integration.rs` asserts the cached prefix is byte-identical across
+three turns of one conversation — because the failure mode here is silent:
+requests keep succeeding and the bill is just higher.
+`usage.cache_read_input_tokens` staying at zero across a conversation is the
+symptom that something in that prefix is moving.
+
+**The third budget is the conversation's.** `--agent-max-conversation-tokens`
+(default 1000000, the model's own context window; `0` lifts it) is a running
+total of `usage` across the turns of one conversation — the prompt however it
+was served, uncached, written to the cache or read back from it, plus what came
+out. Prior turns ride into every follow-up, so the thread is the one thing here
+that grows on its own. The turn that would cross the total is refused BEFORE it
+is sent, with all three numbers and what to do about it, and costs nothing. The
+totals are the supplier's own accounting and never reach the log: a token count
+is not a fact about the decision graph.
 
 `explain` is **always** a streaming run, whatever `stream_output` said: a
 consultation is model time, and its reply is a stream by nature. The exchange
@@ -309,6 +360,7 @@ run id instead would need one mount per question asked.
 
 | `stream` | carries | what it is |
 | --- | --- | --- |
+| `question` | `line`: the question, as the reader typed it | the turn's opening, appended before anything is asked of a model |
 | `citation` | `record`: the resolved source, whole | one cited passage with its tag, document, heading, lines and digest — or `resolved: false` with the reason |
 | `answer` | `line`: one text chunk | the prose, as the model streams it |
 | `end` | `done: true`, `exit`, and a `line` on anything but a clean end | the turn's close |
@@ -431,19 +483,19 @@ lens pointer's `path` names.
 ## Tests
 
 ```sh
-cargo test                              # 43 unit + 9 integration
+cargo test                              # 85 unit + 15 integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 The integration suite spawns the real `glade-node` binary booted with
 `tests/fixtures/gyld-test-app.glade`, under a temp `GLADE_HOME` and `HOME`
-(never the real `~/.glade`). Eight of its nine tests drive a **runner double**,
+(never the real `~/.glade`). All but one of its tests drive a **runner double**,
 so the whole verb path is exercised with no interpreter and no Gyld checkout in
 sight — the attach-time publication is checked with a runner that panics if it
 is called at all, because that path runs no host, and the first build with one
 that answers the discovery run the way a checkout would and then writes a
-bundle. The ninth runs one real subprocess,
+bundle. One test runs one real subprocess,
 `emit_decision_streams.py --help`, out of a Gyld checkout found at
 `../../gyld-wz/gyld` or at `GLADE_GYLD_TEST_GYLD_ROOT`; it skips loudly when
 that checkout or its interpreter is absent.

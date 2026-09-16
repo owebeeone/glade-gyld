@@ -321,6 +321,14 @@ pub enum AskRefusal {
     /// The counted input crossed the per-run budget. Refused BEFORE the call,
     /// with both numbers, so it costs nothing.
     OverInputBudget { counted: u64, budget: u64 },
+    /// This turn would take the CONVERSATION over its running total. Refused
+    /// before the call as well, with all three numbers: a conversation that can
+    /// grow without bound is a bill that can.
+    OverConversationBudget {
+        spent: u64,
+        counted: u64,
+        budget: u64,
+    },
     /// The call could not be made, or broke on the way. Failure as data, like a
     /// spawn error or a timeout on the host path.
     Transport { reason: String },
@@ -359,6 +367,17 @@ impl AskRefusal {
                 format!(
                     "this turn counts {counted} input tokens; the per-run budget is {budget}, so \
                      nothing was sent"
+                )
+            }
+            AskRefusal::OverConversationBudget {
+                spent,
+                counted,
+                budget,
+            } => {
+                format!(
+                    "this conversation has spent {spent} tokens and this turn counts {counted} \
+                     more; the per-conversation budget is {budget}, so nothing was sent. Open a \
+                     new conversation, or raise --agent-max-conversation-tokens"
                 )
             }
             AskRefusal::Transport { reason } => reason.clone(),

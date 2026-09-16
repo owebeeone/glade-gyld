@@ -1143,7 +1143,7 @@ async fn the_per_conversation_budget_refuses_the_turn_that_would_cross_it() {
     let (records, seen) = conversed(
         model.clone(),
         "consult-conv-budget",
-        |c| c.agent.max_conversation_tokens = 2_000,
+        |c| c.agent.max_conversation_tokens = Some(2_000),
         &["why is this blocked?", "and what unlocks it?"],
     )
     .await;
@@ -1387,6 +1387,91 @@ async fn a_draft_naming_a_foreign_alternative_is_emitted_unresolved_not_correcte
 /// The REAL HTTPS client, driven where the supplier drives it: on a blocking
 /// task, against a port nothing is listening on.
 ///
+/// The configuration a RUNNING supplier reads: a file under the app-owned
+/// bundle root, with no flag and no restart anywhere in it.
+///
+/// grazel composes this binary's argv itself and passes none of the `--agent-*`
+/// flags, so this file is the only way a desk's model or endpoint can be
+/// changed at all. It is read through `GyldConfig` exactly as a call reads it.
+#[test]
+fn the_bundle_roots_own_config_file_configures_a_supplier_that_was_given_no_flags() {
+    let tmp = Tmp::new("agent-config");
+    let bundle = tmp.path().join("gyld");
+    std::fs::create_dir_all(bundle.join("agent")).unwrap();
+    let config = config_for(
+        "ws://127.0.0.1:1",
+        tmp.path().join("gyld-root"),
+        bundle.clone(),
+    );
+
+    // The key file is the bundle root's own, with no flag and no file.
+    let bare = config.resolve_agent();
+    assert!(bare.notes.is_empty(), "{:?}", bare.notes);
+    assert_eq!(bare.config.key_file, bundle.join("agent/api-key"));
+
+    // The file lands beside the key file and is read at the next call. This
+    // process's OWN environment outranks it (that is the precedence under
+    // test), so what it can be asserted to change is what the environment
+    // here leaves alone.
+    let path = bundle.join(glade_gyld::DEFAULT_CONFIG_FILE);
+    std::fs::write(
+        &path,
+        r#"{"base_url": "http://127.0.0.1:11434", "model": "qwen3.8-96k",
+            "max_tokens": 4242}"#,
+    )
+    .unwrap();
+    let local = config.resolve_agent();
+    assert!(local.notes.is_empty(), "{:?}", local.notes);
+    assert_eq!(local.config.max_output_tokens, 4242);
+    if std::env::var(glade_gyld::BASE_URL_ENV).is_err() {
+        assert_eq!(local.config.base_url, "http://127.0.0.1:11434");
+        assert_eq!(
+            local.config.compat,
+            glade_gyld::Compat::Ollama,
+            "an endpoint that is not Anthropic's takes the ollama profile"
+        );
+        assert!(!local.config.count_tokens, "there is no count_tokens there");
+    } else {
+        eprintln!("SKIP: {} is set here", glade_gyld::BASE_URL_ENV);
+    }
+    if std::env::var(glade_gyld::MODEL_ENV).is_err() {
+        assert_eq!(local.config.model, "qwen3.8-96k");
+    }
+
+    // A flag that WAS passed still wins over both; one that was not passed
+    // sets nothing, which is what makes the file usable at all.
+    let mut flagged = config.clone();
+    flagged.agent.model = Some("gemma4:26b".into());
+    flagged.agent.base_url = Some("http://127.0.0.1:11434".into());
+    let over = flagged.resolve_agent();
+    assert_eq!(over.config.model, "gemma4:26b");
+    assert_eq!(over.config.base_url, "http://127.0.0.1:11434");
+    assert_eq!(over.config.compat, glade_gyld::Compat::Ollama);
+    assert_eq!(
+        over.config.max_output_tokens, 4242,
+        "the file still holds everything no flag named"
+    );
+
+    // A file nobody can parse is a NOTE and the supplier still has a config.
+    std::fs::write(&path, "{,}").unwrap();
+    let broken = config.resolve_agent();
+    assert_eq!(broken.notes.len(), 1, "{:?}", broken.notes);
+    assert!(
+        broken.notes[0].contains("did not decode"),
+        "{:?}",
+        broken.notes
+    );
+    assert_eq!(
+        broken.config.max_output_tokens,
+        glade_gyld::DEFAULT_MAX_OUTPUT_TOKENS,
+        "nothing is taken from a file that did not decode"
+    );
+
+    let said = broken.says();
+    assert!(said.contains(&broken.config.model), "{said}");
+    assert!(!said.to_lowercase().contains("key"), "{said}");
+}
+
 /// The point is not the transport error — it is that there is one. A blocking
 /// HTTP client asserts, in debug builds, that it is neither built nor called
 /// from inside an async context; building it at attach panicked the supplier at

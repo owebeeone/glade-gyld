@@ -31,6 +31,9 @@
 //! * [`model`] — the [`model::ModelClient`] trait and its raw-HTTPS
 //!   implementation: key discovery, the budgets, the streamed SSE, and the one
 //!   tool a draft comes back in (sections 7 and 8).
+//! * [`agent`] — how that client is configured when nobody can pass it a flag:
+//!   `agent/config.json` under the bundle root, the environment over it, the
+//!   flags over both, and the compatibility profile of the endpoint.
 //! * [`bundle`] — the bundle-root layout, the staging repository, containment,
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
@@ -41,6 +44,7 @@
 //!   publishing the bundle root's current build the moment it is serving and
 //!   making the first build itself when the root has none.
 
+pub mod agent;
 pub mod ask;
 pub mod bundle;
 pub mod conversation;
@@ -53,6 +57,10 @@ pub mod sources;
 pub mod supplier;
 pub mod verbs;
 
+pub use agent::{
+    resolve as resolve_agent, AgentOverrides, Compat, Resolved, AUTH_TOKEN_ENV, BASE_URL_ENV,
+    COMPAT_ENV, DEFAULT_CONFIG_FILE, MODEL_ENV,
+};
 pub use ask::{
     AgentState, AskContext, AskDraft, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE,
 };
@@ -67,8 +75,9 @@ pub use exec::{
 };
 pub use model::{
     draft_tool, Declined, Fold, ModelClient, ModelConfig, ModelEvent, ModelOutcome, ModelRequest,
-    DEFAULT_AGENT_MODEL, DEFAULT_MAX_CONVERSATION_TOKENS, DEFAULT_MAX_INPUT_TOKENS,
-    DEFAULT_MAX_OUTPUT_TOKENS, DRAFT_TOOL, END_TURN, MAX_TOKENS, REFUSAL, TOOL_USE,
+    Shape, DEFAULT_AGENT_MODEL, DEFAULT_BASE_URL, DEFAULT_MAX_CONVERSATION_TOKENS,
+    DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DRAFT_TOOL, END_TURN, MAX_TOKENS, REFUSAL,
+    TOOL_USE,
 };
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};

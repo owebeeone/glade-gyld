@@ -11,19 +11,28 @@
 //!            [--python /opt/homebrew/bin/python3.13]
 //!            [--timeout-secs 600] [--max-output-bytes 1048576]
 //!            [--agent-model claude-opus-5] [--agent-key-file FILE]
+//!            [--agent-base-url https://api.anthropic.com] [--agent-compat anthropic|ollama]
 //!            [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]
 //!            [--agent-max-conversation-tokens 1000000]
 //! ```
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
 //! link drop (the kit helper), and tears the session down cleanly on a signal.
+//!
+//! **A flag that was not passed sets nothing.** grazel spawns this binary with
+//! a fixed argument list and none of the `--agent-*` flags in it, so the
+//! configuration that reaches a running desk comes from
+//! `<bundle-root>/agent/config.json` and the environment
+//! (`glade_gyld::agent`). The flags here are the TOP of that precedence, and
+//! they are collected as options precisely so an unpassed one does not overrule
+//! a file with a default nobody chose.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gyld::{
-    serve, GyldConfig, Limits, ModelConfig, Surfaces, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
+    serve, AgentOverrides, Compat, GyldConfig, Limits, Surfaces, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
     DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE,
     DEFAULT_TIMEOUT_SECS,
 };
@@ -34,6 +43,7 @@ const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --b
 [--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
 [--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576] \
 [--agent-model claude-opus-5] [--agent-key-file FILE] \
+[--agent-base-url https://api.anthropic.com] [--agent-compat anthropic|ollama] \
 [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000] \
 [--agent-max-conversation-tokens 1000000]";
 
@@ -65,15 +75,13 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> std::io::Result<()> {
     let config = args.config;
     eprintln!(
-        "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, principal {}, \
-         agent-model {})",
+        "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, principal {})",
         config.node_url,
         config.share,
         config.glade_id,
         config.layout.gyld_root.display(),
         config.layout.bundle_root.display(),
         config.principal.as_deref().unwrap_or("<none>"),
-        config.agent.model,
     );
     let supplier = serve(config, args.python).await?;
     eprintln!("glade-gyld: serving; SIGTERM/SIGINT to stop");
@@ -117,7 +125,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut python = PathBuf::from(DEFAULT_PYTHON);
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES;
-    let mut agent = ModelConfig::default();
+    let mut agent = AgentOverrides::default();
 
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -137,24 +145,36 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--file-id" => surfaces.file_id = take("--file-id")?,
             "--static-base" => surfaces.static_base = take("--static-base")?,
             "--principal" => principal = Some(take("--principal")?),
-            "--agent-model" => agent.model = take("--agent-model")?,
-            "--agent-key-file" => agent.key_file = PathBuf::from(take("--agent-key-file")?),
+            "--agent-model" => agent.model = Some(take("--agent-model")?),
+            "--agent-base-url" => agent.base_url = Some(take("--agent-base-url")?),
+            "--agent-compat" => {
+                agent.compat = Some(Compat::parse(&take("--agent-compat")?)?);
+            }
+            "--agent-key-file" => {
+                agent.key_file = Some(PathBuf::from(take("--agent-key-file")?));
+            }
             "--agent-max-input-tokens" => {
-                agent.max_input_tokens = take("--agent-max-input-tokens")?
-                    .parse()
-                    .map_err(|_| "--agent-max-input-tokens must be an integer".to_string())?;
+                agent.max_input_tokens = Some(
+                    take("--agent-max-input-tokens")?
+                        .parse()
+                        .map_err(|_| "--agent-max-input-tokens must be an integer".to_string())?,
+                );
             }
             "--agent-max-conversation-tokens" => {
-                agent.max_conversation_tokens = take("--agent-max-conversation-tokens")?
-                    .parse()
-                    .map_err(|_| {
-                        "--agent-max-conversation-tokens must be an integer".to_string()
-                    })?;
+                agent.max_conversation_tokens = Some(
+                    take("--agent-max-conversation-tokens")?
+                        .parse()
+                        .map_err(|_| {
+                            "--agent-max-conversation-tokens must be an integer".to_string()
+                        })?,
+                );
             }
             "--agent-max-output-tokens" => {
-                agent.max_output_tokens = take("--agent-max-output-tokens")?
-                    .parse()
-                    .map_err(|_| "--agent-max-output-tokens must be an integer".to_string())?;
+                agent.max_tokens = Some(
+                    take("--agent-max-output-tokens")?
+                        .parse()
+                        .map_err(|_| "--agent-max-output-tokens must be an integer".to_string())?,
+                );
             }
             "--python" => python = PathBuf::from(take("--python")?),
             "--timeout-secs" => {

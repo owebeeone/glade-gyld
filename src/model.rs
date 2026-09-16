@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::agent::Compat;
 use crate::ask::{AskRefusal, KEY_ENV};
 use crate::conversation::{self, Turn};
 use crate::prompt::Prompt;
@@ -62,11 +63,67 @@ pub const DEFAULT_MODEL_TIMEOUT_SECS: u64 = 300;
 /// turns of it, not one. `0` lifts the ceiling.
 pub const DEFAULT_MAX_CONVERSATION_TOKENS: u64 = 1_000_000;
 
+/// What a request may carry beyond the bare Messages API — and therefore what
+/// is DROPPED when an endpoint will not take it.
+///
+/// Both are optimisations, not meaning: `strict` guarantees the draft tool's
+/// input validates, `cache_control` makes a follow-up read the passages from
+/// the cache instead of paying for them again. A turn sent without either is
+/// the same turn, more expensive and less checked. That is why an endpoint
+/// that rejects one is answered by dropping it and saying so, rather than by
+/// failing the reader's question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shape {
+    /// `strict: true` on the draft tool.
+    pub strict: bool,
+    /// The two `cache_control` breakpoints.
+    pub cache_control: bool,
+}
+
+impl Shape {
+    /// Everything on: what the Anthropic path has always sent, and what every
+    /// first attempt sends.
+    pub fn full() -> Shape {
+        Shape {
+            strict: true,
+            cache_control: true,
+        }
+    }
+
+    /// The same request with `strict` dropped from the tool.
+    pub fn without_strict(self) -> Shape {
+        Shape {
+            strict: false,
+            ..self
+        }
+    }
+
+    /// The same request with no cache breakpoints.
+    pub fn without_cache_control(self) -> Shape {
+        Shape {
+            cache_control: false,
+            ..self
+        }
+    }
+}
+
+impl Default for Shape {
+    fn default() -> Shape {
+        Shape::full()
+    }
+}
+
 /// Everything the model call is configured with. No key: see the module note.
+///
+/// It is resolved per call from [`crate::agent::resolve`] — a config file, the
+/// environment and the flags — so the endpoint and the model can change under a
+/// running supplier.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
     pub model: String,
     pub base_url: String,
+    /// Which dialect of the Messages API `base_url` speaks.
+    pub compat: Compat,
     pub max_input_tokens: u64,
     pub max_output_tokens: u64,
     /// The running total one conversation may spend across its turns; `0` is
@@ -75,6 +132,12 @@ pub struct ModelConfig {
     pub timeout: Duration,
     /// Where a key is read from when the environment carries none.
     pub key_file: PathBuf,
+    /// Ask the endpoint to count the input before the call. False where the
+    /// endpoint has no `count_tokens`, and the budget is estimated instead.
+    pub count_tokens: bool,
+    /// What the FIRST request of a call carries. The client degrades from here
+    /// on what the endpoint actually rejects.
+    pub shape: Shape,
 }
 
 impl Default for ModelConfig {
@@ -82,11 +145,25 @@ impl Default for ModelConfig {
         ModelConfig {
             model: DEFAULT_AGENT_MODEL.into(),
             base_url: DEFAULT_BASE_URL.into(),
+            compat: Compat::Anthropic,
             max_input_tokens: DEFAULT_MAX_INPUT_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_conversation_tokens: DEFAULT_MAX_CONVERSATION_TOKENS,
             timeout: Duration::from_secs(DEFAULT_MODEL_TIMEOUT_SECS),
             key_file: PathBuf::new(),
+            count_tokens: true,
+            shape: Shape::full(),
+        }
+    }
+}
+
+impl ModelConfig {
+    /// The default with the bundle root's own key file in it: what an
+    /// unconfigured supplier resolves to.
+    pub fn default_at(bundle_root: &Path) -> ModelConfig {
+        ModelConfig {
+            key_file: bundle_root.join(crate::ask::DEFAULT_KEY_FILE),
+            ..ModelConfig::default()
         }
     }
 }
@@ -227,15 +304,29 @@ impl ModelRequest {
     }
 
     fn shared(&self) -> serde_json::Value {
+        let shape = self.config.shape;
+        let mut tool = draft_tool();
+        if !shape.strict {
+            if let Some(fields) = tool.as_object_mut() {
+                fields.remove("strict");
+            }
+        }
+        let mut system = serde_json::json!({
+            "type": "text",
+            "text": self.prompt.system,
+        });
+        if shape.cache_control {
+            system["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
         serde_json::json!({
             "model": self.config.model,
-            "tools": [draft_tool()],
-            "system": [{
-                "type": "text",
-                "text": self.prompt.system,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            "messages": conversation::messages(&self.turns, &self.prompt.user),
+            "tools": [tool],
+            "system": [system],
+            "messages": conversation::messages(
+                &self.turns,
+                &self.prompt.user,
+                shape.cache_control,
+            ),
         })
     }
 }
@@ -394,15 +485,20 @@ pub fn consult(
 
 /// The model key, at the moment of the call and nowhere else.
 ///
-/// `ANTHROPIC_API_KEY` in the supplier's environment first, then the key file.
-/// The file is MODE CHECKED: a credential any other account on the machine can
-/// read is refused rather than used, because a supplier that quietly accepts
-/// one teaches everybody that it is fine.
+/// `ANTHROPIC_API_KEY` in the supplier's environment first, then
+/// [`crate::agent::AUTH_TOKEN_ENV`], then the key file. The second name is
+/// there because it is the one Claude-shaped clients and the dabeest launchers
+/// already export, and a local endpoint's token is a dummy value that must
+/// nonetheless be present. The file is MODE CHECKED: a credential any other
+/// account on the machine can read is refused rather than used, because a
+/// supplier that quietly accepts one teaches everybody that it is fine.
 pub fn discover_key(key_file: &Path) -> Result<String, AskRefusal> {
-    if let Ok(value) = std::env::var(KEY_ENV) {
-        let value = value.trim().to_string();
-        if !value.is_empty() {
-            return Ok(value);
+    for name in [KEY_ENV, crate::agent::AUTH_TOKEN_ENV] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
         }
     }
     let read = std::fs::read_to_string(key_file);
@@ -1134,6 +1230,71 @@ pub(crate) mod tests {
         let prefix = request().cached_prefix();
         assert_eq!(prefix["tools"], body["tools"]);
         assert_eq!(request().count_body()["tools"], body["tools"]);
+    }
+
+    #[test]
+    fn a_degraded_shape_drops_strict_and_the_breakpoints_and_changes_nothing_else() {
+        let mut request = request();
+        request.turns = crate::conversation::turns(&crate::conversation::tests::turn(
+            "run-1",
+            "why is this blocked?",
+            &["It is."],
+            None,
+        ));
+        let full = request.body(true);
+        assert_eq!(full["tools"][0]["strict"], true);
+        assert_eq!(
+            serde_json::to_string(&full)
+                .unwrap()
+                .matches("cache_control")
+                .count(),
+            2
+        );
+
+        request.config.shape = Shape::full().without_strict();
+        let lax = request.body(true);
+        assert!(
+            lax["tools"][0].get("strict").is_none(),
+            "an endpoint that rejects `strict` gets the tool without it"
+        );
+        assert_eq!(
+            lax["tools"][0]["input_schema"], full["tools"][0]["input_schema"],
+            "the schema itself is untouched: only the guarantee goes"
+        );
+        assert_eq!(lax["messages"], full["messages"]);
+
+        request.config.shape = Shape::full().without_cache_control();
+        let uncached = request.body(true);
+        assert_eq!(
+            serde_json::to_string(&uncached)
+                .unwrap()
+                .matches("cache_control")
+                .count(),
+            0,
+            "no breakpoint survives, in the system block or the history"
+        );
+        assert_eq!(uncached["tools"][0]["strict"], true, "the other stays on");
+        assert_eq!(
+            uncached["system"][0]["text"], full["system"][0]["text"],
+            "the stance and the passages are the same bytes"
+        );
+        assert_eq!(uncached["max_tokens"], full["max_tokens"]);
+
+        // The count body degrades with it: counting a body that is not the one
+        // about to be sent is not a budget.
+        request.config.shape = Shape {
+            strict: false,
+            cache_control: false,
+        };
+        let counted = request.count_body();
+        assert!(counted["tools"][0].get("strict").is_none());
+        assert_eq!(
+            serde_json::to_string(&counted)
+                .unwrap()
+                .matches("cache_control")
+                .count(),
+            0
+        );
     }
 
     #[test]

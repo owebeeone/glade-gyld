@@ -479,8 +479,8 @@ impl AskRefusal {
         match self {
             AskRefusal::NoModelKey { key_file } => {
                 format!(
-                    "no model key: set ANTHROPIC_API_KEY in the supplier's environment, or write \
-                     {}",
+                    "no model key: set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in the \
+                     supplier's environment, or write {}",
                     key_file.display()
                 )
             }

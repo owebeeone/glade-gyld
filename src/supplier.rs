@@ -32,6 +32,7 @@ use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
 use glade_client::GladeClient;
 use glade_wire::generated::ExchangeReq;
 
+use crate::agent::{self, AgentOverrides, Resolved};
 use crate::ask::{self, AgentState, AskDraft, Consultation};
 use crate::bundle::{self, Layout};
 use crate::conversation::{self, Ledger};
@@ -69,10 +70,14 @@ pub struct GyldConfig {
     pub surfaces: Surfaces,
     pub principal: Option<String>,
     pub limits: Limits,
-    /// The ask agent: the model, the two budgets and the key file
-    /// (GyldAskAgent.md section 7). An empty `key_file` is the default,
-    /// `<bundle-root>/agent/api-key`.
-    pub agent: ModelConfig,
+    /// The ask agent, as the FLAGS set it (GyldAskAgent.md section 7).
+    ///
+    /// Only the flags: a field nobody passed is `None` and stays `None`, so
+    /// `<bundle-root>/agent/config.json` and the environment are not overruled
+    /// by a default that was never chosen ([`crate::agent`]). The effective
+    /// configuration is [`GyldConfig::resolve_agent`], taken afresh at attach
+    /// and at every call.
+    pub agent: AgentOverrides,
 }
 
 impl GyldConfig {
@@ -93,26 +98,31 @@ impl GyldConfig {
             surfaces: Surfaces::default(),
             principal: None,
             limits: Limits::default(),
-            agent: ModelConfig::default(),
+            agent: AgentOverrides::default(),
         }
+    }
+
+    /// The effective agent configuration, read NOW: the config file under the
+    /// app-owned bundle root, the environment over it, the flags over both.
+    ///
+    /// Taken afresh every time, which is the point. grazel spawns this supplier
+    /// with a fixed argument list, so the file is the only channel a running
+    /// desk has — and a file that were read once at attach would need a
+    /// restart of the whole app to change a model.
+    pub fn resolve_agent(&self) -> Resolved {
+        agent::resolve(&self.layout.bundle_root, &self.agent)
     }
 
     /// The key file this supplier reads when the environment carries no key.
-    /// The path is the APP's, never a request's: it is `--agent-key-file` or
-    /// the bundle root's own `agent/api-key`.
+    /// The path is the APP's, never a request's: it is `--agent-key-file`, the
+    /// config file's own `key_file`, or the bundle root's `agent/api-key`.
     pub fn key_file(&self) -> PathBuf {
-        if self.agent.key_file.as_os_str().is_empty() {
-            return self.layout.bundle_root.join(ask::DEFAULT_KEY_FILE);
-        }
-        self.agent.key_file.clone()
+        self.resolve_agent().config.key_file
     }
 
-    /// The model configuration one turn is made with, key file resolved.
+    /// The model configuration one turn is made with.
     pub fn model_config(&self) -> ModelConfig {
-        ModelConfig {
-            key_file: self.key_file(),
-            ..self.agent.clone()
-        }
+        self.resolve_agent().config
     }
 }
 
@@ -124,10 +134,12 @@ impl GyldConfig {
 /// reaches a plan, a prompt, a record or a log line.
 fn agent_state(config: &GyldConfig, latest: Option<&std::path::Path>) -> AgentState {
     let key_file = config.key_file();
-    let key = std::env::var(ask::KEY_ENV)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-        || key_file.is_file();
+    let named = |name: &str| {
+        std::env::var(name)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let key = named(ask::KEY_ENV) || named(agent::AUTH_TOKEN_ENV) || key_file.is_file();
     let (index, streams) = match latest {
         Some(dir) => {
             let listed = std::fs::read(dir.join("streams.json"))
@@ -164,7 +176,15 @@ impl GyldSupplier {
 /// Connect, attach as the gyld authority, and serve, with the real Python
 /// runner and the real HTTPS model client.
 pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSupplier> {
-    let model = model::HttpsModelClient::new(config.model_config());
+    // The effective configuration, SAID at attach: which endpoint and which
+    // model this desk is about to be answered by. Never the key, and never
+    // whether there is one — that is the refusal's business, per request.
+    let resolved = config.resolve_agent();
+    eprintln!("glade-gyld: agent {}", resolved.says());
+    for note in resolved.notes.iter() {
+        eprintln!("glade-gyld: agent config: {note}");
+    }
+    let model = model::HttpsModelClient::new(resolved.config);
     serve_with(config, Arc::new(PythonRunner::new(python)), Arc::new(model)).await
 }
 
@@ -710,7 +730,12 @@ async fn consult_run(
     .await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Reply>();
-    let model_config = config.model_config();
+    // Read at every call, not once at attach: the config file is the only
+    // channel a running desk has, so a model changed there takes effect on the
+    // next question rather than on the next restart.
+    let resolved = config.resolve_agent();
+    let budget = resolved.config.max_output_tokens;
+    let model_config = resolved.config;
     let drafted_by = model_config.model.clone();
     let spent = ledger.spent(&conversation);
     let work =
@@ -771,7 +796,6 @@ async fn consult_run(
         append_ask(&client, &config, &conversation, &record).await;
     }
 
-    let budget = config.agent.max_output_tokens;
     let (exit, said) = match work.await {
         Ok(Ok(outcome)) => {
             // What the turn cost joins the conversation's running total, so the

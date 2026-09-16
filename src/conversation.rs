@@ -168,11 +168,15 @@ fn drafted(record: &serde_json::Value) -> String {
 /// this boundary; it is the boundary between what is settled and what is not.
 ///
 /// At most two breakpoints are ever spent, of the four a request may carry.
-pub fn messages(turns: &[Turn], question: &str) -> Vec<serde_json::Value> {
+pub fn messages(turns: &[Turn], question: &str, cached: bool) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (i, turn) in turns.iter().enumerate() {
         out.push(said("user", &turn.question, false));
-        out.push(said("assistant", &turn.assistant(), i + 1 == turns.len()));
+        out.push(said(
+            "assistant",
+            &turn.assistant(),
+            cached && i + 1 == turns.len(),
+        ));
     }
     out.push(said("user", question, false));
     out
@@ -367,7 +371,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_first_turn_carries_the_question_alone_and_marks_nothing() {
-        let messages = messages(&[], "why is this blocked?");
+        let messages = messages(&[], "why is this blocked?", true);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"][0]["text"], "why is this blocked?");
@@ -380,7 +384,7 @@ pub(crate) mod tests {
     #[test]
     fn a_follow_up_replays_every_prior_turn_in_order_and_caches_the_settled_history() {
         let prior = turns(&two_turns());
-        let messages = messages(&prior, "and what unlocks it?");
+        let messages = messages(&prior, "and what unlocks it?", true);
         assert_eq!(
             messages
                 .iter()
@@ -406,6 +410,28 @@ pub(crate) mod tests {
         assert_eq!(
             messages[3]["content"][0]["cache_control"]["type"],
             "ephemeral"
+        );
+
+        // An endpoint that rejects `cache_control` gets the same transcript
+        // with no breakpoint in it: the history is unchanged, the marker is
+        // what goes.
+        let plain = super::messages(&prior, "and what unlocks it?", false);
+        assert!(
+            plain
+                .iter()
+                .all(|m| m["content"][0].get("cache_control").is_none()),
+            "{plain:?}"
+        );
+        assert_eq!(
+            plain
+                .iter()
+                .map(|m| m["content"][0]["text"].clone())
+                .collect::<Vec<_>>(),
+            messages
+                .iter()
+                .map(|m| m["content"][0]["text"].clone())
+                .collect::<Vec<_>>(),
+            "only the marker differs"
         );
     }
 

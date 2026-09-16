@@ -68,15 +68,16 @@ pub use bundle::{FilePointer, Layout};
 pub use conversation::{Ledger, Turn};
 pub use envelope::{
     GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, ASK_ANSWER, ASK_CITATION,
-    ASK_DRAFT, ASK_END, ASK_QUESTION,
+    ASK_DRAFT, ASK_END, ASK_NOTE, ASK_QUESTION,
 };
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
 pub use model::{
-    draft_tool, Declined, Fold, ModelClient, ModelConfig, ModelEvent, ModelOutcome, ModelRequest,
-    Shape, DEFAULT_AGENT_MODEL, DEFAULT_BASE_URL, DEFAULT_MAX_CONVERSATION_TOKENS,
-    DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DRAFT_TOOL, END_TURN, MAX_TOKENS, REFUSAL,
+    degrade, draft_tool, estimate_tokens, Declined, Fold, ModelClient, ModelConfig, ModelEvent,
+    ModelOutcome, ModelRequest, Shape, DEFAULT_AGENT_MODEL, DEFAULT_BASE_URL,
+    DEFAULT_MAX_CONVERSATION_TOKENS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
+    DRAFT_TOOL, END_TURN, ESTIMATED_CHARS_PER_TOKEN, MAX_DEGRADATIONS, MAX_TOKENS, REFUSAL,
     TOOL_USE,
 };
 pub use prompt::{compose, Prompt, STANCE};

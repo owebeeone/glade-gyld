@@ -276,7 +276,14 @@ impl ModelRequest {
     /// and adaptive, and `display` stays at its default, so no reasoning text
     /// can reach a log record.
     pub fn body(&self, stream: bool) -> serde_json::Value {
-        let mut body = self.shared();
+        self.body_shaped(stream, self.config.shape)
+    }
+
+    /// The same body in an explicitly named shape — what a retry after a
+    /// rejection is sent in. The configured shape is only ever the FIRST
+    /// attempt's.
+    pub fn body_shaped(&self, stream: bool, shape: Shape) -> serde_json::Value {
+        let mut body = self.shared_shaped(shape);
         body["max_tokens"] = self.config.max_output_tokens.into();
         body["stream"] = stream.into();
         body
@@ -287,7 +294,7 @@ impl ModelRequest {
     /// SENT is the whole point: a count of something else is not a budget, and
     /// a count that forgot the conversation is not this turn's count.
     pub fn count_body(&self) -> serde_json::Value {
-        self.shared()
+        self.shared_shaped(self.config.shape)
     }
 
     /// The bytes the cache is keyed on, up to and including the system block:
@@ -304,7 +311,10 @@ impl ModelRequest {
     }
 
     fn shared(&self) -> serde_json::Value {
-        let shape = self.config.shape;
+        self.shared_shaped(self.config.shape)
+    }
+
+    fn shared_shaped(&self, shape: Shape) -> serde_json::Value {
         let mut tool = draft_tool();
         if !shape.strict {
             if let Some(fields) = tool.as_object_mut() {
@@ -331,9 +341,18 @@ impl ModelRequest {
     }
 }
 
-/// One thing the stream produced.
+/// One thing the call produced.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
+    /// Something the CALL had to do differently, as data: an input budget that
+    /// is an estimate because the endpoint has no `count_tokens`, a `strict`
+    /// the endpoint rejected, a cache breakpoint it would not take.
+    ///
+    /// **Never silent.** Each of these makes the turn weaker in a way a reader
+    /// can act on — an unchecked draft input, a prompt paid for in full, a
+    /// budget that is a guess — so each one is a record on the run beside the
+    /// answer, not a log line in a terminal nobody is reading.
+    Note(String),
     /// A chunk of the answer, as it arrived.
     Text(String),
     /// A draft, as the tool call carried it — the raw input, read by nothing
@@ -433,8 +452,13 @@ impl ModelOutcome {
 /// Calls a model. Synchronous, like [`crate::exec::Runner`], and driven from a
 /// blocking task; the tests drive a scripted double instead.
 pub trait ModelClient: Send + Sync + 'static {
-    /// Count the input tokens of `request` before it is sent.
-    fn count_tokens(&self, request: &ModelRequest) -> Result<u64, String>;
+    /// Count the input tokens of `request` before it is sent — or estimate
+    /// them, saying so through `on_event`, where the endpoint cannot count.
+    fn count_tokens(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelEvent),
+    ) -> Result<u64, String>;
 
     /// Stream the reply, calling `on_event` for each event as it arrives.
     /// An `Err` is a transport failure, which the caller turns into data.
@@ -443,6 +467,78 @@ pub trait ModelClient: Send + Sync + 'static {
         request: &ModelRequest,
         on_event: &mut dyn FnMut(ModelEvent),
     ) -> Result<ModelOutcome, String>;
+}
+
+/// How many characters of request body one token is taken to be, when the
+/// endpoint cannot be asked.
+///
+/// Deliberately pessimistic. The usual rule of thumb is four characters a
+/// token; three OVER-counts by about a third, and an over-count refuses a turn
+/// that would have fitted while an under-count sends one that does not. A
+/// budget that can be crossed silently is not a budget, and the refusal names
+/// both numbers either way.
+pub const ESTIMATED_CHARS_PER_TOKEN: u64 = 3;
+
+/// The input size of a request, without asking anybody.
+///
+/// It is measured on the body that is about to be SENT — the same document
+/// `count_tokens` would have been given — so it moves with the prompt, the
+/// tool declaration and every prior turn, exactly as the real count does.
+pub fn estimate_tokens(request: &ModelRequest) -> u64 {
+    let body = serde_json::to_string(&request.count_body()).unwrap_or_default();
+    (body.chars().count() as u64).div_ceil(ESTIMATED_CHARS_PER_TOKEN)
+}
+
+/// What one rejection of a request FEATURE costs, and what is left to try.
+///
+/// The ladder is `strict`, then `cache_control`, then nothing: two rungs, so a
+/// call makes at most three attempts and an endpoint that simply dislikes the
+/// request cannot be retried at forever. An error naming the field goes
+/// straight to that rung; one that names neither takes them in order, because
+/// a local endpoint's 400 often says only that a field is unknown.
+///
+/// PURE, so the whole ladder is asserted with no endpoint in sight.
+pub fn degrade(shape: Shape, said: &str) -> Option<(Shape, String)> {
+    let names = |field: &str| said.contains(field);
+    let blamed = |field: &str, shape: Shape| -> Option<(Shape, String)> {
+        Some((
+            shape,
+            format!(
+                "the endpoint answered 400; retrying without `{field}` ({}){}",
+                one_line(said),
+                consequence(field)
+            ),
+        ))
+    };
+    if shape.strict && (names("strict") || !names("cache_control")) {
+        return blamed("strict", shape.without_strict());
+    }
+    if shape.cache_control {
+        return blamed("cache_control", shape.without_cache_control());
+    }
+    if shape.strict {
+        return blamed("strict", shape.without_strict());
+    }
+    None
+}
+
+/// What a reader loses by the drop, said once and in the note.
+fn consequence(field: &str) -> &'static str {
+    match field {
+        "strict" => ", so a draft's input is checked by this supplier rather than guaranteed",
+        _ => ", so this conversation pays for its passages on every turn",
+    }
+}
+
+/// An endpoint's own message, trimmed to one bounded line — it lands in a
+/// record a page draws.
+fn one_line(said: &str) -> String {
+    said.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect()
 }
 
 /// One consultation: count, check both input budgets, then stream.
@@ -462,7 +558,7 @@ pub fn consult(
     on_event: &mut dyn FnMut(ModelEvent),
 ) -> Result<ModelOutcome, AskRefusal> {
     let counted = client
-        .count_tokens(request)
+        .count_tokens(request, on_event)
         .map_err(|reason| AskRefusal::Transport { reason })?;
     if counted > request.config.max_input_tokens {
         return Err(AskRefusal::OverInputBudget {
@@ -561,10 +657,41 @@ mod platform {
     }
 }
 
+/// What this client has LEARNED about the endpoint it is talking to.
+///
+/// A degradation discovered once is remembered, so a conversation does not pay
+/// two wasted round trips on every single turn to rediscover that the endpoint
+/// dislikes `strict`. It only ever narrows — nothing here turns a feature back
+/// on — except when the endpoint itself changes, which is possible because the
+/// configuration is re-read at every call: a fact learned about one endpoint is
+/// no fact at all about the next, so it is dropped with the base URL it was
+/// learned for.
+#[derive(Debug, Default)]
+struct Learned {
+    base_url: String,
+    no_strict: bool,
+    no_cache_control: bool,
+    no_count_tokens: bool,
+}
+
 /// The real client: raw HTTPS to the Messages API, over rustls.
 pub struct HttpsModelClient {
     config: ModelConfig,
     http: OnceLock<reqwest::blocking::Client>,
+    learned: std::sync::Mutex<Learned>,
+}
+
+/// A non-2xx answer, as data: the status is what decides whether a retry is
+/// even worth attempting, so it does not get folded into the message first.
+struct Rejected {
+    status: u16,
+    said: String,
+}
+
+impl Rejected {
+    fn says(&self) -> String {
+        format!("the model answered {}: {}", self.status, self.said)
+    }
 }
 
 impl HttpsModelClient {
@@ -572,11 +699,44 @@ impl HttpsModelClient {
         HttpsModelClient {
             config,
             http: OnceLock::new(),
+            learned: std::sync::Mutex::new(Learned::default()),
         }
     }
 
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    /// The learned state for THIS endpoint, reset when the endpoint changes.
+    fn learned(&self, base_url: &str) -> std::sync::MutexGuard<'_, Learned> {
+        let mut held = self
+            .learned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if held.base_url != base_url {
+            *held = Learned {
+                base_url: base_url.to_string(),
+                ..Default::default()
+            };
+        }
+        held
+    }
+
+    /// The shape this call STARTS in: what the configuration asks for, minus
+    /// everything this endpoint has already refused.
+    fn starting_shape(&self, config: &ModelConfig) -> Shape {
+        let learned = self.learned(&config.base_url);
+        Shape {
+            strict: config.shape.strict && !learned.no_strict,
+            cache_control: config.shape.cache_control && !learned.no_cache_control,
+        }
+    }
+
+    /// Remember a rejection, so the next turn does not rediscover it.
+    fn remember(&self, config: &ModelConfig, shape: Shape) {
+        let mut learned = self.learned(&config.base_url);
+        learned.no_strict = learned.no_strict || !shape.strict;
+        learned.no_cache_control = learned.no_cache_control || !shape.cache_control;
     }
 
     /// The blocking HTTP client, built on FIRST USE and not before.
@@ -603,37 +763,100 @@ impl HttpsModelClient {
 
     /// One request, with the key read at this moment and dropped when it
     /// returns. A non-2xx answer carries the API's own message as data.
+    ///
+    /// The key travels as `x-api-key` always, and ALSO as
+    /// `Authorization: Bearer` under a profile that wants it: local endpoints
+    /// serving this API authenticate the way Claude-shaped clients do, the
+    /// value is the same one either way, and an endpoint that reads either
+    /// header is satisfied by one request rather than by a probe.
+    ///
+    /// `config` is the REQUEST's, not the client's: the configuration is
+    /// re-read at every call, so the endpoint this goes to is the one the
+    /// caller resolved, never the one attach happened to see.
     fn post(
         &self,
+        config: &ModelConfig,
         path: &str,
         body: &serde_json::Value,
-    ) -> Result<reqwest::blocking::Response, String> {
-        let key = discover_key(&self.config.key_file).map_err(|r| r.says())?;
-        let response = self
-            .http()?
-            .post(format!("{}{path}", self.config.base_url))
-            .header("x-api-key", key)
+    ) -> Result<reqwest::blocking::Response, Rejected> {
+        let key = discover_key(&config.key_file).map_err(|r| Rejected {
+            status: 0,
+            said: r.says(),
+        })?;
+        let mut post = self
+            .http()
+            .map_err(|said| Rejected { status: 0, said })?
+            .post(format!("{}{path}", config.base_url))
+            .header("x-api-key", key.clone())
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .map_err(|e| format!("the model call failed: {}", scrub(&e.to_string())))?;
+            .header("content-type", "application/json");
+        if config.compat.sends_bearer() {
+            post = post.header("authorization", format!("Bearer {key}"));
+        }
+        let response = post.json(body).send().map_err(|e| Rejected {
+            status: 0,
+            said: format!("the model call failed: {}", scrub(&e.to_string())),
+        })?;
         let status = response.status();
         if !status.is_success() {
             let said = response.text().unwrap_or_default();
-            return Err(format!(
-                "the model answered {}: {}",
-                status.as_u16(),
-                said.trim().chars().take(600).collect::<String>()
-            ));
+            return Err(Rejected {
+                status: status.as_u16(),
+                said: said.trim().chars().take(600).collect::<String>(),
+            });
         }
         Ok(response)
     }
 }
 
+/// The largest number of times one call re-sends itself in a smaller shape.
+/// Two: `strict`, then `cache_control`, then the 400 is the answer.
+pub const MAX_DEGRADATIONS: usize = 2;
+
 impl ModelClient for HttpsModelClient {
-    fn count_tokens(&self, request: &ModelRequest) -> Result<u64, String> {
-        let response = self.post("/v1/messages/count_tokens", &request.count_body())?;
+    /// Count the input — or estimate it, and SAY that is what happened.
+    ///
+    /// Two ways the count does not happen. The profile may already know there
+    /// is none (Ollama has no `/v1/messages/count_tokens`), in which case no
+    /// round trip is spent discovering that on every turn; or the endpoint may
+    /// answer 404, which is the same discovery made the hard way, remembered so
+    /// it is made only once. Either way the budget is still CHECKED — against
+    /// an estimate that says it is one.
+    fn count_tokens(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelEvent),
+    ) -> Result<u64, String> {
+        let config = &request.config;
+        let estimate = |why: &str, on_event: &mut dyn FnMut(ModelEvent)| -> u64 {
+            let counted = estimate_tokens(request);
+            on_event(ModelEvent::Note(format!(
+                "{why}, so this turn's input budget is an ESTIMATE of about {counted} tokens                  (one per {ESTIMATED_CHARS_PER_TOKEN} characters of request), not a count"
+            )));
+            counted
+        };
+        if !config.count_tokens || self.learned(&config.base_url).no_count_tokens {
+            return Ok(estimate(
+                &format!(
+                    "the {} endpoint has no /v1/messages/count_tokens",
+                    config.compat.name()
+                ),
+                on_event,
+            ));
+        }
+        let response = match self.post(config, "/v1/messages/count_tokens", &request.count_body()) {
+            Ok(response) => response,
+            Err(rejected) if rejected.status == 404 => {
+                self.learned(&config.base_url).no_count_tokens = true;
+                return Ok(estimate(
+                    "this endpoint answered 404 for /v1/messages/count_tokens",
+                    on_event,
+                ));
+            }
+            Err(rejected) => {
+                return Err(rejected.says());
+            }
+        };
         let value: serde_json::Value = response
             .json()
             .map_err(|e| format!("the token count did not decode: {e}"))?;
@@ -643,15 +866,49 @@ impl ModelClient for HttpsModelClient {
             .ok_or_else(|| format!("the token count carried no `input_tokens`: {value}"))
     }
 
+    /// Stream the reply, dropping what the endpoint will not take.
+    ///
+    /// A 400 is the one status worth retrying, and only by sending LESS: the
+    /// same prompt, the same transcript, the same question, without a feature
+    /// the endpoint rejected. Every drop is an event before the retry, so the
+    /// reader is told what the answer they are about to read was weakened by,
+    /// and the client remembers it for the turns after this one.
     fn stream(
         &self,
         request: &ModelRequest,
         on_event: &mut dyn FnMut(ModelEvent),
     ) -> Result<ModelOutcome, String> {
-        let response = self.post("/v1/messages", &request.body(true))?;
-        let mut fold = Fold::default();
-        fold_stream(BufReader::new(response), &mut fold, on_event)?;
-        Ok(fold.outcome)
+        let config = &request.config;
+        let mut shape = self.starting_shape(config);
+        for _ in 0..=MAX_DEGRADATIONS {
+            let rejected =
+                match self.post(config, "/v1/messages", &request.body_shaped(true, shape)) {
+                    Ok(response) => {
+                        let mut fold = Fold::default();
+                        fold_stream(BufReader::new(response), &mut fold, on_event)?;
+                        return Ok(fold.outcome);
+                    }
+                    Err(rejected) => rejected,
+                };
+            if rejected.status != 400 {
+                return Err(rejected.says());
+            }
+            match degrade(shape, &rejected.said) {
+                Some((smaller, note)) => {
+                    on_event(ModelEvent::Note(note));
+                    shape = smaller;
+                    self.remember(config, shape);
+                }
+                None => {
+                    return Err(rejected.says());
+                }
+            }
+        }
+        Err(format!(
+            "the endpoint answered 400 to every shape this call could take, down to a request              with no `strict` and no `cache_control` ({} base-url {})",
+            config.compat.name(),
+            config.base_url
+        ))
     }
 }
 
@@ -878,7 +1135,11 @@ pub(crate) mod tests {
     }
 
     impl ModelClient for Scripted {
-        fn count_tokens(&self, request: &ModelRequest) -> Result<u64, String> {
+        fn count_tokens(
+            &self,
+            request: &ModelRequest,
+            _on_event: &mut dyn FnMut(ModelEvent),
+        ) -> Result<u64, String> {
             self.seen.lock().unwrap().push(request.clone());
             self.counted.clone()
         }
@@ -1012,6 +1273,11 @@ pub(crate) mod tests {
             }
             ModelEvent::Draft(input) => {
                 drafts.push(input);
+            }
+            // A fold produces no notes: they are the CLIENT's, made about the
+            // endpoint, and never anything in the transcript.
+            ModelEvent::Note(note) => {
+                panic!("a folded transcript said {note:?}");
             }
         })
         .expect("the transcript folded");
@@ -1320,6 +1586,78 @@ pub(crate) mod tests {
             Some("{\"alternative\": \"a1\""),
             "{drafts:?}"
         );
+    }
+
+    #[test]
+    fn the_ladder_drops_one_feature_at_a_time_and_then_runs_out() {
+        // Named: it goes straight to the rung the endpoint blamed.
+        let (shape, note) =
+            degrade(Shape::full(), "system.0: unexpected field `cache_control`").expect("a rung");
+        assert_eq!(
+            shape,
+            Shape::full().without_cache_control(),
+            "`strict` was not what it complained about"
+        );
+        assert!(
+            note.contains("`cache_control`") && note.contains("400"),
+            "{note}"
+        );
+        assert!(note.contains("pays for its passages"), "{note}");
+
+        // Unnamed: the rungs are taken in order, cheapest loss first.
+        let (shape, note) = degrade(Shape::full(), "invalid request").expect("a rung");
+        assert_eq!(shape, Shape::full().without_strict());
+        assert!(note.contains("`strict`"), "{note}");
+        assert!(note.contains("checked by this supplier"), "{note}");
+
+        let (shape, _) = degrade(shape, "invalid request").expect("the second rung");
+        assert_eq!(
+            shape,
+            Shape {
+                strict: false,
+                cache_control: false
+            }
+        );
+
+        // And then there is nothing left to drop: a 400 is the answer.
+        assert_eq!(degrade(shape, "invalid request"), None);
+        assert_eq!(degrade(shape, "unexpected field `strict`"), None);
+
+        // A rung already taken is not taken twice.
+        let lax = Shape::full().without_strict();
+        let (shape, note) = degrade(lax, "unexpected field `strict`").expect("a rung");
+        assert_eq!(
+            shape,
+            Shape {
+                strict: false,
+                cache_control: false
+            }
+        );
+        assert!(note.contains("`cache_control`"), "{note}");
+
+        // An endpoint's own words reach the note, bounded and on one line.
+        let (_, note) = degrade(Shape::full(), &format!("a\n{}", "x".repeat(900))).expect("a rung");
+        assert!(!note.contains('\n'), "{note}");
+        assert!(note.len() < 500, "{} chars", note.len());
+    }
+
+    #[test]
+    fn an_estimate_is_of_the_body_about_to_be_sent_and_grows_with_it() {
+        let first = request();
+        let small = estimate_tokens(&first);
+        assert!(small > 0);
+
+        let mut bigger = request();
+        bigger.prompt.system = format!("{} {}", first.prompt.system, "passage ".repeat(1000));
+        assert!(
+            estimate_tokens(&bigger) > small + 1000,
+            "it moves with the prompt it is an estimate of"
+        );
+
+        // Pessimistic on purpose: an estimate that under-counts is not a bound.
+        let body = serde_json::to_string(&first.count_body()).unwrap();
+        assert_eq!(small, (body.chars().count() as u64).div_ceil(3));
+        assert!(small >= (body.chars().count() as u64) / 4);
     }
 
     #[test]

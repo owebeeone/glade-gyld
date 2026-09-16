@@ -244,7 +244,7 @@ pub struct GyldAskRecord {
     pub principal: Option<String>,
     /// The conversation this turn belongs to, and the surface's key.
     pub conversation: String,
-    /// `"question" | "answer" | "citation" | "draft" | "end"`.
+    /// `"question" | "answer" | "citation" | "note" | "draft" | "end"`.
     pub stream: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub line: Option<String>,
@@ -271,6 +271,17 @@ pub const ASK_CITATION: &str = "citation";
 /// The offer a turn made (section 8). Its `record` is a
 /// [`crate::ask::AskDraft`], `drafted_by` and all.
 pub const ASK_DRAFT: &str = "draft";
+/// Something the CALL had to do differently, said beside the answer it
+/// weakened: an input budget that is an estimate because the endpoint cannot
+/// count, a `strict` the endpoint rejected, a cache breakpoint it would not
+/// take, a config file that did not decode.
+///
+/// A sixth record stream, and on the same rule as `question`: a consumer that
+/// has never heard of it draws nothing for it, and one that has draws the line
+/// it carries. The point is that a fallback is never SILENT — a reader looking
+/// at a weaker answer can see what weakened it, in the same place as the
+/// answer, rather than in a terminal log nobody is reading.
+pub const ASK_NOTE: &str = "note";
 pub const ASK_END: &str = "end";
 
 impl GyldAskRecord {
@@ -333,6 +344,22 @@ impl GyldAskRecord {
         GyldAskRecord {
             record: Some(source),
             ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_CITATION)
+        }
+    }
+
+    /// One thing the call had to do differently, as one line. It is appended
+    /// as it happens — before the answer it weakened, because that is when it
+    /// is discovered.
+    pub fn note(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        note: String,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            line: Some(note),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_NOTE)
         }
     }
 

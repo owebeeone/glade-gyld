@@ -735,6 +735,19 @@ async fn consult_run(
     // next question rather than on the next restart.
     let resolved = config.resolve_agent();
     let budget = resolved.config.max_output_tokens;
+    // What resolving the configuration had to say — a file that did not decode,
+    // a setting nobody has heard of — is the run's business too: a desk served
+    // by the wrong model can read why here, next to the answer.
+    for note in resolved.notes.iter() {
+        seq += 1;
+        append_ask(
+            &client,
+            &config,
+            &conversation,
+            &GyldAskRecord::note(&run_id, seq, &who, &conversation, note.clone()),
+        )
+        .await;
+    }
     let model_config = resolved.config;
     let drafted_by = model_config.model.clone();
     let spent = ledger.spent(&conversation);
@@ -755,6 +768,10 @@ async fn consult_run(
             };
             model::consult(model.as_ref(), &request, spent, &mut |event| {
                 let reply = match event {
+                    // A fallback the call had to make. It rides the same
+                    // channel as the answer so it lands in the records in the
+                    // ORDER it happened — before the prose it weakened.
+                    ModelEvent::Note(note) => Reply::Note(note),
                     ModelEvent::Text(chunk) => Reply::Answer(chunk),
                     // The draft is READ here, against the envelope this
                     // consultation resolved, so an alternative the envelope
@@ -780,6 +797,7 @@ async fn consult_run(
             Reply::Answer(chunk) => {
                 GyldAskRecord::answer(&run_id, seq + 1, &who, &conversation, chunk)
             }
+            Reply::Note(note) => GyldAskRecord::note(&run_id, seq + 1, &who, &conversation, note),
             Reply::Draft(Ok(draft)) => GyldAskRecord::draft(
                 &run_id,
                 seq + 1,
@@ -827,6 +845,8 @@ async fn consult_run(
 enum Reply {
     Citation(serde_json::Value),
     Answer(String),
+    /// Something the call had to do differently, on its way to a `note` record.
+    Note(String),
     /// A draft, read against the envelope — or the reason it was not a draft.
     Draft(Result<AskDraft, String>),
 }

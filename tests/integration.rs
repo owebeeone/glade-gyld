@@ -326,6 +326,9 @@ struct ScriptedModel {
     input_tokens: u64,
     output_tokens: u64,
     transport: Option<&'static str>,
+    /// What the call had to do differently, said before anything else — the
+    /// compatibility fallbacks, as the real client emits them.
+    notes: Vec<&'static str>,
     calls: AtomicU64,
     /// Every request it was handed, in order — so a conversation's prefix can
     /// be diffed between turns rather than taken on trust.
@@ -343,6 +346,7 @@ impl Default for ScriptedModel {
             input_tokens: 1200,
             output_tokens: 42,
             transport: None,
+            notes: Vec::new(),
             calls: AtomicU64::new(0),
             seen: Mutex::new(Vec::new()),
         }
@@ -357,10 +361,17 @@ impl ScriptedModel {
 }
 
 impl ModelClient for ScriptedModel {
-    fn count_tokens(&self, request: &ModelRequest) -> Result<u64, String> {
+    fn count_tokens(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelEvent),
+    ) -> Result<u64, String> {
         // Recorded HERE, not in `stream`: a turn the budget refuses is counted
         // and never sent, and it is still a turn this double was asked about.
         self.seen.lock().unwrap().push(request.clone());
+        for note in self.notes.iter() {
+            on_event(ModelEvent::Note((*note).to_string()));
+        }
         Ok(self.counted)
     }
 
@@ -399,7 +410,11 @@ impl ModelClient for ScriptedModel {
 struct NoModel;
 
 impl ModelClient for NoModel {
-    fn count_tokens(&self, _request: &ModelRequest) -> Result<u64, String> {
+    fn count_tokens(
+        &self,
+        _request: &ModelRequest,
+        _on_event: &mut dyn FnMut(ModelEvent),
+    ) -> Result<u64, String> {
         panic!("no verb but `explain` counts tokens");
     }
 
@@ -964,6 +979,54 @@ async fn a_normal_consultation_cites_then_answers_and_closes_clean() {
     );
 }
 
+/// A fallback is a RECORD on the turn it weakened, in order, never a silence.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_compatibility_fallback_lands_on_the_run_beside_the_answer() {
+    let model = Arc::new(ScriptedModel {
+        chunks: vec!["It is blocked."],
+        notes: vec![
+            "the ollama endpoint has no /v1/messages/count_tokens, so this turn's input budget \
+             is an ESTIMATE of about 900 tokens",
+            "the endpoint answered 400; retrying without `strict`",
+        ],
+        ..Default::default()
+    });
+    let records = consulted(model.clone(), "consult-notes").await;
+
+    let notes: Vec<&str> = records
+        .iter()
+        .filter(|r| r.stream == glade_gyld::ASK_NOTE)
+        .filter_map(|r| r.line.as_deref())
+        .collect();
+    assert_eq!(notes.len(), 2, "{records:?}");
+    assert!(notes[0].contains("ESTIMATE"), "{notes:?}");
+    assert!(notes[1].contains("`strict`"), "{notes:?}");
+
+    // They come BEFORE the answer they weakened, which is when they happened.
+    let at = |stream: &str| {
+        records
+            .iter()
+            .position(|r| r.stream == stream)
+            .unwrap_or(usize::MAX)
+    };
+    assert!(
+        at(glade_gyld::ASK_NOTE) < at(glade_gyld::ASK_ANSWER),
+        "{records:?}"
+    );
+
+    // And they weaken nothing else: the answer is the answer and the turn is
+    // still clean.
+    let answers: Vec<&str> = records
+        .iter()
+        .filter(|r| r.stream == glade_gyld::ASK_ANSWER)
+        .filter_map(|r| r.line.as_deref())
+        .collect();
+    assert_eq!(answers, vec!["It is blocked."]);
+    let end = records.last().expect("a terminal record");
+    assert_eq!(end.stream, glade_gyld::ASK_END);
+    assert_eq!(end.exit, Some(0), "a fallback is not a failure");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_declined_turn_a_budget_stop_and_a_transport_failure_are_all_data() {
     // The model declined: the category and the explanation land as data.
@@ -1498,11 +1561,494 @@ async fn the_real_model_client_answers_with_data_from_a_blocking_task() {
         },
         turns: Vec::new(),
     };
-    let said = tokio::task::spawn_blocking(move || client.count_tokens(&request))
+    let said = tokio::task::spawn_blocking(move || client.count_tokens(&request, &mut |_| {}))
         .await
         .expect("the blocking task did not panic")
         .expect_err("nothing is listening on port 1");
     assert!(said.contains("the model call failed"), "{said}");
+}
+
+// --------------------------------------------------------------------------
+// The compatibility profile, against a SCRIPTED ENDPOINT
+// --------------------------------------------------------------------------
+
+/// A scripted HTTP endpoint: one thread, one canned answer per request, and
+/// every request it was sent kept whole.
+///
+/// The [`ScriptedModel`] above stands in for the model CLIENT and so cannot say
+/// anything about headers, statuses or retries — the very things the
+/// compatibility profile is about. This stands in for the ENDPOINT instead, so
+/// a 404 on `count_tokens`, a 400 on `strict` and the bearer header are
+/// asserted on the bytes that actually went over a socket, with no network
+/// beyond loopback and no dependency added.
+mod endpoint {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// One request, as it arrived.
+    #[derive(Clone, Debug)]
+    pub struct Seen {
+        pub path: String,
+        pub headers: Vec<(String, String)>,
+        pub body: serde_json::Value,
+    }
+
+    impl Seen {
+        /// One header, lowercased name, or `None` when it was not sent.
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// Whether the body carries `strict` anywhere in it.
+        pub fn strict(&self) -> bool {
+            self.body.to_string().contains("\"strict\"")
+        }
+
+        /// How many cache breakpoints the body carries.
+        pub fn breakpoints(&self) -> usize {
+            self.body.to_string().matches("cache_control").count()
+        }
+    }
+
+    /// What the endpoint answers: status, content type, body.
+    pub type Answer = (u16, &'static str, String);
+
+    pub struct Endpoint {
+        pub base_url: String,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        stop: Arc<AtomicBool>,
+        addr: String,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Endpoint {
+        /// Bind loopback on an OS-assigned port and answer with `reply`, which
+        /// is given the request and how many came before it.
+        pub fn serve<R>(reply: R) -> Endpoint
+        where
+            R: Fn(&Seen, usize) -> Answer + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+            let addr = listener.local_addr().expect("an address").to_string();
+            let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let seen = seen.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    for incoming in listener.incoming() {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let mut socket = match incoming {
+                            Ok(socket) => socket,
+                            Err(_) => {
+                                continue;
+                            }
+                        };
+                        let request = match read_request(&socket) {
+                            Some(request) => request,
+                            None => {
+                                continue;
+                            }
+                        };
+                        let nth = {
+                            let mut held = seen.lock().unwrap();
+                            held.push(request.clone());
+                            held.len() - 1
+                        };
+                        let (status, kind, body) = reply(&request, nth);
+                        let head = format!(
+                            "HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes());
+                        let _ = socket.write_all(body.as_bytes());
+                        let _ = socket.flush();
+                    }
+                })
+            };
+            Endpoint {
+                base_url: format!("http://{addr}"),
+                seen,
+                stop,
+                addr,
+                thread: Some(thread),
+            }
+        }
+
+        /// Every request it was sent, oldest first.
+        pub fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Endpoint {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // One connection to wake `accept`, which is otherwise blocked.
+            let _ = TcpStream::connect(&self.addr);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The request line, the headers and the body — enough HTTP to be an
+    /// endpoint and no more.
+    fn read_request(socket: &TcpStream) -> Option<Seen> {
+        let clone = socket.try_clone().ok()?;
+        let mut reader = BufReader::new(clone);
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut length = 0usize;
+        loop {
+            let mut held = String::new();
+            if reader.read_line(&mut held).ok()? == 0 {
+                break;
+            }
+            let held = held.trim_end().to_string();
+            if held.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = held.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if name == "content-length" {
+                    length = value.parse().unwrap_or(0);
+                }
+                headers.push((name, value));
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).ok()?;
+        Some(Seen {
+            path,
+            headers,
+            body: serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        })
+    }
+}
+
+/// A clean streamed answer, as an endpoint sends one.
+const SSE: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1200}}}"#,
+    "\n\nevent: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","#,
+    r#""text":"It is blocked."}}"#,
+    "\n\nevent: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"#,
+    r#""usage":{"output_tokens":42}}"#,
+    "\n\n",
+);
+
+/// A key file the client can read, in a directory the caller owns.
+fn agent_key(tmp: &Tmp, value: &str) -> PathBuf {
+    let key = tmp.path().join("api-key");
+    std::fs::write(&key, format!("{value}\n")).unwrap();
+    key_mode_600(&key);
+    key
+}
+
+/// A request aimed at `endpoint`, in `compat`.
+fn request_to(base_url: &str, compat: glade_gyld::Compat, key: PathBuf) -> ModelRequest {
+    ModelRequest {
+        config: glade_gyld::ModelConfig {
+            base_url: base_url.into(),
+            compat,
+            count_tokens: compat.counts_tokens(),
+            key_file: key,
+            timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
+        prompt: glade_gyld::Prompt {
+            system: "the stance and the passages".into(),
+            user: "why is this blocked?".into(),
+        },
+        turns: Vec::new(),
+    }
+}
+
+/// Every note one call produced, in order.
+fn notes_of(events: &[ModelEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ModelEvent::Note(note) => Some(note.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every text chunk one call produced.
+fn text_of(events: &[ModelEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ModelEvent::Text(chunk) => Some(chunk.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_ollama_profile_estimates_the_budget_sends_a_bearer_and_never_asks_for_a_count() {
+    let tmp = Tmp::new("compat-ollama");
+    let endpoint = endpoint::Endpoint::serve(|_seen, _nth| (200, "text/event-stream", SSE.into()));
+    let request = request_to(
+        &endpoint.base_url,
+        glade_gyld::Compat::Ollama,
+        agent_key(&tmp, "ollama"),
+    );
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+
+    let mut events: Vec<ModelEvent> = Vec::new();
+    let counted = client
+        .count_tokens(&request, &mut |e| events.push(e))
+        .expect("an estimate is not a failure");
+
+    // Nothing went over the wire for the count: the profile already knows
+    // there is no `count_tokens` there.
+    assert!(endpoint.seen().is_empty(), "{:?}", endpoint.seen());
+    assert!(counted > 0, "the estimate is of the body about to be sent");
+    assert_eq!(counted, glade_gyld::estimate_tokens(&request));
+    let notes = notes_of(&events);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("count_tokens"), "{notes:?}");
+    assert!(notes[0].contains("ESTIMATE"), "the run SAYS so: {notes:?}");
+    assert!(notes[0].contains(&counted.to_string()), "{notes:?}");
+
+    let outcome = client
+        .stream(&request, &mut |e| events.push(e))
+        .expect("the stream");
+    assert!(outcome.complete());
+    assert_eq!(text_of(&events), "It is blocked.");
+
+    let seen = endpoint.seen();
+    assert_eq!(seen.len(), 1, "one request, and it was the stream");
+    assert_eq!(seen[0].path, "/v1/messages");
+    assert_eq!(seen[0].header("x-api-key"), Some("ollama"));
+    assert_eq!(
+        seen[0].header("authorization"),
+        Some("Bearer ollama"),
+        "Claude-shaped clients authenticate to these endpoints with a bearer"
+    );
+    assert_eq!(seen[0].header("anthropic-version"), Some("2023-06-01"));
+    assert_eq!(seen[0].body["stream"], true);
+    assert!(
+        seen[0].strict() && seen[0].breakpoints() == 1,
+        "the profile still TRIES both; it discovers a refusal, it does not assume one"
+    );
+}
+
+#[test]
+fn the_anthropic_profile_counts_with_the_endpoint_and_sends_no_bearer() {
+    let tmp = Tmp::new("compat-anthropic");
+    let endpoint = endpoint::Endpoint::serve(|seen, _nth| {
+        if seen.path.ends_with("count_tokens") {
+            return (200, "application/json", r#"{"input_tokens":1234}"#.into());
+        }
+        (200, "text/event-stream", SSE.into())
+    });
+    let request = request_to(
+        &endpoint.base_url,
+        glade_gyld::Compat::Anthropic,
+        agent_key(&tmp, "sk-test"),
+    );
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+
+    let mut events: Vec<ModelEvent> = Vec::new();
+    let counted = client
+        .count_tokens(&request, &mut |e| events.push(e))
+        .expect("the count");
+    assert_eq!(counted, 1234, "the endpoint's own number, not an estimate");
+    assert!(notes_of(&events).is_empty(), "nothing was fallen back to");
+
+    client
+        .stream(&request, &mut |e| events.push(e))
+        .expect("the stream");
+
+    let seen = endpoint.seen();
+    assert_eq!(seen.len(), 2, "the count, then the call");
+    assert_eq!(seen[0].path, "/v1/messages/count_tokens");
+    assert!(seen[0].body.get("max_tokens").is_none());
+    assert_eq!(seen[1].path, "/v1/messages");
+    for one in seen.iter() {
+        assert_eq!(one.header("x-api-key"), Some("sk-test"));
+        assert_eq!(
+            one.header("authorization"),
+            None,
+            "the Anthropic path is unchanged, header for header"
+        );
+        assert!(one.strict(), "and carries `strict`");
+    }
+    assert_eq!(seen[1].breakpoints(), 1, "and its cache breakpoint");
+    assert!(notes_of(&events).is_empty(), "nothing to say: {events:?}");
+}
+
+#[test]
+fn a_404_on_count_tokens_becomes_an_estimate_and_is_asked_only_once() {
+    let tmp = Tmp::new("compat-404");
+    let endpoint = endpoint::Endpoint::serve(|seen, _nth| {
+        if seen.path.ends_with("count_tokens") {
+            return (404, "application/json", r#"{"error":"not found"}"#.into());
+        }
+        (200, "text/event-stream", SSE.into())
+    });
+    // The ANTHROPIC profile, so the 404 is discovered rather than assumed.
+    let request = request_to(
+        &endpoint.base_url,
+        glade_gyld::Compat::Anthropic,
+        agent_key(&tmp, "sk-test"),
+    );
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+
+    let mut events: Vec<ModelEvent> = Vec::new();
+    let counted = client
+        .count_tokens(&request, &mut |e| events.push(e))
+        .expect("a 404 is not a failure; it is a fact about the endpoint");
+    assert_eq!(counted, glade_gyld::estimate_tokens(&request));
+    let notes = notes_of(&events);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("404"), "{notes:?}");
+    assert!(notes[0].contains("ESTIMATE"), "{notes:?}");
+
+    // Learned: the second turn does not spend a round trip rediscovering it.
+    let mut again: Vec<ModelEvent> = Vec::new();
+    let second = client
+        .count_tokens(&request, &mut |e| again.push(e))
+        .expect("an estimate");
+    assert_eq!(second, counted);
+    assert_eq!(
+        endpoint.seen().len(),
+        1,
+        "asked once, ever: {:?}",
+        endpoint.seen()
+    );
+    let notes = notes_of(&again);
+    assert_eq!(notes.len(), 1, "and it still SAYS so every turn: {notes:?}");
+}
+
+#[test]
+fn a_400_on_strict_and_then_on_cache_control_is_retried_smaller_and_each_drop_is_a_note() {
+    let tmp = Tmp::new("compat-400");
+    let endpoint = endpoint::Endpoint::serve(|seen, _nth| {
+        if seen.strict() {
+            return (
+                400,
+                "application/json",
+                r#"{"error":{"message":"tools.0: unexpected field `strict`"}}"#.into(),
+            );
+        }
+        if seen.breakpoints() > 0 {
+            return (
+                400,
+                "application/json",
+                r#"{"error":{"message":"system.0: unexpected field `cache_control`"}}"#.into(),
+            );
+        }
+        (200, "text/event-stream", SSE.into())
+    });
+    let request = request_to(
+        &endpoint.base_url,
+        glade_gyld::Compat::Ollama,
+        agent_key(&tmp, "ollama"),
+    );
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+
+    let mut events: Vec<ModelEvent> = Vec::new();
+    let outcome = client
+        .stream(&request, &mut |e| events.push(e))
+        .expect("the answer still arrives");
+    assert!(outcome.complete());
+    assert_eq!(text_of(&events), "It is blocked.", "the reader is answered");
+
+    // Three attempts: full, without `strict`, without either.
+    let seen = endpoint.seen();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(seen[0].strict() && seen[0].breakpoints() == 1);
+    assert!(!seen[1].strict() && seen[1].breakpoints() == 1);
+    assert!(!seen[2].strict() && seen[2].breakpoints() == 0);
+    assert_eq!(
+        seen[2].body["messages"], seen[0].body["messages"],
+        "only the markers went: the transcript is the same transcript"
+    );
+    assert_eq!(
+        seen[2].body["tools"][0]["input_schema"], seen[0].body["tools"][0]["input_schema"],
+        "and the schema is the same schema"
+    );
+
+    // Both drops are said, in the order they happened.
+    let notes = notes_of(&events);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].contains("`strict`") && notes[0].contains("400"),
+        "{notes:?}"
+    );
+    assert!(notes[1].contains("`cache_control`"), "{notes:?}");
+    assert!(
+        notes[1].contains("pays for its passages"),
+        "a note says what it COST: {notes:?}"
+    );
+
+    // Learned: the next turn starts where the last one ended, with no retries.
+    let mut again: Vec<ModelEvent> = Vec::new();
+    client
+        .stream(&request, &mut |e| again.push(e))
+        .expect("the answer");
+    assert_eq!(endpoint.seen().len(), 4, "one request, not three");
+    let last = endpoint.seen().pop().expect("a request");
+    assert!(!last.strict() && last.breakpoints() == 0);
+    assert!(
+        notes_of(&again).is_empty(),
+        "a fact already learned is not re-announced every turn: {:?}",
+        notes_of(&again)
+    );
+}
+
+#[test]
+fn an_endpoint_that_400s_whatever_it_is_sent_is_a_transport_failure_with_its_own_words() {
+    let tmp = Tmp::new("compat-400-always");
+    let endpoint = endpoint::Endpoint::serve(|_seen, _nth| {
+        (
+            400,
+            "application/json",
+            r#"{"error":{"message":"model \"nope\" not found"}}"#.into(),
+        )
+    });
+    let request = request_to(
+        &endpoint.base_url,
+        glade_gyld::Compat::Ollama,
+        agent_key(&tmp, "ollama"),
+    );
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+
+    let mut events: Vec<ModelEvent> = Vec::new();
+    let said = client
+        .stream(&request, &mut |e| events.push(e))
+        .expect_err("nothing this call could send was accepted");
+    assert!(said.contains("400"), "{said}");
+    assert!(
+        said.contains("not found"),
+        "the endpoint's own words: {said}"
+    );
+    assert_eq!(
+        endpoint.seen().len(),
+        glade_gyld::MAX_DEGRADATIONS + 1,
+        "it is not retried at forever"
+    );
+    assert_eq!(notes_of(&events).len(), glade_gyld::MAX_DEGRADATIONS);
 }
 
 #[cfg(unix)]

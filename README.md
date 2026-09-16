@@ -225,6 +225,42 @@ reaches a plan, a prompt, a record, a log line or the browser.
 The key is `ANTHROPIC_API_KEY` in the supplier's environment, else the file
 `--agent-key-file` names, else `<bundle-root>/agent/api-key`.
 
+### Grounding: the build's own source index
+
+A build emits `sources.json` (`gyld.sources.v1`) beside `streams.json`: the
+documents it was pointed at, every tag it resolved to a table row or a numbered
+heading with that passage, `cited_by` — which record in which stream cites which
+tags — and `unresolved`, the tags that resolve to nothing and why.
+
+For each tag the envelope carries, plus each tag the index's own `cited_by`
+adds for the same record, the supplier takes the index's entry WHOLE: document,
+path, heading, line range, passage, digest. **It never reads a cited document
+and never greps.** If the index carries no passage there is no passage, and the
+model is told exactly that: an unresolved tag travels into the prompt with the
+index's own reason, so the answer can say *this record cites `AZ-7` and this
+build's index resolves it to nothing*. Hiding it would be an omission the
+supplier invented, which is what rule 6.7 forbids.
+
+Every consultation logs one line with both counts:
+
+```text
+[gyld] glade-gyld: explain glade_decisions:GladeDecisions.key_custody on base
+       (conv-tab1-key_custody-1789363954989): 8 source tag(s) resolved, 3 unresolved
+```
+
+The prompt is two parts, and the split is the point. The **stable prefix** — a
+constant stance, the emitted facts of the envelope and every resolved passage —
+is what carries `cache_control`, so a follow-up on the same envelope reads the
+cache rather than paying for the passages again. The **turn** is the reader's
+question and nothing else. Composition is pure, so the whole prompt is asserted
+as a golden (`tests/fixtures/explain-prompt.txt`); `cargo test -- --ignored
+rewrite_the_golden` regenerates it when it changes on purpose.
+
+The stance is four sentences and a constant — no request composes any part of
+it: explain the graph as it was EMITTED; quote only the supplied passages and
+name the tag; name what is not emitted rather than filling it in; you may
+propose and draft, but you never rule and never submit.
+
 ## Long-op output (log `gyld.output`)
 
 `stream_output: true` answers immediately with

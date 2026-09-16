@@ -21,6 +21,10 @@
 //! * [`envelope`] — the request, response and output-record JSON shapes.
 //! * [`ask`] — the `gyld.ask-context.v1` envelope the `explain` verb consults,
 //!   and its refusals (GyldAskAgent.md sections 3 and 4).
+//! * [`sources`] — the emitted source index (`gyld.sources.v1`) and the
+//!   resolver that grounds an answer in it (section 5).
+//! * [`prompt`] — the stance, the emitted context and the passages, composed
+//!   into the one stable prefix a turn is cached on (section 7).
 //! * [`bundle`] — the bundle-root layout, the staging repository, containment,
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
@@ -35,7 +39,9 @@ pub mod ask;
 pub mod bundle;
 pub mod envelope;
 pub mod exec;
+pub mod prompt;
 pub mod publish;
+pub mod sources;
 pub mod supplier;
 pub mod verbs;
 
@@ -45,7 +51,9 @@ pub use envelope::{GyldArgs, GyldOutputRecord, GyldRequest, GyldResponse};
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
+pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
+pub use sources::{ResolvedSource, SourceIndex, SOURCES_FORMAT};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID,
     DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_ID,

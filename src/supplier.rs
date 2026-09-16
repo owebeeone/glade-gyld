@@ -32,11 +32,13 @@ use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
 use glade_client::GladeClient;
 use glade_wire::generated::ExchangeReq;
 
-use crate::ask::{self, AgentState};
+use crate::ask::{self, AgentState, Consultation};
 use crate::bundle::{self, Layout};
 use crate::envelope::{GyldOutputRecord, GyldRequest, GyldResponse};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
+use crate::prompt::{self, Prompt};
 use crate::publish::{self, Surfaces};
+use crate::sources::{self, ResolvedSource};
 use crate::verbs::{self, Plan};
 
 /// The default surfaces a gyld supplier stands behind (`gyld-app.glade`).
@@ -349,7 +351,14 @@ fn answer(
 
     // `explain` runs no host: it consults. A consult plan carries no argv at
     // all, so nothing about it can reach a runner.
-    if plan.consult.is_some() {
+    if let Some(consult) = plan.consult.as_ref() {
+        let grounded = match ground(consult) {
+            Ok(g) => g,
+            Err(e) => {
+                return GyldResponse::failed(e, who);
+            }
+        };
+        let _ = grounded;
         return GyldResponse::failed(NO_MODEL_CLIENT, who);
     }
 
@@ -383,6 +392,27 @@ fn answer(
         }
         Err(e) => GyldResponse::failed(e, who),
     }
+}
+
+/// Ground one consultation (GyldAskAgent.md sections 5 and 7).
+///
+/// Read the build's own source index, resolve the tags this record and its
+/// ruling cite, and compose the prompt. One log line says how it went, with
+/// both counts: a citation that resolves to nothing is a thing to be VISIBLE
+/// about, in the log as well as in the answer.
+///
+/// An index that is absent, unreadable or of another format is a refusal as
+/// data, exactly like every other failure here.
+fn ground(consult: &Consultation) -> Result<(Vec<ResolvedSource>, Prompt), String> {
+    let index = sources::read(&consult.sources)?;
+    let resolved = index.resolve(&consult.context);
+    let (found, missing) = sources::counted(&resolved);
+    eprintln!(
+        "glade-gyld: explain {} on {} ({}): {found} source tag(s) resolved, {missing} unresolved",
+        consult.context.record.slot, consult.context.stream, consult.conversation
+    );
+    let prompt = prompt::compose(&consult.context, &resolved);
+    Ok((resolved, prompt))
 }
 
 /// Write the planned overlay module, refusing to clobber one unless the plan
@@ -840,6 +870,43 @@ mod tests {
         });
         write_overlay(&plan).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grounding_resolves_the_cited_tags_and_refuses_a_missing_index_as_data() {
+        let dir = root("ground");
+        let index = dir.join("sources.json");
+        let context =
+            ask::AskContext::parse(Some(&ask::tests::envelope())).expect("the fixture envelope");
+        let consult = Consultation {
+            context,
+            sources: index.clone(),
+            conversation: "conv-tab1-key_custody-1789".into(),
+        };
+
+        // No index: a readable refusal, and nothing composed.
+        let e = ground(&consult).unwrap_err();
+        assert!(e.contains("cannot read the source index"), "{e}");
+
+        std::fs::write(
+            &index,
+            serde_json::to_vec(&sources::tests::index()).unwrap(),
+        )
+        .unwrap();
+        let (resolved, prompt) = ground(&consult).expect("grounding");
+        assert_eq!(sources::counted(&resolved), (1, 3));
+        assert!(
+            prompt.system.contains("| Q11 | Key custody"),
+            "the index's own passage is the quotable material"
+        );
+        assert!(
+            prompt
+                .system
+                .contains("UNRESOLVED: no document in this index declares it"),
+            "an unresolved tag reaches the prompt, with its reason"
+        );
+        assert_eq!(prompt.user, "why is this blocked?");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,21 +14,39 @@
 //! no free-form argument list, so no requester composes a command line. Each
 //! mutating verb maps to exactly ONE Gyld host invocation, and every one of them
 //! builds into a NEW directory: nothing is ever edited in place.
+//!
+//! Two verbs run no host at all. `list` READS the latest build's stream listing
+//! ([`Plan::read`]); `explain` CONSULTS ([`Plan::consult`]) — it resolves an ask
+//! envelope against the build's source index and calls a model, with no
+//! subprocess and no filesystem effect whatever. Neither ever carries an argv,
+//! and `explain` carries no [`PlannedWrite`] either, so "the agent never writes
+//! an overlay" is a property of the plan type rather than a promise in prose.
 
 use std::path::PathBuf;
 
+use crate::ask::{AgentState, Consultation};
 use crate::bundle::{contained, Layout};
 use crate::envelope::{GyldArgs, GyldRequest};
 
-/// The stage-1 allow-list (GyldGrythPlugins.md 4.7, step 4.1).
+/// The allow-list (GyldGrythPlugins.md 4.7 step 4.1, GyldAskAgent.md section 4).
 ///
-/// `list` is the one read verb and the one verb with no subprocess: it reads the
-/// latest build's `streams.json` off disk. The other six are the write path;
-/// each produces a new build or a new document and never overwrites one.
+/// `list` and `explain` are the two verbs with no subprocess: `list` reads the
+/// latest build's `streams.json` off disk and `explain` consults a model about
+/// what the build already emitted. The other six are the write path; each
+/// produces a new build or a new document and never overwrites one.
+///
+/// `explain`, not `ask`: `ask` is taken and the collision is not cosmetic — it
+/// means APPEND A QUESTION TO A STREAM'S OVERLAY AND REBUILD, which writes Gyld
+/// source. A second meaning on that name would put a verb that writes and a
+/// verb that writes nothing behind one word, and make `attributed_to`
+/// unreadable in an audit trail.
+///
 /// EXCLUDED for now and why: `occurred`, `lens` and `inspect` (section 4.7 names
 /// them, but no Gyld host verb exists for them yet), and everything else,
 /// because the supplier only ever runs the hosts it can name.
-pub const ALLOWED_VERBS: &[&str] = &["list", "answer", "ask", "fork", "link", "rebuild", "diff"];
+pub const ALLOWED_VERBS: &[&str] = &[
+    "list", "answer", "ask", "explain", "fork", "link", "rebuild", "diff",
+];
 
 /// The Gyld host that owns the four stream-manager verbs.
 pub const MANAGER_HOST: &str = "manage_decision_streams.py";
@@ -117,8 +135,8 @@ pub struct PlannedWrite {
     pub force: bool,
 }
 
-/// What one request resolves to. Exactly one of `read` (the `list` verb) or
-/// `argv` (everything else) is set.
+/// What one request resolves to. Exactly one of `read` (the `list` verb),
+/// `consult` (the `explain` verb) or `argv` (everything else) is set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub verb: String,
@@ -134,17 +152,28 @@ pub struct Plan {
     pub output_dir: Option<PathBuf>,
     /// The document this verb reads instead of running a host (`list`).
     pub read: Option<PathBuf>,
+    /// The consultation this verb runs instead of a host (`explain`): the
+    /// validated envelope, the index it is resolved against and the
+    /// conversation the reply is keyed by. Never accompanied by a `write` or
+    /// an `argv`.
+    pub consult: Option<Consultation>,
 }
 
 /// Resolve a request into a [`Plan`], or a refusal. PURE: it touches no file,
 /// so the same refusal is produced whether or not the bundle root exists yet.
+///
 /// `latest` is the caller's answer to "what is the current bundle", which the
-/// three bundle-reading verbs need and the two generating verbs do not.
+/// bundle-reading verbs need and the two generating verbs do not. `agent` is
+/// the caller's already-taken reading of the agent's world — a key was found,
+/// the build emitted an index, these are the streams it lists — handed in as
+/// DATA so `explain`'s refusals are produced here too, with no environment
+/// read and no file stat anywhere in this function.
 pub fn plan(
     layout: &Layout,
     request: &GyldRequest,
     latest: Option<&std::path::Path>,
     stamp: &str,
+    agent: &AgentState,
 ) -> Result<Plan, String> {
     if request.verb.is_empty() {
         return Err("envelope missing `verb`".into());
@@ -176,12 +205,23 @@ pub fn plan(
         pythonpath: layout.pythonpath(),
         output_dir: None,
         read: None,
+        consult: None,
     };
 
     match request.verb.as_str() {
         "list" => {
             let bundle = latest.ok_or(NO_BUNDLE)?;
             plan.read = Some(bundle.join("streams.json"));
+        }
+        "explain" => {
+            // The one verb that runs no host AND touches no file: it resolves
+            // the envelope against the build's source index and consults a
+            // model. No `write`, no `argv`, no `output_dir` — the agent has no
+            // path by which to become a Gyld fact.
+            let bundle = latest.ok_or(NO_BUNDLE)?;
+            let consult = Consultation::resolve(bundle, args.context.as_ref(), agent)
+                .map_err(|refusal| refusal.says())?;
+            plan.consult = Some(consult);
         }
         "answer" | "ask" => {
             let stream = require_stream(args.stream.as_deref(), "stream")?;
@@ -259,6 +299,7 @@ pub fn plan(
         .map(|w| &w.path)
         .chain(plan.output_dir.iter())
         .chain(plan.read.iter())
+        .chain(plan.consult.iter().map(|c| &c.sources))
     {
         if !contained(root, path) {
             return Err(format!(
@@ -314,6 +355,7 @@ pub fn discover_plan(layout: &Layout) -> Plan {
         pythonpath: layout.pythonpath(),
         output_dir: None,
         read: None,
+        consult: None,
     }
 }
 
@@ -371,6 +413,7 @@ pub fn first_build_plan(layout: &Layout, stamp: &str, declared: &[String]) -> Pl
         pythonpath: layout.pythonpath(),
         output_dir: Some(layout.new_build_dir(stamp)),
         read: None,
+        consult: None,
     }
 }
 
@@ -468,12 +511,18 @@ mod tests {
         GyldRequest::parse(json.as_bytes()).expect("envelope")
     }
 
+    /// An agent ready to consult about the streams this bundle lists.
+    fn agent() -> AgentState {
+        AgentState::ready(&["base", "stream-a", "keys-a"])
+    }
+
     fn planned(json: &str) -> Plan {
         plan(
             &layout(),
             &request(json),
             Some(Path::new("/b/builds/build-0")),
             "build-1",
+            &agent(),
         )
         .expect("plan")
     }
@@ -484,20 +533,36 @@ mod tests {
             &request(json),
             Some(Path::new("/b/builds/build-0")),
             "build-1",
+            &agent(),
         )
         .expect_err("refusal")
     }
 
+    /// An `explain` request carrying the fixture envelope.
+    fn explain_request() -> GyldRequest {
+        let body = serde_json::json!({
+            "verb": "explain",
+            "stream_output": true,
+            "args": { "context": crate::ask::tests::envelope() },
+        });
+        request(&body.to_string())
+    }
+
     #[test]
-    fn the_allow_list_is_the_seven_named_verbs() {
+    fn the_allow_list_is_the_eight_named_verbs() {
         for v in ALLOWED_VERBS {
             assert!(verb_allowed(v), "{v}");
         }
         for v in [
-            "occurred", "lens", "inspect", "capture", "emit", "", "rm", "fork ",
+            "occurred", "lens", "inspect", "capture", "emit", "", "rm", "fork ", "consult",
+            "advise", "explain ",
         ] {
             assert!(!verb_allowed(v), "{v} must be refused");
         }
+        assert!(
+            verb_allowed("explain") && verb_allowed("ask"),
+            "`explain` and `ask` are two verbs, not two spellings of one"
+        );
     }
 
     #[test]
@@ -667,6 +732,7 @@ mod tests {
             &request(&body.to_string()),
             Some(Path::new("/b/builds/b0")),
             "b1",
+            &agent(),
         )
         .expect_err("refusal");
         assert!(e.contains("the limit is"), "{e}");
@@ -679,6 +745,7 @@ mod tests {
             &request(r#"{"verb":"list"}"#),
             Some(Path::new("/elsewhere")),
             "b1",
+            &agent(),
         )
         .expect_err("refusal");
         assert!(e.contains("leaves the bundle root"), "{e}");
@@ -688,7 +755,7 @@ mod tests {
     fn verbs_that_need_a_bundle_refuse_before_one_exists() {
         for verb in ["list", "rebuild"] {
             let body = format!("{{\"verb\":\"{verb}\"}}");
-            let e = plan(&layout(), &request(&body), None, "b1").expect_err("refusal");
+            let e = plan(&layout(), &request(&body), None, "b1", &agent()).expect_err("refusal");
             assert!(e.contains("no bundle"), "{verb}: {e}");
         }
         // fork and link do not need one: they generate an overlay module.
@@ -697,6 +764,7 @@ mod tests {
             &request(r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#),
             None,
             "b1",
+            &agent(),
         );
         assert!(p.is_ok(), "{p:?}");
     }
@@ -772,9 +840,101 @@ mod tests {
     fn verbs_that_need_a_bundle_all_name_the_same_refusal() {
         for verb in ["list", "rebuild"] {
             let body = format!("{{\"verb\":\"{verb}\"}}");
-            let e = plan(&layout(), &request(&body), None, "b1").expect_err("refusal");
+            let e = plan(&layout(), &request(&body), None, "b1", &agent()).expect_err("refusal");
             assert_eq!(e, NO_BUNDLE, "{verb}");
         }
+    }
+
+    #[test]
+    fn explain_consults_and_carries_no_write_and_no_argv() {
+        let p = plan(
+            &layout(),
+            &explain_request(),
+            Some(Path::new("/b/builds/build-0")),
+            "build-1",
+            &agent(),
+        )
+        .expect("a consult plan");
+        assert!(
+            p.argv.is_empty(),
+            "the agent never reaches a command line: {:?}",
+            p.argv
+        );
+        assert!(
+            p.write.is_none(),
+            "the agent never writes an overlay: {:?}",
+            p.write
+        );
+        assert!(p.output_dir.is_none() && p.read.is_none(), "{p:?}");
+
+        let consult = p.consult.expect("a consultation");
+        assert_eq!(
+            consult.sources,
+            PathBuf::from("/b/builds/build-0/sources.json"),
+            "the index is the one the current build emitted"
+        );
+        assert_eq!(consult.conversation, "conv-tab1-key_custody-1789");
+        assert_eq!(consult.context.stream, "base");
+        assert_eq!(consult.context.tags(), vec!["Q11", "AZ-7"]);
+    }
+
+    #[test]
+    fn each_explain_refusal_is_produced_with_no_filesystem_effect() {
+        let bundle = Path::new("/b/builds/build-0");
+        let explain = explain_request();
+        let refuse = |agent: &AgentState| -> String {
+            plan(&layout(), &explain, Some(bundle), "build-1", agent).expect_err("refusal")
+        };
+
+        // No model key — the whole world is otherwise ready.
+        let e = refuse(&AgentState {
+            key: false,
+            key_file: PathBuf::from("/b/agent/api-key"),
+            ..agent()
+        });
+        assert!(
+            e.contains("no model key") && e.contains("ANTHROPIC_API_KEY"),
+            "{e}"
+        );
+
+        // No source index: grounding was ruled in from day one.
+        let e = refuse(&AgentState {
+            index: false,
+            ..agent()
+        });
+        assert!(
+            e.contains("sources.json") && e.contains("--sources-root"),
+            "{e}"
+        );
+
+        // A stream this build does not list.
+        let e = refuse(&AgentState::ready(&["stream-a"]));
+        assert!(e.contains("this build lists"), "{e}");
+
+        // An envelope that did not decode.
+        let bad = request(r#"{"verb":"explain","args":{"stream":"base"}}"#);
+        let e = plan(&layout(), &bad, Some(bundle), "build-1", &agent()).expect_err("refusal");
+        assert!(e.contains("`context`"), "{e}");
+
+        // And before any of them: a bundle root with no build at all.
+        let e = plan(&layout(), &explain, None, "build-1", &agent()).expect_err("refusal");
+        assert_eq!(e, NO_BUNDLE);
+
+        // Nothing above touched the filesystem: `/b` is not a directory here.
+        assert!(!Path::new("/b").exists(), "the planner laid nothing down");
+    }
+
+    #[test]
+    fn an_index_outside_the_bundle_root_is_refused_like_any_other_path() {
+        let e = plan(
+            &layout(),
+            &explain_request(),
+            Some(Path::new("/elsewhere/builds/build-0")),
+            "build-1",
+            &agent(),
+        )
+        .expect_err("refusal");
+        assert!(e.contains("leaves the bundle root"), "{e}");
     }
 
     #[test]

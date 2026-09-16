@@ -32,6 +32,7 @@ use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
 use glade_client::GladeClient;
 use glade_wire::generated::ExchangeReq;
 
+use crate::ask::{self, AgentState};
 use crate::bundle::{self, Layout};
 use crate::envelope::{GyldOutputRecord, GyldRequest, GyldResponse};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
@@ -46,6 +47,12 @@ pub const DEFAULT_OUTPUT_ID: &str = "gyld.output";
 /// fails on them.
 pub const DEFAULT_PYTHON: &str = "/opt/homebrew/bin/python3.13";
 
+/// The refusal an `explain` gets when this supplier has no model client to
+/// consult with. Failure is data here as everywhere: the envelope is validated
+/// and the world is read exactly as it would be, and the refusal names what is
+/// missing rather than handing an empty argv to a runner.
+pub const NO_MODEL_CLIENT: &str = "no model client is attached to this supplier";
+
 /// Everything the supplier needs to attach and serve.
 #[derive(Clone, Debug)]
 pub struct GyldConfig {
@@ -59,6 +66,9 @@ pub struct GyldConfig {
     pub surfaces: Surfaces,
     pub principal: Option<String>,
     pub limits: Limits,
+    /// Where a model key file is read when the environment carries none
+    /// (`--agent-key-file`). `None` is `<bundle-root>/agent/api-key`.
+    pub agent_key_file: Option<PathBuf>,
 }
 
 impl GyldConfig {
@@ -78,7 +88,46 @@ impl GyldConfig {
             surfaces: Surfaces::default(),
             principal: None,
             limits: Limits::default(),
+            agent_key_file: None,
         }
+    }
+
+    /// The key file this supplier reads when the environment carries no key.
+    /// The path is the APP's, never a request's: it is `--agent-key-file` or
+    /// the bundle root's own `agent/api-key`.
+    pub fn key_file(&self) -> PathBuf {
+        self.agent_key_file
+            .clone()
+            .unwrap_or_else(|| self.layout.bundle_root.join(ask::DEFAULT_KEY_FILE))
+    }
+}
+
+/// The agent's readiness, read once per request and handed to the PURE planner
+/// as data (GyldAskAgent.md sections 4 and 7).
+///
+/// PRESENCE only. Whether a key exists is a boolean; the key VALUE is read by
+/// the model client at the moment of the call and by nothing else, so it never
+/// reaches a plan, a prompt, a record or a log line.
+fn agent_state(config: &GyldConfig, latest: Option<&std::path::Path>) -> AgentState {
+    let key_file = config.key_file();
+    let key = std::env::var(ask::KEY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || key_file.is_file();
+    let (index, streams) = match latest {
+        Some(dir) => {
+            let listed = std::fs::read(dir.join("streams.json"))
+                .map(|bytes| publish::stream_ids(&bytes))
+                .unwrap_or_default();
+            (dir.join(ask::SOURCES_FILE).is_file(), listed)
+        }
+        None => (false, Vec::new()),
+    };
+    AgentState {
+        key,
+        key_file,
+        index,
+        streams,
     }
 }
 
@@ -282,7 +331,8 @@ fn answer(
     }
     let latest = bundle::latest_build(&config.layout);
     let stamp = bundle::build_stamp();
-    let plan = match verbs::plan(&config.layout, &request, latest.as_deref(), &stamp) {
+    let agent = agent_state(config, latest.as_deref());
+    let plan = match verbs::plan(&config.layout, &request, latest.as_deref(), &stamp, &agent) {
         Ok(p) => p,
         Err(e) => {
             // `fork` and `link` need no bundle and are unaffected; the five that
@@ -295,6 +345,12 @@ fn answer(
 
     if let Err(e) = write_overlay(&plan) {
         return GyldResponse::failed(e, who);
+    }
+
+    // `explain` runs no host: it consults. A consult plan carries no argv at
+    // all, so nothing about it can reach a runner.
+    if plan.consult.is_some() {
+        return GyldResponse::failed(NO_MODEL_CLIENT, who);
     }
 
     // `list` is the one verb with no subprocess: it reads the current bundle's
@@ -762,6 +818,7 @@ mod tests {
                 .unwrap(),
             None,
             "build-1",
+            &AgentState::default(),
         )
         .unwrap();
 

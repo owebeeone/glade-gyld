@@ -18,6 +18,9 @@
 //!      supplier attaches, with no verb issued and no host invoked at all.
 //!   7. a bundle root with NO build gets its first build for itself, keeps
 //!      answering while it runs, and lands its own census.
+//!   8. `explain` refuses as DATA — a bad envelope, a stream the build does not
+//!      list, a build with no source index — with no host invoked and the
+//!      supplier still answering afterwards.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -185,6 +188,44 @@ fn seed_whole_bundle(bundle_root: &Path) -> PathBuf {
     )
     .unwrap();
     dir
+}
+
+/// A well-formed `gyld.ask-context.v1` envelope over a seeded bundle's `base`
+/// stream, as the page's `askEnvelope()` composes one.
+fn ask_envelope(stream: &str, question: &str) -> serde_json::Value {
+    serde_json::json!({
+        "format": "gyld.ask-context.v1",
+        "stream": stream,
+        "perspective": "decisions",
+        "snapshot": null,
+        "record": {
+            "slot": "glade_decisions:GladeDecisions.key_custody",
+            "label": "key_custody",
+            "lines": ["Key custody and recovery posture"],
+            "kind": "question", "definition": "Question", "description": ""
+        },
+        "status": {
+            "emitted": true, "listed": true, "declared": "open",
+            "effective": "blocked", "tier": "now", "answerable_now": false,
+            "reason": "waits on proof_family"
+        },
+        "alternatives": [], "lean": null, "ruling": null,
+        "sources": [{"tag": "Q11", "cites": "record"}],
+        "requires": [], "unlocks": [], "gates": [], "neighbourhood": null,
+        "principal": "gianni",
+        "conversation": "conv-tab1-key_custody-1789",
+        "question": question
+    })
+}
+
+/// The `explain` request that carries one.
+fn explain(stream: &str, question: &str) -> String {
+    serde_json::json!({
+        "verb": "explain",
+        "stream_output": true,
+        "args": { "context": ask_envelope(stream, question) }
+    })
+    .to_string()
 }
 
 fn config_for(url: &str, gyld: PathBuf, bundle: PathBuf) -> GyldConfig {
@@ -500,6 +541,87 @@ async fn refusals_are_data_and_never_reach_a_host() {
     node.kill().await.ok();
 }
 
+// ---- 2b. `explain` refuses as data, and runs no host -----------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_refusals_are_data_and_the_supplier_keeps_answering() {
+    let tmp = Tmp::new("explain");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let seeded = seed_bundle(&bundle);
+
+    // A key file makes the key PRESENT whatever this process's environment
+    // holds, so the refusals under test are the ones this test is about. Its
+    // contents are never read here: the supplier only asks whether it exists.
+    std::fs::create_dir_all(bundle.join("agent")).unwrap();
+    std::fs::write(bundle.join("agent/api-key"), "not-a-key\n").unwrap();
+
+    let runner = Arc::new(Recorder::default());
+    let _sup = serve_with(config_for(&url, gyld, bundle.clone()), runner.clone())
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    // The seeded bundle carries no `sources.json`: grounding was ruled in from
+    // day one, so an ungrounded answer is refused rather than given.
+    let r = request(&requester, &explain("base", "why is this blocked?")).await;
+    assert!(!r.ok, "{r:?}");
+    let said = r.error.clone().unwrap_or_default();
+    assert!(
+        said.contains("sources.json") && said.contains("--sources-root"),
+        "{said}"
+    );
+    assert!(r.run_id.is_none(), "nothing started: {r:?}");
+
+    // With an index there, a stream the build does not list is still refused.
+    std::fs::write(
+        seeded.join("sources.json"),
+        br#"{"format":"gyld.sources.v1"}"#,
+    )
+    .unwrap();
+    let r = request(&requester, &explain("stream-a", "why?")).await;
+    assert!(!r.ok, "{r:?}");
+    assert!(
+        r.error
+            .clone()
+            .unwrap_or_default()
+            .contains("this build lists"),
+        "{r:?}"
+    );
+
+    // A malformed envelope names the field, not a flat `bad envelope`.
+    let r = request(&requester, r#"{"verb":"explain","args":{"stream":"base"}}"#).await;
+    assert!(
+        !r.ok && r.error.clone().unwrap_or_default().contains("`context`"),
+        "{r:?}"
+    );
+
+    // A well-formed one over a listed stream gets past every guard and stops at
+    // the one thing this supplier has not got: something to consult.
+    let r = request(&requester, &explain("base", "why is this blocked?")).await;
+    assert!(!r.ok, "{r:?}");
+    assert!(
+        r.error
+            .clone()
+            .unwrap_or_default()
+            .contains("no model client"),
+        "{r:?}"
+    );
+    assert_eq!(r.attributed_to.as_deref(), Some("gianni"));
+
+    // Not one of them reached a host, and the supplier is still answering.
+    assert_eq!(runner.count(), 0, "`explain` runs no host, ever");
+    let listed = request(&requester, r#"{"verb":"list"}"#).await;
+    assert!(listed.ok, "the supplier stays up: {listed:?}");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
 // ---- 3. a spawn failure answers as data ------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -683,6 +805,7 @@ fn the_emit_host_answers_help_as_a_real_subprocess() {
         pythonpath: layout.pythonpath(),
         output_dir: None,
         read: None,
+        consult: None,
     };
     let limits = Limits {
         timeout: Duration::from_secs(60),

@@ -29,7 +29,8 @@ glade-gyld --node ws://127.0.0.1:9099 \
   [--decisions-id gyld.decisions] [--lens-id gyld.lens] [--file-id gyld.file] \
   [--static-base /gyld] \
   [--principal gianni] [--python /opt/homebrew/bin/python3.13] \
-  [--timeout-secs 600] [--max-output-bytes 1048576]
+  [--timeout-secs 600] [--max-output-bytes 1048576] \
+  [--agent-key-file FILE]
 ```
 
 Attaches, serves, reattaches on link drop, and shuts down cleanly on
@@ -151,6 +152,7 @@ was built, and the previous bundle stands untouched.
 | verb | args | one host invocation |
 | --- | --- | --- |
 | `list` | none | none: reads `streams.json` of the latest build |
+| `explain` | `context` | none: resolves an ask envelope and consults a model |
 | `answer` | `stream`, `overlay` | writes the overlay module, then `rebuild` |
 | `ask` | `stream`, `overlay`, `question` | the same, with the question appended |
 | `fork` | `parent`, `stream`, `note?`, `force?` | `manage_decision_streams.py fork PARENT NEW` |
@@ -161,6 +163,13 @@ was built, and the previous bundle stands untouched.
 Everything else is refused as data. Excluded and why: `occurred`, `lens` and
 `inspect` are named by section 4.7 but no Gyld host verb exists for them yet,
 and the supplier only ever runs the hosts it can name.
+
+`explain` is `ask`'s neighbour on the list and its opposite in effect. `ask`
+appends a QUESTION to a stream's overlay module and rebuilds — it writes Gyld
+source. `explain` writes nothing at all: it is the first verb with no
+filesystem effect whatever, and its plan carries no `write` and no `argv`, so
+"the agent never writes an overlay" is a property of the plan type rather than
+a promise in prose ("The ask agent" below).
 
 Three guards stand between a request and a host, in this order: the verb
 allow-list, the stream-id pattern (Gyld's own `[a-z][a-z0-9]*(-[a-z0-9]+)*`,
@@ -177,6 +186,44 @@ than returned on the exchange.
 A **synchronous** mutating verb holds the exchange for as long as the run takes,
 bounded by the timeout. A build is minutes of Python, so a UI sends one with
 `stream_output: true` and follows the log surface instead.
+
+## The ask agent (verb `explain`)
+
+`explain` answers a reader's question about a record the build already emitted,
+grounded in the passages that record cites. It runs no Gyld host, writes no
+file and produces no Gyld fact: the answer is text, the citations are the
+index's own passages, and a ruling still exists only when a human submits one
+(`gyld-wz/dev-docs/ui/GyldAskAgent.md`).
+
+```json
+{ "verb": "explain",
+  "args": { "context": { "format": "gyld.ask-context.v1", "...": "..." } },
+  "stream_output": true, "principal": "gianni" }
+```
+
+`args.context` is the ask envelope the page composed, whole — a typed object
+like every other `args` field, so nothing a requester writes reaches a command
+line, and in this verb's case nothing reaches a subprocess at all. The envelope
+travels in POINTERS: the lens geometry and the projection are paths with
+digests, never bytes.
+
+The planner validates it and refuses as data, before anything starts:
+
+| refusal | what it says |
+| --- | --- |
+| a bad envelope | the field and what is wrong with it, never a flat `bad envelope` |
+| no model key | set `ANTHROPIC_API_KEY` in the supplier's environment, or write the key file |
+| no source index | the build's missing `sources.json`, and the `--sources-root` flag that emits one |
+| a stream the build does not list | the stream it named and the streams there are |
+
+Each of the four is produced with **no filesystem effect at all**: whether a key
+exists, whether the build emitted an index and which streams it lists are read
+once per request and handed to the pure planner as data. A key VALUE is read by
+the model client at the moment of the call and by nothing else — it never
+reaches a plan, a prompt, a record, a log line or the browser.
+
+The key is `ANTHROPIC_API_KEY` in the supplier's environment, else the file
+`--agent-key-file` names, else `<bundle-root>/agent/api-key`.
 
 ## Long-op output (log `gyld.output`)
 

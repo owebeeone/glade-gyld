@@ -241,7 +241,14 @@ mod tests {
         let request =
             GyldRequest::parse(br#"{"verb":"fork","args":{"parent":"base","stream":"a-b"}}"#)
                 .unwrap();
-        plan(&layout, &request, None, "build-1").unwrap()
+        plan(
+            &layout,
+            &request,
+            None,
+            "build-1",
+            &crate::ask::AgentState::default(),
+        )
+        .unwrap()
     }
 
     #[test]

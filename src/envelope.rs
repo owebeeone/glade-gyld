@@ -51,6 +51,14 @@ pub struct GyldArgs {
     /// `rebuild`: an explicit ISO-8601 build stamp (the host defaults it to now).
     #[serde(default)]
     pub built: Option<String>,
+    /// `explain`: the ask-context envelope (`gyld.ask-context.v1`), WHOLE.
+    ///
+    /// Held as raw JSON rather than as a typed field so a malformed envelope is
+    /// the `explain` verb's own readable refusal — naming the field and what is
+    /// wrong with it — instead of a flat `bad envelope` on every request that
+    /// happens to carry a `context`.
+    #[serde(default)]
+    pub context: Option<serde_json::Value>,
     /// Overwrite an existing overlay module or diff document.
     #[serde(default)]
     pub force: bool,

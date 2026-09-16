@@ -198,7 +198,7 @@ fn push_pointer(
 /// The stream ids a `gyld.streams.v1` listing carries, in the order it lists
 /// them. A listing that does not parse yields none: the bundle is still
 /// published, and the note says the rest could not be read.
-fn stream_ids(listing: &[u8]) -> Vec<String> {
+pub fn stream_ids(listing: &[u8]) -> Vec<String> {
     let value: serde_json::Value = match serde_json::from_slice(listing) {
         Ok(v) => v,
         Err(_) => {

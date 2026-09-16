@@ -9,6 +9,7 @@
 //!            [--file-id gyld.file] [--static-base /gyld] [--principal P]
 //!            [--python /opt/homebrew/bin/python3.13]
 //!            [--timeout-secs 600] [--max-output-bytes 1048576]
+//!            [--agent-key-file FILE]
 //! ```
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
@@ -27,7 +28,8 @@ const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --b
 [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
 [--streams-id gyld.streams] [--stream-id gyld.stream] [--decisions-id gyld.decisions] \
 [--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
-[--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576]";
+[--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576] \
+[--agent-key-file FILE]";
 
 /// The parsed CLI: the supplier config plus the interpreter to run the hosts.
 struct Args {
@@ -106,6 +108,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut python = PathBuf::from(DEFAULT_PYTHON);
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES;
+    let mut agent_key_file: Option<PathBuf> = None;
 
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -124,6 +127,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--file-id" => surfaces.file_id = take("--file-id")?,
             "--static-base" => surfaces.static_base = take("--static-base")?,
             "--principal" => principal = Some(take("--principal")?),
+            "--agent-key-file" => agent_key_file = Some(PathBuf::from(take("--agent-key-file")?)),
             "--python" => python = PathBuf::from(take("--python")?),
             "--timeout-secs" => {
                 timeout_secs = take("--timeout-secs")?
@@ -158,5 +162,6 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
         timeout: Duration::from_secs(timeout_secs),
         max_output_bytes,
     };
+    config.agent_key_file = agent_key_file;
     Ok(Args { config, python })
 }

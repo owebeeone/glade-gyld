@@ -19,6 +19,8 @@
 //!
 //! Modules:
 //! * [`envelope`] — the request, response and output-record JSON shapes.
+//! * [`ask`] — the `gyld.ask-context.v1` envelope the `explain` verb consults,
+//!   and its refusals (GyldAskAgent.md sections 3 and 4).
 //! * [`bundle`] — the bundle-root layout, the staging repository, containment,
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
@@ -29,6 +31,7 @@
 //!   publishing the bundle root's current build the moment it is serving and
 //!   making the first build itself when the root has none.
 
+pub mod ask;
 pub mod bundle;
 pub mod envelope;
 pub mod exec;
@@ -36,6 +39,7 @@ pub mod publish;
 pub mod supplier;
 pub mod verbs;
 
+pub use ask::{AgentState, AskContext, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE};
 pub use bundle::{FilePointer, Layout};
 pub use envelope::{GyldArgs, GyldOutputRecord, GyldRequest, GyldResponse};
 pub use exec::{

@@ -30,7 +30,8 @@ glade-gyld --node ws://127.0.0.1:9099 \
   [--static-base /gyld] \
   [--principal gianni] [--python /opt/homebrew/bin/python3.13] \
   [--timeout-secs 600] [--max-output-bytes 1048576] \
-  [--agent-key-file FILE]
+  [--agent-model claude-opus-5] [--agent-key-file FILE] \
+  [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]
 ```
 
 Attaches, serves, reattaches on link drop, and shuts down cleanly on
@@ -223,7 +224,10 @@ the model client at the moment of the call and by nothing else — it never
 reaches a plan, a prompt, a record, a log line or the browser.
 
 The key is `ANTHROPIC_API_KEY` in the supplier's environment, else the file
-`--agent-key-file` names, else `<bundle-root>/agent/api-key`.
+`--agent-key-file` names, else `<bundle-root>/agent/api-key`. A key file any
+other account on the machine can read is **refused rather than used** — `chmod
+600` it — because a supplier that quietly accepts one teaches everybody that it
+is fine.
 
 ### Grounding: the build's own source index
 
@@ -260,6 +264,40 @@ The stance is four sentences and a constant — no request composes any part of
 it: explain the graph as it was EMITTED; quote only the supplied passages and
 name the tag; name what is not emitted rather than filling it in; you may
 propose and draft, but you never rule and never submit.
+
+### The call, and the two budgets
+
+There is no official Anthropic SDK for Rust, so the call is raw HTTPS: `POST
+/v1/messages` with `x-api-key` and `anthropic-version`, `"stream": true`, and
+the SSE events folded into text chunks as they arrive. `--agent-model` defaults
+to **`claude-opus-5`**, taken from the `claude-api` skill's model table rather
+than from this file's memory. Thinking is not configured: on this model family
+it is on and adaptive by default, and its display stays at the default, so no
+reasoning text can reach a log record.
+
+`ModelClient` is a trait for the same reason `exec::Runner` is — the whole verb
+path is driven in the tests by a scripted double with no network in sight — and
+it is synchronous, like `Runner`, called from a blocking task.
+
+Both bounds are **refusal boundaries, not hopes**:
+
+- `--agent-max-input-tokens` is checked with `POST /v1/messages/count_tokens`
+  BEFORE the call, so an over-budget turn is refused with both numbers and costs
+  nothing.
+- `--agent-max-output-tokens` is the request's `max_tokens`. A turn that stops
+  there keeps its partial text and **says it is partial**: half an answer that
+  says so is data; half an answer presented as a whole one is not.
+
+`stop_reason` is data too. `end_turn` closes the run with exit 0; `max_tokens`
+and every other ending close it with a non-zero exit and a line saying which;
+`refusal` carries the model's own category and explanation. A transport failure
+is one line and a non-zero exit, never a hang and never a panic.
+
+`explain` is **always** a streaming run, whatever `stream_output` said: a
+consultation is model time, and its reply is a stream by nature. The exchange
+answers at once with `{ok: true, run_id, done: false}` and the chunks arrive on
+the reply surface as `answer` records, closed by the usual `{done: true, exit}`
+marker.
 
 ## Long-op output (log `gyld.output`)
 

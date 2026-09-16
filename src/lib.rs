@@ -25,6 +25,8 @@
 //!   resolver that grounds an answer in it (section 5).
 //! * [`prompt`] — the stance, the emitted context and the passages, composed
 //!   into the one stable prefix a turn is cached on (section 7).
+//! * [`model`] — the [`model::ModelClient`] trait and its raw-HTTPS
+//!   implementation: key discovery, the budgets, the streamed SSE (section 7).
 //! * [`bundle`] — the bundle-root layout, the staging repository, containment,
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
@@ -39,6 +41,7 @@ pub mod ask;
 pub mod bundle;
 pub mod envelope;
 pub mod exec;
+pub mod model;
 pub mod prompt;
 pub mod publish;
 pub mod sources;
@@ -50,6 +53,11 @@ pub use bundle::{FilePointer, Layout};
 pub use envelope::{GyldArgs, GyldOutputRecord, GyldRequest, GyldResponse};
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
+};
+pub use model::{
+    Declined, ModelClient, ModelConfig, ModelEvent, ModelOutcome, ModelRequest,
+    DEFAULT_AGENT_MODEL, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, END_TURN, MAX_TOKENS,
+    REFUSAL,
 };
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};

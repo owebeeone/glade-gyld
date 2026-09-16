@@ -314,6 +314,16 @@ pub enum AskRefusal {
     BadEnvelope { reason: String },
     /// The envelope names a stream this build does not list.
     StreamNotListed { stream: String, listed: Vec<String> },
+    /// A key file any other account on the machine can read is refused rather
+    /// than used: a supplier that quietly accepts one teaches everybody that it
+    /// is fine.
+    KeyFileMode { key_file: PathBuf, mode: u32 },
+    /// The counted input crossed the per-run budget. Refused BEFORE the call,
+    /// with both numbers, so it costs nothing.
+    OverInputBudget { counted: u64, budget: u64 },
+    /// The call could not be made, or broke on the way. Failure as data, like a
+    /// spawn error or a timeout on the host path.
+    Transport { reason: String },
 }
 
 impl AskRefusal {
@@ -338,6 +348,20 @@ impl AskRefusal {
             AskRefusal::StreamNotListed { stream, listed } => {
                 format!("the ask envelope names stream {stream:?}; this build lists {listed:?}")
             }
+            AskRefusal::KeyFileMode { key_file, mode } => {
+                format!(
+                    "the key file {} is mode {mode:o}: it is readable beyond its owner, so it is \
+                     refused rather than used. `chmod 600` it",
+                    key_file.display()
+                )
+            }
+            AskRefusal::OverInputBudget { counted, budget } => {
+                format!(
+                    "this turn counts {counted} input tokens; the per-run budget is {budget}, so \
+                     nothing was sent"
+                )
+            }
+            AskRefusal::Transport { reason } => reason.clone(),
         }
     }
 }

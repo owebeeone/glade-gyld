@@ -9,7 +9,8 @@
 //!            [--file-id gyld.file] [--static-base /gyld] [--principal P]
 //!            [--python /opt/homebrew/bin/python3.13]
 //!            [--timeout-secs 600] [--max-output-bytes 1048576]
-//!            [--agent-key-file FILE]
+//!            [--agent-model claude-opus-5] [--agent-key-file FILE]
+//!            [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]
 //! ```
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
@@ -20,7 +21,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gyld::{
-    serve, GyldConfig, Limits, Surfaces, DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES,
+    serve, GyldConfig, Limits, ModelConfig, Surfaces, DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, DEFAULT_TIMEOUT_SECS,
 };
 
@@ -29,7 +30,8 @@ const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --b
 [--streams-id gyld.streams] [--stream-id gyld.stream] [--decisions-id gyld.decisions] \
 [--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
 [--python /opt/homebrew/bin/python3.13] [--timeout-secs 600] [--max-output-bytes 1048576] \
-[--agent-key-file FILE]";
+[--agent-model claude-opus-5] [--agent-key-file FILE] \
+[--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000]";
 
 /// The parsed CLI: the supplier config plus the interpreter to run the hosts.
 struct Args {
@@ -59,13 +61,15 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> std::io::Result<()> {
     let config = args.config;
     eprintln!(
-        "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, principal {})",
+        "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, principal {}, \
+         agent-model {})",
         config.node_url,
         config.share,
         config.glade_id,
         config.layout.gyld_root.display(),
         config.layout.bundle_root.display(),
         config.principal.as_deref().unwrap_or("<none>"),
+        config.agent.model,
     );
     let supplier = serve(config, args.python).await?;
     eprintln!("glade-gyld: serving; SIGTERM/SIGINT to stop");
@@ -108,7 +112,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut python = PathBuf::from(DEFAULT_PYTHON);
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES;
-    let mut agent_key_file: Option<PathBuf> = None;
+    let mut agent = ModelConfig::default();
 
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -127,7 +131,18 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--file-id" => surfaces.file_id = take("--file-id")?,
             "--static-base" => surfaces.static_base = take("--static-base")?,
             "--principal" => principal = Some(take("--principal")?),
-            "--agent-key-file" => agent_key_file = Some(PathBuf::from(take("--agent-key-file")?)),
+            "--agent-model" => agent.model = take("--agent-model")?,
+            "--agent-key-file" => agent.key_file = PathBuf::from(take("--agent-key-file")?),
+            "--agent-max-input-tokens" => {
+                agent.max_input_tokens = take("--agent-max-input-tokens")?
+                    .parse()
+                    .map_err(|_| "--agent-max-input-tokens must be an integer".to_string())?;
+            }
+            "--agent-max-output-tokens" => {
+                agent.max_output_tokens = take("--agent-max-output-tokens")?
+                    .parse()
+                    .map_err(|_| "--agent-max-output-tokens must be an integer".to_string())?;
+            }
             "--python" => python = PathBuf::from(take("--python")?),
             "--timeout-secs" => {
                 timeout_secs = take("--timeout-secs")?
@@ -162,6 +177,6 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
         timeout: Duration::from_secs(timeout_secs),
         max_output_bytes,
     };
-    config.agent_key_file = agent_key_file;
+    config.agent = agent;
     Ok(Args { config, python })
 }

@@ -21,6 +21,9 @@
 //!   8. `explain` refuses as DATA — a bad envelope, a stream the build does not
 //!      list, a build with no source index — with no host invoked and the
 //!      supplier still answering afterwards.
+//!   9. the WHOLE consult path against a scripted model double: a normal
+//!      stream, a refusal, a budget stop and a transport error, each reaching a
+//!      subscriber as records closed by a terminal marker.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -35,7 +38,8 @@ use tokio::process::{Child, Command};
 
 use glade_client::GladeClient;
 use glade_gyld::{
-    serve_with, GyldConfig, GyldOutputRecord, GyldResponse, Limits, Plan, RunOutput, Runner,
+    serve_with, Declined, GyldConfig, GyldOutputRecord, GyldResponse, Limits, ModelClient,
+    ModelEvent, ModelOutcome, ModelRequest, Plan, RunOutput, Runner,
 };
 
 // ---- harness --------------------------------------------------------------
@@ -302,6 +306,82 @@ impl Runner for Recorder {
     }
 }
 
+/// A scripted model: it answers a token count and replays chunks, so the whole
+/// consult path runs with no network in sight. The SSE vocabulary itself is
+/// folded and asserted in the crate's own unit tests.
+struct ScriptedModel {
+    counted: u64,
+    chunks: Vec<&'static str>,
+    stop_reason: &'static str,
+    declined: Option<Declined>,
+    output_tokens: u64,
+    transport: Option<&'static str>,
+    calls: AtomicU64,
+}
+
+impl Default for ScriptedModel {
+    fn default() -> ScriptedModel {
+        ScriptedModel {
+            counted: 1200,
+            chunks: Vec::new(),
+            stop_reason: glade_gyld::END_TURN,
+            declined: None,
+            output_tokens: 42,
+            transport: None,
+            calls: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ModelClient for ScriptedModel {
+    fn count_tokens(&self, _request: &ModelRequest) -> Result<u64, String> {
+        Ok(self.counted)
+    }
+
+    fn stream(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelEvent),
+    ) -> Result<ModelOutcome, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            request.prompt.system.contains("You are the Gyld ask agent"),
+            "the stance reaches the model: {}",
+            request.prompt.system
+        );
+        if let Some(e) = self.transport {
+            return Err(e.to_string());
+        }
+        for chunk in self.chunks.iter() {
+            on_event(ModelEvent::Text((*chunk).to_string()));
+        }
+        Ok(ModelOutcome {
+            stop_reason: self.stop_reason.into(),
+            declined: self.declined.clone(),
+            output_tokens: self.output_tokens,
+            ..Default::default()
+        })
+    }
+}
+
+/// The model for every test that is not about the model: it panics if a verb
+/// ever reaches it, because no other verb should.
+struct NoModel;
+
+impl ModelClient for NoModel {
+    fn count_tokens(&self, _request: &ModelRequest) -> Result<u64, String> {
+        panic!("no verb but `explain` counts tokens");
+    }
+
+    fn stream(
+        &self,
+        _request: &ModelRequest,
+        _on_event: &mut dyn FnMut(ModelEvent),
+    ) -> Result<ModelOutcome, String> {
+        panic!("no verb but `explain` calls a model");
+    }
+}
+
 async fn poll<F, Fut>(mut f: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -364,6 +444,7 @@ async fn each_verb_maps_to_one_recorded_host_invocation() {
     let _sup = serve_with(
         config_for(&url, gyld.clone(), bundle.clone()),
         runner.clone(),
+        Arc::new(NoModel),
     )
     .await
     .unwrap();
@@ -496,9 +577,13 @@ async fn refusals_are_data_and_never_reach_a_host() {
     seed_bundle(&bundle);
 
     let runner = Arc::new(Recorder::default());
-    let _sup = serve_with(config_for(&url, gyld, bundle), runner.clone())
-        .await
-        .unwrap();
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle),
+        runner.clone(),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
 
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
@@ -558,9 +643,13 @@ async fn explain_refusals_are_data_and_the_supplier_keeps_answering() {
     std::fs::write(bundle.join("agent/api-key"), "not-a-key\n").unwrap();
 
     let runner = Arc::new(Recorder::default());
-    let _sup = serve_with(config_for(&url, gyld, bundle.clone()), runner.clone())
-        .await
-        .unwrap();
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle.clone()),
+        runner.clone(),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
 
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
@@ -600,19 +689,6 @@ async fn explain_refusals_are_data_and_the_supplier_keeps_answering() {
         "{r:?}"
     );
 
-    // A well-formed one over a listed stream gets past every guard and stops at
-    // the one thing this supplier has not got: something to consult.
-    let r = request(&requester, &explain("base", "why is this blocked?")).await;
-    assert!(!r.ok, "{r:?}");
-    assert!(
-        r.error
-            .clone()
-            .unwrap_or_default()
-            .contains("no model client"),
-        "{r:?}"
-    );
-    assert_eq!(r.attributed_to.as_deref(), Some("gianni"));
-
     // Not one of them reached a host, and the supplier is still answering.
     assert_eq!(runner.count(), 0, "`explain` runs no host, ever");
     let listed = request(&requester, r#"{"verb":"list"}"#).await;
@@ -620,6 +696,269 @@ async fn explain_refusals_are_data_and_the_supplier_keeps_answering() {
 
     requester.close().await;
     node.kill().await.ok();
+}
+
+// ---- 2c. the whole consult path, against a scripted model ------------------
+
+/// Seed a build's source index and an app-owned key file, so `explain` gets
+/// past every guard. The key file is never READ here — the supplier only asks
+/// whether it exists until the model client reads it — and it is mode 600, the
+/// only mode the client accepts.
+fn seed_agent(bundle_root: &Path, build: &Path) {
+    std::fs::write(
+        build.join("sources.json"),
+        serde_json::json!({
+            "format": "gyld.sources.v1",
+            "written": "2026-09-16T10:37:26Z",
+            "root": {"option": "--sources-root", "given": "../../glade-wz",
+                     "name": "glade-wz", "found": true},
+            "documents": [],
+            "tags": [{"tag": "Q11", "family": "matrix-row",
+                      "document": "GladeBuyBuildMatrix",
+                      "path": "dev-docs/GladeBuyBuildMatrix.md",
+                      "resolver": "table-row-id", "heading": "4. The questions",
+                      "lines": [158, 158],
+                      "passage": "| Q11 | Key custody and recovery posture | buy |",
+                      "digest": "d8eb379e", "truncated": false}],
+            "cited_by": [{"stream": "base",
+                          "slot": "glade_decisions:GladeDecisions.key_custody",
+                          "field": "sources", "tags": ["AZ-7"]}],
+            "unresolved": [{"tag": "AZ-7", "family": "row-id",
+                            "reason": "no document in this index declares it",
+                            "cited_by": ["glade_decisions:GladeDecisions.key_custody"]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let agent = bundle_root.join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    let key = agent.join("api-key");
+    std::fs::write(&key, "unused-by-the-double\n").unwrap();
+}
+
+/// Fold the output log for one run, waiting for its terminal record.
+async fn run_records(sub: &GladeClient, run_id: &str) -> Vec<GyldOutputRecord> {
+    let s = sub.clone();
+    let key = run_id.to_string();
+    let closed = poll(|| {
+        let s = s.clone();
+        let key = key.clone();
+        async move {
+            s.fold_log("ws-razel", "gyld.output", Some(key.as_bytes()))
+                .await
+                .iter()
+                .any(|e| {
+                    serde_json::from_slice::<GyldOutputRecord>(e)
+                        .map(|r| r.done == Some(true))
+                        .unwrap_or(false)
+                })
+        }
+    })
+    .await;
+    assert!(closed, "the run {run_id} closed with a terminal record");
+    sub.fold_log("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+        .await
+        .iter()
+        .filter_map(|e| serde_json::from_slice(e).ok())
+        .collect()
+}
+
+/// One consultation, end to end, against a scripted model.
+async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldOutputRecord> {
+    let tmp = Tmp::new(tag);
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let build = seed_bundle(&bundle);
+    seed_agent(&bundle, &build);
+
+    let runner = Arc::new(Recorder::default());
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle.clone()),
+        runner.clone(),
+        model.clone(),
+    )
+    .await
+    .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.output", None)
+        .await
+        .unwrap();
+
+    let accepted = request(&requester, &explain("base", "why is this blocked?")).await;
+    assert!(
+        accepted.ok && accepted.done == Some(false),
+        "a consultation is accepted at once: {accepted:?}"
+    );
+    assert_eq!(accepted.attributed_to.as_deref(), Some("gianni"));
+    let run_id = accepted.run_id.clone().expect("a run id");
+
+    sub.subscribe("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+        .await
+        .unwrap();
+    let records = run_records(&sub, &run_id).await;
+
+    assert_eq!(runner.count(), 0, "`explain` runs no host, ever");
+    assert!(records.iter().all(|r| r.run_id == run_id));
+    assert!(records
+        .iter()
+        .all(|r| r.principal.as_deref() == Some("gianni")));
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+    records
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_normal_consultation_streams_its_answer_and_closes_clean() {
+    let model = Arc::new(ScriptedModel {
+        chunks: vec!["It is blocked ", "by proof_family (Q11)."],
+        ..Default::default()
+    });
+    let records = consulted(model.clone(), "consult-ok").await;
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1, "one call, one turn");
+
+    let answers: Vec<&str> = records
+        .iter()
+        .filter(|r| r.stream == "answer")
+        .filter_map(|r| r.line.as_deref())
+        .collect();
+    assert_eq!(answers, vec!["It is blocked ", "by proof_family (Q11)."]);
+    let end = records.last().expect("a terminal record");
+    assert_eq!(end.stream, "end");
+    assert_eq!(end.exit, Some(0));
+    assert_eq!(end.done, Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declined_turn_a_budget_stop_and_a_transport_failure_are_all_data() {
+    // The model declined: the category and the explanation land as data.
+    let records = consulted(
+        Arc::new(ScriptedModel {
+            stop_reason: glade_gyld::REFUSAL,
+            declined: Some(Declined {
+                category: "cyber".into(),
+                explanation: "declined to continue".into(),
+            }),
+            ..Default::default()
+        }),
+        "consult-refuse",
+    )
+    .await;
+    let said = records
+        .iter()
+        .filter_map(|r| r.line.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(said.contains("the model declined (cyber)"), "{said}");
+    assert_eq!(records.last().unwrap().exit, Some(1));
+
+    // The output budget stopped it: the partial text is KEPT and said to be.
+    let records = consulted(
+        Arc::new(ScriptedModel {
+            chunks: vec!["It is blo"],
+            stop_reason: glade_gyld::MAX_TOKENS,
+            ..Default::default()
+        }),
+        "consult-budget",
+    )
+    .await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.stream == "answer")
+            .filter_map(|r| r.line.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["It is blo"],
+        "half an answer that says it is half an answer is data"
+    );
+    let said = records
+        .iter()
+        .filter_map(|r| r.line.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(said.contains("is partial"), "{said}");
+    assert_eq!(records.last().unwrap().exit, Some(1));
+
+    // The call broke: failure as data, not a hang and not a panic.
+    let records = consulted(
+        Arc::new(ScriptedModel {
+            transport: Some("connection reset by peer"),
+            ..Default::default()
+        }),
+        "consult-transport",
+    )
+    .await;
+    let said = records
+        .iter()
+        .filter_map(|r| r.line.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(said.contains("connection reset by peer"), "{said}");
+    assert_eq!(records.last().unwrap().exit, Some(1));
+}
+
+/// The REAL HTTPS client, driven where the supplier drives it: on a blocking
+/// task, against a port nothing is listening on.
+///
+/// The point is not the transport error — it is that there is one. A blocking
+/// HTTP client asserts, in debug builds, that it is neither built nor called
+/// from inside an async context; building it at attach panicked the supplier at
+/// start-up, and this is the regression test for that.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_real_model_client_answers_with_data_from_a_blocking_task() {
+    let tmp = Tmp::new("https");
+    let key = tmp.path().join("api-key");
+    std::fs::write(&key, "not-a-real-key\n").unwrap();
+    key_mode_600(&key);
+
+    let config = glade_gyld::ModelConfig {
+        base_url: "http://127.0.0.1:1".into(),
+        key_file: key,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = glade_gyld::model::HttpsModelClient::new(config.clone());
+    let request = ModelRequest {
+        config,
+        prompt: glade_gyld::Prompt {
+            system: "the stance".into(),
+            user: "why?".into(),
+        },
+    };
+    let said = tokio::task::spawn_blocking(move || client.count_tokens(&request))
+        .await
+        .expect("the blocking task did not panic")
+        .expect_err("nothing is listening on port 1");
+    assert!(said.contains("the model call failed"), "{said}");
+}
+
+#[cfg(unix)]
+mod key_modes {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    pub fn set_600(path: &Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[cfg(not(unix))]
+mod key_modes {
+    use std::path::Path;
+
+    pub fn set_600(_path: &Path) {}
+}
+
+fn key_mode_600(path: &Path) {
+    key_modes::set_600(path);
 }
 
 // ---- 3. a spawn failure answers as data ------------------------------------
@@ -636,7 +975,7 @@ async fn a_host_failure_answers_as_data() {
         fail: Some("timed out after 200ms".into()),
         ..Default::default()
     });
-    let _sup = serve_with(config_for(&url, gyld, bundle), runner)
+    let _sup = serve_with(config_for(&url, gyld, bundle), runner, Arc::new(NoModel))
         .await
         .unwrap();
 
@@ -676,7 +1015,7 @@ async fn streaming_output_reaches_a_subscriber_in_sequence() {
         gate: Some(gate.clone()),
         ..Default::default()
     });
-    let _sup = serve_with(config_for(&url, gyld, bundle), runner)
+    let _sup = serve_with(config_for(&url, gyld, bundle), runner, Arc::new(NoModel))
         .await
         .unwrap();
 
@@ -962,6 +1301,7 @@ async fn a_successful_build_publishes_the_bundle_onto_the_value_surfaces() {
     let _sup = serve_with(
         config_for(&url, gyld, bundle.clone()),
         Arc::new(BundleBuilder),
+        Arc::new(NoModel),
     )
     .await
     .unwrap();
@@ -1080,9 +1420,13 @@ async fn a_build_already_in_the_bundle_root_is_published_when_the_supplier_attac
     let (gyld, bundle) = roots(&tmp);
     let seeded = seed_whole_bundle(&bundle);
 
-    let _sup = serve_with(config_for(&url, gyld, bundle.clone()), Arc::new(NeverRuns))
-        .await
-        .unwrap();
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle.clone()),
+        Arc::new(NeverRuns),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
 
     // The subscriber arrives AFTER the supplier attached, which is the case
     // that was broken: a page opened on a running composition, no Rebuild
@@ -1226,6 +1570,7 @@ async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
     let _sup = serve_with(
         config_for(&url, gyld.clone(), bundle.clone()),
         runner.clone(),
+        Arc::new(NoModel),
     )
     .await
     .unwrap();

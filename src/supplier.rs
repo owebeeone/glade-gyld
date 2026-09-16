@@ -36,10 +36,15 @@ use crate::ask::{self, AgentState, Consultation};
 use crate::bundle::{self, Layout};
 use crate::envelope::{GyldOutputRecord, GyldRequest, GyldResponse};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
+use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
 use crate::prompt::{self, Prompt};
 use crate::publish::{self, Surfaces};
 use crate::sources::{self, ResolvedSource};
 use crate::verbs::{self, Plan};
+
+/// The record stream one chunk of a model's answer takes, as it streams
+/// (GyldAskAgent.md section 4, "The reply").
+pub const ANSWER_STREAM: &str = "answer";
 
 /// The default surfaces a gyld supplier stands behind (`gyld-app.glade`).
 pub const DEFAULT_SHARE: &str = "ws-razel";
@@ -48,12 +53,6 @@ pub const DEFAULT_OUTPUT_ID: &str = "gyld.output";
 /// The interpreter the Gyld hosts require: the default `python3` is 3.10 and
 /// fails on them.
 pub const DEFAULT_PYTHON: &str = "/opt/homebrew/bin/python3.13";
-
-/// The refusal an `explain` gets when this supplier has no model client to
-/// consult with. Failure is data here as everywhere: the envelope is validated
-/// and the world is read exactly as it would be, and the refusal names what is
-/// missing rather than handing an empty argv to a runner.
-pub const NO_MODEL_CLIENT: &str = "no model client is attached to this supplier";
 
 /// Everything the supplier needs to attach and serve.
 #[derive(Clone, Debug)]
@@ -68,9 +67,10 @@ pub struct GyldConfig {
     pub surfaces: Surfaces,
     pub principal: Option<String>,
     pub limits: Limits,
-    /// Where a model key file is read when the environment carries none
-    /// (`--agent-key-file`). `None` is `<bundle-root>/agent/api-key`.
-    pub agent_key_file: Option<PathBuf>,
+    /// The ask agent: the model, the two budgets and the key file
+    /// (GyldAskAgent.md section 7). An empty `key_file` is the default,
+    /// `<bundle-root>/agent/api-key`.
+    pub agent: ModelConfig,
 }
 
 impl GyldConfig {
@@ -90,7 +90,7 @@ impl GyldConfig {
             surfaces: Surfaces::default(),
             principal: None,
             limits: Limits::default(),
-            agent_key_file: None,
+            agent: ModelConfig::default(),
         }
     }
 
@@ -98,9 +98,18 @@ impl GyldConfig {
     /// The path is the APP's, never a request's: it is `--agent-key-file` or
     /// the bundle root's own `agent/api-key`.
     pub fn key_file(&self) -> PathBuf {
-        self.agent_key_file
-            .clone()
-            .unwrap_or_else(|| self.layout.bundle_root.join(ask::DEFAULT_KEY_FILE))
+        if self.agent.key_file.as_os_str().is_empty() {
+            return self.layout.bundle_root.join(ask::DEFAULT_KEY_FILE);
+        }
+        self.agent.key_file.clone()
+    }
+
+    /// The model configuration one turn is made with, key file resolved.
+    pub fn model_config(&self) -> ModelConfig {
+        ModelConfig {
+            key_file: self.key_file(),
+            ..self.agent.clone()
+        }
     }
 }
 
@@ -150,15 +159,21 @@ impl GyldSupplier {
 }
 
 /// Connect, attach as the gyld authority, and serve, with the real Python
-/// runner.
+/// runner and the real HTTPS model client.
 pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSupplier> {
-    serve_with(config, Arc::new(PythonRunner::new(python))).await
+    let model = model::HttpsModelClient::new(config.model_config());
+    serve_with(config, Arc::new(PythonRunner::new(python)), Arc::new(model)).await
 }
 
-/// Connect, attach and serve with a caller-supplied runner. The tests drive this
-/// one with a recording double, so the whole verb path is exercised with no
-/// interpreter and no Gyld checkout in sight.
-pub async fn serve_with(config: GyldConfig, runner: Arc<dyn Runner>) -> io::Result<GyldSupplier> {
+/// Connect, attach and serve with a caller-supplied runner and model client.
+/// The tests drive this one with a recording runner and a scripted model, so
+/// the whole verb path is exercised with no interpreter, no Gyld checkout and
+/// no network in sight.
+pub async fn serve_with(
+    config: GyldConfig,
+    runner: Arc<dyn Runner>,
+    model: Arc<dyn ModelClient>,
+) -> io::Result<GyldSupplier> {
     let config = Arc::new(config);
     let client = GladeClient::new(format!("glade-gyld:{}:{}", config.share, config.glade_id));
     client.connect(&config.node_url).await?;
@@ -176,6 +191,7 @@ pub async fn serve_with(config: GyldConfig, runner: Arc<dyn Runner>) -> io::Resu
         client.clone(),
         config.clone(),
         runner.clone(),
+        model,
         Handle::current(),
         first.clone(),
     );
@@ -286,6 +302,7 @@ fn make_handler(
     client: GladeClient,
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
+    model: Arc<dyn ModelClient>,
     handle: Handle,
     first: Arc<FirstBuild>,
 ) -> impl Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static {
@@ -295,6 +312,7 @@ fn make_handler(
             &client,
             &config,
             &runner,
+            &model,
             &handle,
             &runs,
             &first,
@@ -311,6 +329,7 @@ fn answer(
     client: &GladeClient,
     config: &Arc<GyldConfig>,
     runner: &Arc<dyn Runner>,
+    model: &Arc<dyn ModelClient>,
     handle: &Handle,
     runs: &Arc<AtomicU64>,
     first: &Arc<FirstBuild>,
@@ -351,15 +370,21 @@ fn answer(
 
     // `explain` runs no host: it consults. A consult plan carries no argv at
     // all, so nothing about it can reach a runner.
-    if let Some(consult) = plan.consult.as_ref() {
-        let grounded = match ground(consult) {
-            Ok(g) => g,
-            Err(e) => {
-                return GyldResponse::failed(e, who);
-            }
-        };
-        let _ = grounded;
-        return GyldResponse::failed(NO_MODEL_CLIENT, who);
+    //
+    // It is ALWAYS a streaming run, whatever `stream_output` said: a
+    // consultation is model time, and its reply is a stream by nature. The
+    // accept answer carries the run id, and the reply lands on the log surface.
+    if let Some(consult) = plan.consult.clone() {
+        spawn_consult(
+            client.clone(),
+            config.clone(),
+            model.clone(),
+            handle.clone(),
+            run_id.clone(),
+            consult,
+            who.clone(),
+        );
+        return GyldResponse::accepted(run_id, who);
     }
 
     // `list` is the one verb with no subprocess: it reads the current bundle's
@@ -602,6 +627,100 @@ async fn stream_run(
                 &who,
                 "stderr",
                 format!("run task failed: {e}"),
+            );
+            append(&client, &config, &run_id, &record).await;
+            -1
+        }
+    };
+    seq += 1;
+    append(
+        &client,
+        &config,
+        &run_id,
+        &GyldOutputRecord::end(&run_id, seq, &who, exit),
+    )
+    .await;
+}
+
+/// Accept a consultation and answer at once: [`consult_run`] on its own task.
+fn spawn_consult(
+    client: GladeClient,
+    config: Arc<GyldConfig>,
+    model: Arc<dyn ModelClient>,
+    handle: Handle,
+    run_id: String,
+    consult: Consultation,
+    who: Option<String>,
+) {
+    handle.spawn(consult_run(client, config, model, run_id, consult, who));
+}
+
+/// Run one consultation and stream its reply.
+///
+/// The shape is [`stream_run`]'s, and deliberately: ground and call on a
+/// BLOCKING task, append each chunk to the log as it arrives, close with a
+/// terminal record carrying the exit. A refusal — no index, an over-budget
+/// turn, a transport failure — is one line on the log and a non-zero exit,
+/// never a hang and never a panic.
+///
+/// The partial text of a turn the output budget stopped is KEPT and said to be
+/// partial: half an answer that says it is half an answer is data; half an
+/// answer presented as a whole one is not.
+async fn consult_run(
+    client: GladeClient,
+    config: Arc<GyldConfig>,
+    model: Arc<dyn ModelClient>,
+    run_id: String,
+    consult: Consultation,
+    who: Option<String>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let model_config = config.model_config();
+    let work =
+        tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
+            let (_sources, prompt) = ground(&consult)?;
+            let request = ModelRequest {
+                config: model_config,
+                prompt,
+            };
+            model::consult(model.as_ref(), &request, &mut |event| {
+                let ModelEvent::Text(chunk) = event;
+                let _ = tx.send(chunk);
+            })
+            .map_err(|refusal| refusal.says())
+        });
+
+    let mut seq: u64 = 0;
+    while let Some(chunk) = rx.recv().await {
+        seq += 1;
+        let record = GyldOutputRecord::line(&run_id, seq, &who, ANSWER_STREAM, chunk);
+        append(&client, &config, &run_id, &record).await;
+    }
+
+    let budget = config.agent.max_output_tokens;
+    let exit = match work.await {
+        Ok(Ok(outcome)) => {
+            if let Some(said) = outcome.says(budget) {
+                seq += 1;
+                let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", said);
+                append(&client, &config, &run_id, &record).await;
+            }
+            outcome.exit()
+        }
+        Ok(Err(refused)) => {
+            seq += 1;
+            let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", refused);
+            append(&client, &config, &run_id, &record).await;
+            1
+        }
+        Err(e) => {
+            seq += 1;
+            let record = GyldOutputRecord::line(
+                &run_id,
+                seq,
+                &who,
+                "stderr",
+                format!("the consultation task failed: {e}"),
             );
             append(&client, &config, &run_id, &record).await;
             -1

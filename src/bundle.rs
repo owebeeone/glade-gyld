@@ -148,6 +148,11 @@ pub fn lexically_normalize(path: &Path) -> Option<PathBuf> {
 /// with one link per file of `<gyld-root>/examples`; a name that already exists
 /// there (a supplier-written overlay, or a link from an earlier run) is left
 /// exactly as it is, so a written overlay always wins over the checkout's copy.
+///
+/// Idempotent CONCURRENTLY too, which is the case the supplier actually runs:
+/// every verb ensures the stage on the exchange path while the first build
+/// ensures it on its own task, so on a fresh bundle root two callers reach the
+/// same absent link at once. See [`already_laid`].
 pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
     let overlays = layout.overlays();
     std::fs::create_dir_all(&overlays)?;
@@ -165,15 +170,36 @@ pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
             if target.symlink_metadata().is_ok() {
                 continue;
             }
-            platform::link_file(&entry.path(), &target)?;
+            already_laid(platform::link_file(&entry.path(), &target))?;
         }
     }
 
     let examples = layout.stage_examples();
     if examples.symlink_metadata().is_err() {
-        platform::link_dir(&overlays, &examples)?;
+        already_laid(platform::link_dir(&overlays, &examples))?;
     }
     Ok(())
+}
+
+/// Treat `AlreadyExists` from laying a link as the success it is.
+///
+/// The seeding above is check-then-act — `symlink_metadata`, then link — and
+/// the supplier calls it from two places that run at the same time: the
+/// exchange handler ensures the stage for EVERY verb, and `prepare_first_build`
+/// ensures it on the bootstrap task. On a fresh bundle root both see nothing
+/// and both lay the link; the loser gets `EEXIST`. The guard above already says
+/// what to do when the name is taken — leave it alone — so the loser has the
+/// outcome it asked for and there is nothing to report. It surfaced as
+/// `bundle root unusable: File exists (os error 17)`, which refused the verb or,
+/// worse, abandoned the first build and left the root with no bundle at all.
+///
+/// Every other error is still an error: a read-only root, a missing parent, a
+/// permission refusal all come straight back.
+fn already_laid(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
 }
 
 /// Platform-specific linking, behind an explicit module boundary (the workzone's
@@ -350,6 +376,55 @@ mod tests {
         // The checkout is untouched: exactly the one file it started with.
         let listed = std::fs::read_dir(gyld.join("examples")).unwrap().count();
         assert_eq!(listed, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensuring_one_fresh_stage_from_several_callers_at_once_is_not_an_error() {
+        // The supplier's own shape: the exchange handler ensures the stage for
+        // every verb while the bootstrap task ensures it for the first build,
+        // so a FRESH root is staged by several callers at the same moment.
+        // Each one used to check the link was absent and then lay it, and the
+        // loser's `EEXIST` refused a verb or abandoned the first build.
+        let root = tmp("stage-race");
+        let gyld = root.join("gyld");
+        std::fs::create_dir_all(gyld.join("examples")).unwrap();
+        for n in 0..8 {
+            std::fs::write(gyld.join(format!("examples/s{n}.gyld.py")), "base\n").unwrap();
+        }
+
+        // Several fresh roots: the window is between the check and the link, so
+        // one root is one sample of it.
+        for attempt in 0..8 {
+            let bundle = root.join(format!("bundle-{attempt}"));
+            let layout = Layout::new(gyld.clone(), bundle.clone());
+            let start = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                let start = &start;
+                let layout = &layout;
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            start.wait();
+                            ensure_stage(layout)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("the staging thread ran")
+                        .expect("a concurrent ensure_stage is not a failure");
+                }
+            });
+            // And the stage they raced to build is the one stage: every seed
+            // reachable through `stage/examples`, exactly once.
+            for n in 0..8 {
+                let seeded = layout.stage_examples().join(format!("s{n}.gyld.py"));
+                assert_eq!(std::fs::read_to_string(&seeded).unwrap(), "base\n");
+            }
+            assert_eq!(std::fs::read_dir(layout.overlays()).unwrap().count(), 8);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

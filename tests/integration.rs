@@ -34,6 +34,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::Mutex;
@@ -2555,17 +2556,31 @@ async fn a_build_already_in_the_bundle_root_is_published_when_the_supplier_attac
             .unwrap();
     }
 
+    // Every surface, not just the first one. The publication is one append per
+    // document — the census FIRST and the lens pointer LAST — so a census that
+    // has landed says nothing about a pointer that has not, and `fold_value` is
+    // a fold over what this session has SEEN, never a fetch that waits. Waiting
+    // on the census alone and then reading the pointer straight out was a race
+    // the parallel suite lost about one run in ten.
     let s = sub.clone();
     let landed = poll(|| {
         let s = s.clone();
         async move {
-            s.fold_value("ws-razel", "gyld.streams", None)
-                .await
-                .is_some()
+            for (id, key) in [
+                ("gyld.streams", None),
+                ("gyld.stream", Some(b"base".as_slice())),
+                ("gyld.decisions", Some(b"base".as_slice())),
+                ("gyld.lens", Some(b"base/decisions".as_slice())),
+            ] {
+                if s.fold_value("ws-razel", id, key).await.is_none() {
+                    return false;
+                }
+            }
+            true
         }
     })
     .await;
-    assert!(landed, "the census landed with no verb issued at all");
+    assert!(landed, "the whole build landed with no verb issued at all");
 
     let listing = sub
         .fold_value("ws-razel", "gyld.streams", None)
@@ -2616,9 +2631,16 @@ async fn a_build_already_in_the_bundle_root_is_published_when_the_supplier_attac
 /// run with the ids a Gyld checkout would print, and writes a whole bundle for
 /// the build itself. `gate`, when it is there, holds the BUILD closed (never
 /// the discovery) so the test can see the supplier answering mid-flight.
+///
+/// A rendezvous channel rather than a `Barrier`, because the two parties here
+/// are not symmetric: the test reaches the gate on the strength of a REFUSAL
+/// that the supplier raises before it has run anything, so a bootstrap that
+/// never reaches the runner at all leaves the test as the only party. A
+/// `Barrier` parked it there for good and hung the whole `cargo test` run;
+/// this side of the gate is bounded and says what did not arrive.
 struct Bootstrapper {
     plans: Mutex<Vec<Plan>>,
-    gate: Option<Arc<Barrier>>,
+    gate: Option<SyncSender<()>>,
 }
 
 impl Runner for Bootstrapper {
@@ -2642,7 +2664,10 @@ impl Runner for Bootstrapper {
             }
         };
         if let Some(gate) = self.gate.as_ref() {
-            gate.wait();
+            // A zero-capacity send returns when the test receives it, and errors
+            // at once if the test is already gone, so the build is held exactly
+            // as long as the test holds it and never a moment past the test.
+            let _ = gate.send(());
         }
         on_line("stdout", "capturing base");
         let lenses = dir.join("streams/base/lenses");
@@ -2673,10 +2698,10 @@ async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
     // No seed at all: this is a fresh data directory.
     assert!(!bundle.join("latest.json").exists());
 
-    let gate = Arc::new(Barrier::new(2));
+    let (open, gate) = std::sync::mpsc::sync_channel::<()>(0);
     let runner = Arc::new(Bootstrapper {
         plans: Mutex::new(Vec::new()),
-        gate: Some(gate.clone()),
+        gate: Some(open),
     });
     let _sup = serve_with(
         config_for(&url, gyld.clone(), bundle.clone()),
@@ -2735,7 +2760,10 @@ async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
         .await
         .unwrap();
 
-    gate.wait(); // let the first build finish
+    // Let the first build finish — bounded, so a bootstrap that never reached
+    // the runner is a named failure rather than a test that never returns.
+    gate.recv_timeout(Duration::from_secs(60))
+        .expect("the first build reached the runner");
 
     let s = sub.clone();
     let landed = poll(|| {

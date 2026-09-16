@@ -363,6 +363,7 @@ run id instead would need one mount per question asked.
 | `question` | `line`: the question, as the reader typed it | the turn's opening, appended before anything is asked of a model |
 | `citation` | `record`: the resolved source, whole | one cited passage with its tag, document, heading, lines and digest — or `resolved: false` with the reason |
 | `answer` | `line`: one text chunk | the prose, as the model streams it |
+| `draft` | `record`: the offer, with `drafted_by` | an alternative and a one-sentence ruling a human may take |
 | `end` | `done: true`, `exit`, and a `line` on anything but a clean end | the turn's close |
 
 Every record carries `run_id`, `seq`, `principal` and `conversation`, in the
@@ -374,6 +375,69 @@ The **citations come first**, before the prose, so a reader sees what the answer
 is grounded in as soon as there is anything to see — and sees it even when the
 call then fails. A citation's `record` is the index's own entry, never the
 model's rendering of it.
+
+### Drafting: an offer, never a ruling
+
+When the reader asks for a proposal, the agent may name ONE alternative and
+draft the ruling text a human could take. The stance says the boundary in the
+same constant the rest of it lives in: propose only an alternative the context
+lists, write the ruling as one sentence in the form the overlays use
+(`YYYY-MM-DD, owner: ...`), and never rule, never submit, never say a decision
+has been taken. The stance carries no date of its own — a clock in the cached
+prefix would move it every turn — so the date is the model's and the decision
+is the human's.
+
+The `draft` record is `{slot, alternative, alternative_slot?, ruling_text,
+sources, drafted_by, resolved, reason?}`:
+
+- `slot` is the **envelope's** record, never a name the model chose.
+- `alternative` is the model's own string, **verbatim**, and `alternative_slot`
+  is the envelope's qualified slot for it — present only when the envelope
+  actually offers it.
+- `drafted_by` is the **model id**, so a draft can never be mistaken for a
+  person's text, in the window or in the log.
+- **A draft naming an alternative the envelope does not offer is emitted as
+  `resolved: false` with the name it gave and the reason, not corrected.**
+  Bending a foreign name onto the nearest alternative would be the supplier
+  inventing a proposal nobody made. A draft that does not decode is *not a
+  draft*: nothing is offered, and the turn's close says what arrived.
+
+**Structured output: a strict tool, not a fenced JSON block.** The `claude-api`
+skill offers two mechanisms — `output_config.format`, which constrains the whole
+response to one JSON document, and `strict: true` on a tool, which guarantees
+`tool_use.input` validates against the schema exactly. This reply is prose,
+streamed to a reader as it arrives, with an offer sometimes beside it, so a
+whole-response format is the wrong shape: it would cost the reader the answer to
+get the draft (and it is incompatible with citations besides). One tool,
+`propose_draft`, is declared instead. Its call arrives as its own content block
+alongside the text blocks, schema-checked, and never has to be scraped back out
+of the prose the reader is already reading; a fenced block would be guaranteed
+by nothing and rendered twice.
+
+Three choices go with it:
+
+- `tool_choice` stays at its default, **`auto`**. Forcing the call would have
+  the agent propose on every turn, including the ones that only asked what a
+  record says — and an agent that must always propose is an agent that rules.
+- `eager_input_streaming` is **off**. The skill turns it on so large tool inputs
+  stream as they are generated, at the price of the client owning validation and
+  possibly parsing a truncated input; a draft is a slot, one sentence and a few
+  tags, so the buffered form is both small and the one that arrives whole or not
+  at all.
+- The tool is declared **unconditionally**, not only when the envelope offers
+  alternatives. Tools render at position 0, ahead of the system block, so a tool
+  set that varied with the question would move the cached prefix on every turn —
+  the silent cache invalidator the skill names by name.
+
+`stop_reason: "tool_use"` closes the run with **exit 0**. This verb declares
+exactly one tool and never answers the call: there is no loop to continue and
+nothing more the model would say, so a turn that ends by making the offer the
+reader asked for is a turn that ended.
+
+The agent still never calls `answer`. The `explain` plan carries no
+`PlannedWrite` and no `argv`, the model client has no access to the overlay
+path, and a draft is one more record on a log surface — the human's Submit is
+the only thing that ever writes a ruling.
 
 ## Long-op output (log `gyld.output`)
 
@@ -483,7 +547,7 @@ lens pointer's `path` names.
 ## Tests
 
 ```sh
-cargo test                              # 85 unit + 15 integration
+cargo test                              # 91 unit + 18 integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

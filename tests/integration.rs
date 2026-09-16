@@ -27,6 +27,9 @@
 //!  10. a CONVERSATION of three turns on one key: the supplier reads its own
 //!      records back as prior turns, the cached prefix is byte-identical across
 //!      them, and the per-conversation budget refuses the turn that crosses it.
+//!  11. the DRAFT: a well-formed offer with its model id, a malformed one that
+//!      offers nothing and says why, and one naming an alternative the envelope
+//!      does not offer, emitted unresolved rather than corrected.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -315,6 +318,9 @@ impl Runner for Recorder {
 struct ScriptedModel {
     counted: u64,
     chunks: Vec<&'static str>,
+    /// The tool input a drafting turn calls back with — the RAW input, as the
+    /// SSE fold hands it over: a string here is one that was not even JSON.
+    draft: Option<serde_json::Value>,
     stop_reason: &'static str,
     declined: Option<Declined>,
     input_tokens: u64,
@@ -331,6 +337,7 @@ impl Default for ScriptedModel {
         ScriptedModel {
             counted: 1200,
             chunks: Vec::new(),
+            draft: None,
             stop_reason: glade_gyld::END_TURN,
             declined: None,
             input_tokens: 1200,
@@ -373,6 +380,9 @@ impl ModelClient for ScriptedModel {
         }
         for chunk in self.chunks.iter() {
             on_event(ModelEvent::Text((*chunk).to_string()));
+        }
+        if let Some(draft) = self.draft.clone() {
+            on_event(ModelEvent::Draft(draft));
         }
         Ok(ModelOutcome {
             stop_reason: self.stop_reason.into(),
@@ -1173,6 +1183,205 @@ async fn the_per_conversation_budget_refuses_the_turn_that_would_cross_it() {
         2,
         "{records:?}"
     );
+}
+
+// ---- 3a. the draft: an offer, never a ruling -------------------------------
+
+/// An envelope whose record offers TWO alternatives, which is the shape a
+/// question worth drafting against has.
+fn two_alternatives(question: &str) -> String {
+    let mut envelope = ask_envelope("base", question);
+    envelope["alternatives"] = serde_json::json!([
+        {"slot": "glade_decisions:GladeDecisions.key_custody.device",
+         "label": "device", "description": "on the device", "preferred": true},
+        {"slot": "glade_decisions:GladeDecisions.key_custody.custodian",
+         "label": "custodian", "description": "with a custodian", "preferred": false}
+    ]);
+    serde_json::json!({
+        "verb": "explain",
+        "stream_output": true,
+        "args": { "context": envelope }
+    })
+    .to_string()
+}
+
+/// One consultation over that envelope, answered by a double that drafts.
+async fn drafted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldAskRecord> {
+    let tmp = Tmp::new(tag);
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let build = seed_bundle(&bundle);
+    seed_agent(&bundle, &build);
+
+    let runner = Arc::new(Recorder::default());
+    let _sup = serve_with(config_for(&url, gyld, bundle), runner.clone(), model)
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.ask", Some(CONVERSATION.as_bytes()))
+        .await
+        .unwrap();
+
+    let accepted = request(
+        &requester,
+        &two_alternatives("which alternative would you propose, and how would it read?"),
+    )
+    .await;
+    assert!(accepted.ok, "{accepted:?}");
+    let records = ask_records(&sub, CONVERSATION).await;
+    assert_eq!(runner.count(), 0, "`explain` runs no host, ever");
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+    records
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_well_formed_draft_lands_as_an_offer_with_the_model_that_made_it() {
+    let records = drafted(
+        Arc::new(ScriptedModel {
+            chunks: vec!["Two are offered. "],
+            draft: Some(serde_json::json!({
+                "alternative": "glade_decisions:GladeDecisions.key_custody.device",
+                "ruling_text": "2026-09-16, owner: gianni: keys stay on the device.",
+                "sources": ["Q11"]
+            })),
+            stop_reason: "tool_use",
+            ..Default::default()
+        }),
+        "draft-ok",
+    )
+    .await;
+
+    let draft = records
+        .iter()
+        .find(|r| r.stream == "draft")
+        .expect("a draft record");
+    let offer = draft.record.as_ref().expect("the offer");
+    assert_eq!(
+        offer["slot"], "glade_decisions:GladeDecisions.key_custody",
+        "the record it is FOR is the envelope's own"
+    );
+    assert_eq!(
+        offer["alternative"],
+        "glade_decisions:GladeDecisions.key_custody.device"
+    );
+    assert_eq!(
+        offer["alternative_slot"], "glade_decisions:GladeDecisions.key_custody.device",
+        "the alternative's QUALIFIED slot"
+    );
+    assert_eq!(offer["resolved"], true);
+    assert_eq!(
+        offer["ruling_text"],
+        "2026-09-16, owner: gianni: keys stay on the device."
+    );
+    assert_eq!(offer["sources"], serde_json::json!(["Q11"]));
+    assert_eq!(
+        offer["drafted_by"], "claude-opus-5",
+        "the model id, so a draft can never be mistaken for a person's text"
+    );
+
+    // The prose still arrived, and the turn ended CLEAN: the offer is how a
+    // turn that was asked to propose ends.
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.stream == glade_gyld::ASK_ANSWER)
+            .filter_map(|r| r.line.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["Two are offered. "]
+    );
+    let end = records.last().expect("a terminal record");
+    assert_eq!(end.exit, Some(0), "{end:?}");
+    assert!(end.line.is_none(), "{end:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_draft_offers_nothing_and_the_turn_says_why() {
+    let records = drafted(
+        Arc::new(ScriptedModel {
+            chunks: vec!["Two are offered. "],
+            // Not even JSON — the fold hands the raw string over rather than
+            // drop it, so the close can say what arrived.
+            draft: Some(serde_json::json!(
+                "{\"alternative\": \"...device\", \"ruling_te"
+            )),
+            stop_reason: "tool_use",
+            ..Default::default()
+        }),
+        "draft-malformed",
+    )
+    .await;
+
+    assert!(
+        !records.iter().any(|r| r.stream == "draft"),
+        "a draft that did not decode is NOT a draft: {records:?}"
+    );
+    let end = records.last().expect("a terminal record");
+    let said = end.line.clone().unwrap_or_default();
+    assert!(said.contains("did not decode as an object"), "{said}");
+    assert!(said.contains("ruling_te"), "it says what arrived: {said}");
+    assert_eq!(
+        end.exit,
+        Some(1),
+        "the prose stands, but the offer the reader asked for did not arrive"
+    );
+    // And the prose is kept: half a turn that says so is data.
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.stream == glade_gyld::ASK_ANSWER)
+            .count(),
+        1,
+        "{records:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_naming_a_foreign_alternative_is_emitted_unresolved_not_corrected() {
+    let records = drafted(
+        Arc::new(ScriptedModel {
+            chunks: vec!["Neither is quite it. "],
+            draft: Some(serde_json::json!({
+                "alternative": "glade_decisions:GladeDecisions.key_custody.hsm",
+                "ruling_text": "2026-09-16, owner: gianni: put them in an HSM.",
+                "sources": ["Q11"]
+            })),
+            stop_reason: "tool_use",
+            ..Default::default()
+        }),
+        "draft-foreign",
+    )
+    .await;
+
+    let offer = records
+        .iter()
+        .find(|r| r.stream == "draft")
+        .and_then(|r| r.record.clone())
+        .expect("a draft record, and an unresolved one");
+    assert_eq!(
+        offer["alternative"], "glade_decisions:GladeDecisions.key_custody.hsm",
+        "the name it GAVE, uncorrected"
+    );
+    assert_eq!(offer["resolved"], false);
+    assert!(
+        offer.get("alternative_slot").is_none(),
+        "there is no qualified slot for an alternative nothing offers: {offer}"
+    );
+    let reason = offer["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("key_custody.device"), "{reason}");
+    assert!(reason.contains("not this one"), "{reason}");
+
+    // It is still a draft record and still a clean turn: the agent made an
+    // offer, and whether the offer matches anything emitted is DATA.
+    assert_eq!(records.last().expect("an end").exit, Some(0));
 }
 
 /// The REAL HTTPS client, driven where the supplier drives it: on a blocking

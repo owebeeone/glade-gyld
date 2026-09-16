@@ -91,6 +91,76 @@ impl Default for ModelConfig {
     }
 }
 
+/// The one tool this verb declares, and the form a DRAFT comes back in
+/// (GyldAskAgent.md section 8).
+pub const DRAFT_TOOL: &str = "propose_draft";
+
+/// The draft tool, declared on every request whatever the question asks.
+///
+/// **Why a tool and not a fenced JSON block.** The `claude-api` skill offers
+/// two structured-output mechanisms: `output_config.format`, which constrains
+/// the WHOLE response to one JSON document, and `strict: true` on a tool, which
+/// guarantees that `tool_use.input` validates against the schema exactly. This
+/// reply is PROSE — streamed to a reader as it arrives — with an offer
+/// sometimes beside it, so a whole-response format is the wrong shape: it would
+/// cost the reader the answer to get the draft. A tool call arrives as its own
+/// content block alongside the text blocks, schema-checked, and never has to be
+/// scraped back out of the prose the reader is already reading. A fenced block
+/// in the prose would be guaranteed by nothing and rendered twice.
+///
+/// `tool_choice` stays at its default, `auto`. Forcing the call would have the
+/// agent propose on every turn, including the turns that only asked what a
+/// record says — and an agent that must always propose is an agent that rules.
+///
+/// `eager_input_streaming` is deliberately OFF. The skill turns it on so LARGE
+/// tool inputs stream as they are generated, at the price of the client owning
+/// validation and possibly parsing a truncated input; a draft is a slot, one
+/// sentence and a few tags, so the buffered form is both small and the one that
+/// arrives whole or not at all.
+///
+/// It is declared UNCONDITIONALLY — not only when the envelope offers
+/// alternatives. Tools render at position 0, ahead of the system block, so a
+/// tool set that varied with the question would move the cached prefix on every
+/// turn: a conditional tool list is the silent cache invalidator the skill names
+/// by name.
+pub fn draft_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": DRAFT_TOOL,
+        "description": "\
+    Offer ONE alternative for this record together with the ruling text a reader \
+    could take. Call this when the reader asks for a proposal, a recommendation, a \
+    lean or draft ruling text — and not otherwise. Say your reasoning in prose \
+    first; the call carries the offer, not the argument for it. A draft is an \
+    OFFER: a human takes it, edits it or discards it, and calling this tool is not \
+    ruling.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "alternative": {
+                    "type": "string",
+                    "description": "The QUALIFIED SLOT of the alternative you \
+    propose, exactly as the context lists it under `Alternatives`. Propose only an \
+    alternative that list offers.",
+                },
+                "ruling_text": {
+                    "type": "string",
+                    "description": "ONE sentence, in the form the overlays use: \
+    `YYYY-MM-DD, owner: ...`.",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "The source tags this draft leans on, from \
+    the passages supplied. Cite only tags that were supplied.",
+                },
+            },
+            "required": ["alternative", "ruling_text", "sources"],
+            "additionalProperties": false,
+        },
+        "strict": true,
+    })
+}
+
 /// One turn's request: the configuration, the two-part prompt, and the prior
 /// turns of this conversation as its own records tell them.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -151,6 +221,7 @@ impl ModelRequest {
         let body = self.shared();
         serde_json::json!({
             "model": body["model"],
+            "tools": body["tools"],
             "system": body["system"],
         })
     }
@@ -158,6 +229,7 @@ impl ModelRequest {
     fn shared(&self) -> serde_json::Value {
         serde_json::json!({
             "model": self.config.model,
+            "tools": [draft_tool()],
             "system": [{
                 "type": "text",
                 "text": self.prompt.system,
@@ -173,6 +245,12 @@ impl ModelRequest {
 pub enum ModelEvent {
     /// A chunk of the answer, as it arrived.
     Text(String),
+    /// A draft, as the tool call carried it — the raw input, read by nothing
+    /// here. What a draft MEANS is the envelope's business
+    /// ([`crate::ask::AskDraft::parse`]); a tool input that was not even JSON
+    /// arrives as a string, so the supplier can say what it was rather than
+    /// swallow it.
+    Draft(serde_json::Value),
 }
 
 /// Why the model declined, as data (`stop_reason: "refusal"`).
@@ -201,11 +279,19 @@ pub const END_TURN: &str = "end_turn";
 pub const MAX_TOKENS: &str = "max_tokens";
 /// The ending that means the model declined.
 pub const REFUSAL: &str = "refusal";
+/// The ending that means the turn closed on a tool call.
+///
+/// A CLEAN ending here. This verb declares exactly one tool, whose whole
+/// purpose is to carry a draft back, and it never answers the call: there is no
+/// loop to continue and nothing more the model would say. A turn that ends by
+/// making the offer the reader asked for is a turn that ended.
+pub const TOOL_USE: &str = "tool_use";
 
 impl ModelOutcome {
-    /// The turn ended because the answer ended.
+    /// The turn ended because the answer ended — or because it ended in the
+    /// draft it was asked for, which is the same thing here (see [`TOOL_USE`]).
     pub fn complete(&self) -> bool {
-        self.stop_reason == END_TURN
+        self.stop_reason == END_TURN || self.stop_reason == TOOL_USE
     }
 
     /// What this turn cost, whole: the prompt however it was served — uncached,
@@ -225,7 +311,7 @@ impl ModelOutcome {
     /// This is the line the run's terminal record carries.
     pub fn says(&self, max_output_tokens: u64) -> Option<String> {
         match self.stop_reason.as_str() {
-            END_TURN => None,
+            END_TURN | TOOL_USE => None,
             MAX_TOKENS => Some(format!(
                 "the answer stopped at the output budget of {max_output_tokens} tokens and is \
                  partial",
@@ -467,10 +553,25 @@ impl ModelClient for HttpsModelClient {
         on_event: &mut dyn FnMut(ModelEvent),
     ) -> Result<ModelOutcome, String> {
         let response = self.post("/v1/messages", &request.body(true))?;
-        let mut outcome = ModelOutcome::default();
-        fold_stream(BufReader::new(response), &mut outcome, on_event)?;
-        Ok(outcome)
+        let mut fold = Fold::default();
+        fold_stream(BufReader::new(response), &mut fold, on_event)?;
+        Ok(fold.outcome)
     }
+}
+
+/// The in-flight state of one folded stream: the outcome so far, and the tool
+/// inputs still arriving.
+///
+/// A tool input does NOT arrive whole. It is opened by a `content_block_start`
+/// naming the tool, filled by `input_json_delta` fragments, and closed by a
+/// `content_block_stop` — so the fold has to hold the fragments somewhere until
+/// the block closes. Here, and not on [`ModelOutcome`]: an outcome is what the
+/// turn RESULTED in, and a half-arrived tool input is not a result.
+#[derive(Debug, Default)]
+pub struct Fold {
+    pub outcome: ModelOutcome,
+    /// The open tool blocks: content-block index, tool name, JSON so far.
+    open: Vec<(u64, String, String)>,
 }
 
 /// Fold an SSE body into events and an outcome. Every line that is not a
@@ -478,7 +579,7 @@ impl ModelClient for HttpsModelClient {
 /// skipped: the payload's own `type` is what dispatches.
 pub fn fold_stream(
     body: impl BufRead,
-    outcome: &mut ModelOutcome,
+    fold: &mut Fold,
     on_event: &mut dyn FnMut(ModelEvent),
 ) -> Result<(), String> {
     for line in body.lines() {
@@ -492,7 +593,7 @@ pub fn fold_stream(
         if payload.is_empty() {
             continue;
         }
-        fold_event(payload, outcome, on_event)?;
+        fold_event(payload, fold, on_event)?;
     }
     Ok(())
 }
@@ -501,9 +602,10 @@ pub fn fold_stream(
 /// scripted transcript with no network.
 pub fn fold_event(
     payload: &str,
-    outcome: &mut ModelOutcome,
+    fold: &mut Fold,
     on_event: &mut dyn FnMut(ModelEvent),
 ) -> Result<(), String> {
+    let outcome = &mut fold.outcome;
     let value: serde_json::Value = match serde_json::from_str(payload) {
         Ok(v) => v,
         Err(_) => {
@@ -519,18 +621,59 @@ pub fn fold_event(
             outcome.cache_read_input_tokens = number(usage, "cache_read_input_tokens");
             outcome.cache_creation_input_tokens = number(usage, "cache_creation_input_tokens");
         }
+        "content_block_start" => {
+            // A tool block opens here and is EMPTY: its input arrives as
+            // fragments and is only whole at `content_block_stop`.
+            let block = value.get("content_block");
+            let kind = block
+                .and_then(|b| b.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if kind == "tool_use" {
+                let name = block
+                    .and_then(|b| b.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                fold.open.push((index_of(&value), name, String::new()));
+            }
+        }
         "content_block_delta" => {
             let delta = value.get("delta");
             let kind = delta
                 .and_then(|d| d.get("type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            // `text_delta` only. A `thinking_delta` is reasoning and never
-            // reaches a log record; a `input_json_delta` belongs to a tool this
-            // verb does not declare.
+            // A `thinking_delta` is reasoning and never reaches a log record.
             if kind == "text_delta" {
                 if let Some(text) = delta.and_then(|d| d.get("text")).and_then(|v| v.as_str()) {
                     on_event(ModelEvent::Text(text.to_string()));
+                }
+            }
+            if kind == "input_json_delta" {
+                let fragment = delta
+                    .and_then(|d| d.get("partial_json"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let index = index_of(&value);
+                if let Some(open) = fold.open.iter_mut().find(|(i, _, _)| *i == index) {
+                    open.2.push_str(fragment);
+                }
+            }
+        }
+        "content_block_stop" => {
+            let index = index_of(&value);
+            if let Some(at) = fold.open.iter().position(|(i, _, _)| *i == index) {
+                let (_, name, json) = fold.open.remove(at);
+                if name == DRAFT_TOOL {
+                    // A tool input that is not even JSON travels as the string
+                    // it was, so the supplier can SAY what arrived rather than
+                    // quietly drop it.
+                    let input = match serde_json::from_str::<serde_json::Value>(&json) {
+                        Ok(value) => value,
+                        Err(_) => serde_json::Value::String(json),
+                    };
+                    on_event(ModelEvent::Draft(input));
                 }
             }
         }
@@ -572,6 +715,11 @@ pub fn fold_event(
         _ => {}
     }
     Ok(())
+}
+
+/// A content block's index, which is how a delta finds the block it belongs to.
+fn index_of(value: &serde_json::Value) -> u64 {
+    value.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
 fn number(value: Option<&serde_json::Value>, field: &str) -> u64 {
@@ -647,9 +795,9 @@ pub(crate) mod tests {
             if let Some(e) = self.transport.as_deref() {
                 return Err(e.to_string());
             }
-            let mut outcome = ModelOutcome::default();
-            fold_stream(self.transcript.as_bytes(), &mut outcome, on_event)?;
-            Ok(outcome)
+            let mut fold = Fold::default();
+            fold_stream(self.transcript.as_bytes(), &mut fold, on_event)?;
+            Ok(fold.outcome)
         }
     }
 
@@ -696,6 +844,43 @@ pub(crate) mod tests {
         "\n\n",
     );
 
+    /// A turn that answered in prose and then made an OFFER: the tool block
+    /// opens empty, its input arrives in fragments, and the turn closes on the
+    /// call itself.
+    pub(crate) const DRAFTED: &str = concat!(
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\nevent: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","#,
+        r#""text":"Two are offered."}}"#,
+        "\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","#,
+        r#""id":"toolu_1","name":"propose_draft","input":{}}}"#,
+        "\n\nevent: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","#,
+        r#""partial_json":"{\"alternative\": \"a1\", \"ruling_te"}}"#,
+        "\n\nevent: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","#,
+        r#""partial_json":"xt\": \"2026-09-16, owner: g: keep them.\"}"}}"#,
+        "\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"#,
+        r#""usage":{"output_tokens":90}}"#,
+        "\n\n",
+    );
+
+    /// The tool input was cut off mid-JSON.
+    pub(crate) const DRAFT_TRUNCATED: &str = concat!(
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","#,
+        r#""id":"toolu_1","name":"propose_draft","input":{}}}"#,
+        "\n\nevent: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","#,
+        r#""partial_json":"{\"alternative\": \"a1\""}}"#,
+        "\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    );
+
     /// The stream itself failed.
     pub(crate) const STREAM_ERROR: &str = concat!(
         "event: error\n",
@@ -715,14 +900,26 @@ pub(crate) mod tests {
     }
 
     fn collect(transcript: &str) -> (Vec<String>, ModelOutcome) {
+        let (text, drafts, outcome) = fold(transcript);
+        assert!(drafts.is_empty(), "no draft in this transcript: {drafts:?}");
+        (text, outcome)
+    }
+
+    /// Fold a transcript into its text, its drafts and its outcome.
+    fn fold(transcript: &str) -> (Vec<String>, Vec<serde_json::Value>, ModelOutcome) {
         let mut text: Vec<String> = Vec::new();
-        let mut outcome = ModelOutcome::default();
-        fold_stream(transcript.as_bytes(), &mut outcome, &mut |event| {
-            let ModelEvent::Text(chunk) = event;
-            text.push(chunk);
+        let mut drafts: Vec<serde_json::Value> = Vec::new();
+        let mut fold = Fold::default();
+        fold_stream(transcript.as_bytes(), &mut fold, &mut |event| match event {
+            ModelEvent::Text(chunk) => {
+                text.push(chunk);
+            }
+            ModelEvent::Draft(input) => {
+                drafts.push(input);
+            }
         })
         .expect("the transcript folded");
-        (text, outcome)
+        (text, drafts, fold.outcome)
     }
 
     #[test]
@@ -905,9 +1102,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_draft_tool_is_declared_on_every_request_and_sits_in_the_cached_prefix() {
+        let body = request().body(true);
+        let tools = body["tools"].as_array().expect("one tool");
+        assert_eq!(tools.len(), 1, "one tool, and only one");
+        assert_eq!(tools[0]["name"], DRAFT_TOOL);
+        assert_eq!(
+            tools[0]["strict"], true,
+            "strict is what guarantees the input validates"
+        );
+        assert_eq!(tools[0]["input_schema"]["additionalProperties"], false);
+        assert_eq!(
+            tools[0]["input_schema"]["required"],
+            serde_json::json!(["alternative", "ruling_text", "sources"])
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "auto: an agent that must always propose is an agent that rules"
+        );
+        assert!(
+            tools[0].get("eager_input_streaming").is_none(),
+            "a draft is small and arrives whole or not at all"
+        );
+        assert!(
+            body.get("output_config").is_none(),
+            "the response is PROSE with an offer beside it, not one JSON document"
+        );
+
+        // Tools render before the system block, so they are part of what the
+        // system breakpoint caches — and part of what must not move.
+        let prefix = request().cached_prefix();
+        assert_eq!(prefix["tools"], body["tools"]);
+        assert_eq!(request().count_body()["tools"], body["tools"]);
+    }
+
+    #[test]
+    fn a_drafted_turn_folds_its_tool_call_into_a_draft_and_ends_clean() {
+        let (text, drafts, outcome) = fold(DRAFTED);
+        assert_eq!(text, vec!["Two are offered."], "the prose still arrives");
+        assert_eq!(drafts.len(), 1, "{drafts:?}");
+        assert_eq!(drafts[0]["alternative"], "a1", "the fragments rejoin");
+        assert_eq!(drafts[0]["ruling_text"], "2026-09-16, owner: g: keep them.");
+
+        // A turn that ends by making the offer it was asked for is a turn that
+        // ended: this verb answers no tool call and has no loop to continue.
+        assert_eq!(outcome.stop_reason, TOOL_USE);
+        assert!(outcome.complete() && outcome.exit() == 0);
+        assert_eq!(outcome.says(DEFAULT_MAX_OUTPUT_TOKENS), None);
+
+        // A truncated input travels as the string it was, so the supplier can
+        // SAY what arrived rather than quietly drop it.
+        let (_, drafts, _) = fold(DRAFT_TRUNCATED);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].as_str(),
+            Some("{\"alternative\": \"a1\""),
+            "{drafts:?}"
+        );
+    }
+
+    #[test]
     fn a_stream_error_and_a_silent_end_are_both_said() {
-        let mut outcome = ModelOutcome::default();
-        let e = fold_stream(STREAM_ERROR.as_bytes(), &mut outcome, &mut |_| {}).unwrap_err();
+        let mut fold = Fold::default();
+        let e = fold_stream(STREAM_ERROR.as_bytes(), &mut fold, &mut |_| {}).unwrap_err();
         assert!(
             e.contains("overloaded_error") && e.contains("Overloaded"),
             "{e}"

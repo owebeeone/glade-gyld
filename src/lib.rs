@@ -29,7 +29,8 @@
 //! * [`prompt`] — the stance, the emitted context and the passages, composed
 //!   into the one stable prefix a turn is cached on (section 7).
 //! * [`model`] — the [`model::ModelClient`] trait and its raw-HTTPS
-//!   implementation: key discovery, the budgets, the streamed SSE (section 7).
+//!   implementation: key discovery, the budgets, the streamed SSE, and the one
+//!   tool a draft comes back in (sections 7 and 8).
 //! * [`bundle`] — the bundle-root layout, the staging repository, containment,
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
@@ -52,20 +53,22 @@ pub mod sources;
 pub mod supplier;
 pub mod verbs;
 
-pub use ask::{AgentState, AskContext, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE};
+pub use ask::{
+    AgentState, AskContext, AskDraft, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE,
+};
 pub use bundle::{FilePointer, Layout};
 pub use conversation::{Ledger, Turn};
 pub use envelope::{
     GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, ASK_ANSWER, ASK_CITATION,
-    ASK_END, ASK_QUESTION,
+    ASK_DRAFT, ASK_END, ASK_QUESTION,
 };
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
 pub use model::{
-    Declined, ModelClient, ModelConfig, ModelEvent, ModelOutcome, ModelRequest,
+    draft_tool, Declined, Fold, ModelClient, ModelConfig, ModelEvent, ModelOutcome, ModelRequest,
     DEFAULT_AGENT_MODEL, DEFAULT_MAX_CONVERSATION_TOKENS, DEFAULT_MAX_INPUT_TOKENS,
-    DEFAULT_MAX_OUTPUT_TOKENS, END_TURN, MAX_TOKENS, REFUSAL,
+    DEFAULT_MAX_OUTPUT_TOKENS, DRAFT_TOOL, END_TURN, MAX_TOKENS, REFUSAL, TOOL_USE,
 };
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};

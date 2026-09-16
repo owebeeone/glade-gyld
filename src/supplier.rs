@@ -32,7 +32,7 @@ use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
 use glade_client::GladeClient;
 use glade_wire::generated::ExchangeReq;
 
-use crate::ask::{self, AgentState, Consultation};
+use crate::ask::{self, AgentState, AskDraft, Consultation};
 use crate::bundle::{self, Layout};
 use crate::conversation::{self, Ledger};
 use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse};
@@ -711,6 +711,7 @@ async fn consult_run(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Reply>();
     let model_config = config.model_config();
+    let drafted_by = model_config.model.clone();
     let spent = ledger.spent(&conversation);
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
@@ -728,20 +729,45 @@ async fn consult_run(
                 turns: prior,
             };
             model::consult(model.as_ref(), &request, spent, &mut |event| {
-                let ModelEvent::Text(chunk) = event;
-                let _ = tx.send(Reply::Answer(chunk));
+                let reply = match event {
+                    ModelEvent::Text(chunk) => Reply::Answer(chunk),
+                    // The draft is READ here, against the envelope this
+                    // consultation resolved, so an alternative the envelope
+                    // does not offer is marked unresolved rather than bent onto
+                    // one it does.
+                    ModelEvent::Draft(input) => {
+                        Reply::Draft(AskDraft::parse(&input, &consult.context, &drafted_by))
+                    }
+                };
+                let _ = tx.send(reply);
             })
             .map_err(|refusal| refusal.says())
         });
 
+    // A draft that did not decode is not a draft: nothing is offered, and the
+    // turn's close is where that is said.
+    let mut malformed: Option<String> = None;
     while let Some(reply) = rx.recv().await {
-        seq += 1;
         let record = match reply {
             Reply::Citation(source) => {
-                GyldAskRecord::citation(&run_id, seq, &who, &conversation, source)
+                GyldAskRecord::citation(&run_id, seq + 1, &who, &conversation, source)
             }
-            Reply::Answer(chunk) => GyldAskRecord::answer(&run_id, seq, &who, &conversation, chunk),
+            Reply::Answer(chunk) => {
+                GyldAskRecord::answer(&run_id, seq + 1, &who, &conversation, chunk)
+            }
+            Reply::Draft(Ok(draft)) => GyldAskRecord::draft(
+                &run_id,
+                seq + 1,
+                &who,
+                &conversation,
+                serde_json::to_value(&draft).unwrap_or_default(),
+            ),
+            Reply::Draft(Err(reason)) => {
+                malformed = Some(reason);
+                continue;
+            }
         };
+        seq += 1;
         append_ask(&client, &config, &conversation, &record).await;
     }
 
@@ -756,6 +782,18 @@ async fn consult_run(
         Ok(Err(refused)) => (1, Some(refused)),
         Err(e) => (-1, Some(format!("the consultation task failed: {e}"))),
     };
+    // The prose still stands; the offer the reader asked for did not arrive, so
+    // the turn did not end clean.
+    let (exit, said) = match malformed {
+        Some(reason) => {
+            let exit = if exit == 0 { 1 } else { exit };
+            match said {
+                Some(already) => (exit, Some(format!("{already}; {reason}"))),
+                None => (exit, Some(reason)),
+            }
+        }
+        None => (exit, said),
+    };
     seq += 1;
     let end = GyldAskRecord::end(&run_id, seq, &who, &conversation, exit, said);
     append_ask(&client, &config, &conversation, &end).await;
@@ -765,6 +803,8 @@ async fn consult_run(
 enum Reply {
     Citation(serde_json::Value),
     Answer(String),
+    /// A draft, read against the envelope — or the reason it was not a draft.
+    Draft(Result<AskDraft, String>),
 }
 
 /// Append one reply record to the ask surface, keyed by CONVERSATION.

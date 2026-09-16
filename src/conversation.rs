@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::envelope::{GyldAskRecord, ASK_ANSWER, ASK_END, ASK_QUESTION};
+use crate::envelope::{GyldAskRecord, ASK_ANSWER, ASK_DRAFT, ASK_END, ASK_QUESTION};
 
 /// One turn of this conversation as its own records tell it: what was asked,
 /// what came back, and how it closed when the close said anything.
@@ -39,6 +39,9 @@ pub struct Turn {
     /// What this turn's `end` record said, when it said anything: a partial
     /// answer, a decline, a refusal, a transport failure.
     pub closed: Option<String>,
+    /// The offer this turn made, when it made one: the alternative it named and
+    /// the ruling it drafted, in one line.
+    pub drafted: Option<String>,
 }
 
 impl Turn {
@@ -51,12 +54,19 @@ impl Turn {
     /// empty assistant turn, which is not a message the API accepts.
     pub fn assistant(&self) -> String {
         let answer = self.answer.trim();
-        match (answer.is_empty(), self.closed.as_deref()) {
-            (true, Some(said)) => format!("[this turn produced no answer: {said}]"),
+        let mut said = match (answer.is_empty(), self.closed.as_deref()) {
+            (true, Some(closed)) => format!("[this turn produced no answer: {closed}]"),
             (true, None) => "[this turn produced no answer]".to_string(),
-            (false, Some(said)) => format!("{answer}\n\n[this turn ended: {said}]"),
+            (false, Some(closed)) => format!("{answer}\n\n[this turn ended: {closed}]"),
             (false, None) => answer.to_string(),
+        };
+        // The offer is part of the turn that made it. Replaying the prose alone
+        // would have the model reading a transcript in which it never proposed
+        // anything, and proposing the same thing again into the same window.
+        if let Some(drafted) = self.drafted.as_deref() {
+            said.push_str(&format!("\n\n[this turn drafted: {drafted}]"));
         }
+        said
     }
 }
 
@@ -100,6 +110,9 @@ pub fn turns(records: &[Vec<u8>]) -> Vec<Turn> {
             ASK_ANSWER => {
                 turn.answer.push_str(record.line.as_deref().unwrap_or(""));
             }
+            ASK_DRAFT => {
+                turn.drafted = record.record.as_ref().map(drafted);
+            }
             ASK_END => {
                 turn.closed = record.line;
             }
@@ -113,6 +126,33 @@ pub fn turns(records: &[Vec<u8>]) -> Vec<Turn> {
         .filter_map(|run_id| held.remove(run_id))
         .filter(|turn| !turn.question.trim().is_empty())
         .collect()
+}
+
+/// One draft record, in the one line a replayed turn carries it as. The
+/// ALTERNATIVE is whatever the model named — the record never corrects it — and
+/// an unresolved one says it was unresolved rather than passing as an offer the
+/// envelope stands behind.
+fn drafted(record: &serde_json::Value) -> String {
+    let named = record
+        .get("alternative")
+        .and_then(|v| v.as_str())
+        .unwrap_or("an alternative it did not name");
+    let ruling = record
+        .get("ruling_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let resolved = record
+        .get("resolved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    format!(
+        "{named}{} — {ruling}",
+        if resolved {
+            ""
+        } else {
+            " (which this record does not offer)"
+        }
+    )
 }
 
 /// The `messages` array one turn is sent with: the prior turns in order, then
@@ -195,6 +235,17 @@ pub(crate) mod tests {
         chunks: &[&str],
         closed: Option<&str>,
     ) -> Vec<Vec<u8>> {
+        drafting(run_id, question, chunks, closed, None)
+    }
+
+    /// The same, with the `draft` record a turn that made an offer appends.
+    pub(crate) fn drafting(
+        run_id: &str,
+        question: &str,
+        chunks: &[&str],
+        closed: Option<&str>,
+        draft: Option<serde_json::Value>,
+    ) -> Vec<Vec<u8>> {
         let who = Some("gianni".to_string());
         let conversation = "conv-tab1-key_custody-1789";
         let mut out =
@@ -224,10 +275,16 @@ pub(crate) mod tests {
                 .to_bytes(),
             );
         }
+        if let Some(draft) = draft {
+            out.push(
+                GyldAskRecord::draft(run_id, 3 + chunks.len() as u64, &who, conversation, draft)
+                    .to_bytes(),
+            );
+        }
         out.push(
             GyldAskRecord::end(
                 run_id,
-                3 + chunks.len() as u64,
+                4 + chunks.len() as u64,
                 &who,
                 conversation,
                 if closed.is_some() { 1 } else { 0 },
@@ -349,6 +406,53 @@ pub(crate) mod tests {
         assert_eq!(
             messages[3]["content"][0]["cache_control"]["type"],
             "ephemeral"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_made_an_offer_is_replayed_with_it() {
+        let records = drafting(
+            "run-1",
+            "what should we do?",
+            &["Two are offered."],
+            None,
+            Some(serde_json::json!({
+                "slot": "glade_decisions:GladeDecisions.key_custody",
+                "alternative": "a1",
+                "alternative_slot": "a1",
+                "ruling_text": "2026-09-16, owner: gianni: keys stay on device.",
+                "resolved": true
+            })),
+        );
+        let folded = turns(&records);
+        let said = folded[0].assistant();
+        assert!(said.starts_with("Two are offered."), "{said}");
+        assert!(
+            said.contains("[this turn drafted: a1 — 2026-09-16, owner:"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("does not offer"),
+            "a resolved draft is not flagged: {said}"
+        );
+
+        // An unresolved offer is replayed AS unresolved, never as one the
+        // record stands behind.
+        let records = drafting(
+            "run-2",
+            "what about hsm?",
+            &["Not offered."],
+            None,
+            Some(serde_json::json!({
+                "alternative": "hsm",
+                "ruling_text": "2026-09-16, owner: gianni: use an HSM.",
+                "resolved": false
+            })),
+        );
+        let said = turns(&records)[0].assistant();
+        assert!(
+            said.contains("hsm (which this record does not offer)"),
+            "{said}"
         );
     }
 

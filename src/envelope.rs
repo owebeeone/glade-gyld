@@ -244,11 +244,11 @@ pub struct GyldAskRecord {
     pub principal: Option<String>,
     /// The conversation this turn belongs to, and the surface's key.
     pub conversation: String,
-    /// `"question" | "answer" | "citation" | "end"`.
+    /// `"question" | "answer" | "citation" | "draft" | "end"`.
     pub stream: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub line: Option<String>,
-    /// A `citation`'s resolved source, as the index emitted it.
+    /// A `citation`'s resolved source, or a `draft`'s offer.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub record: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -268,6 +268,9 @@ pub struct GyldAskRecord {
 pub const ASK_QUESTION: &str = "question";
 pub const ASK_ANSWER: &str = "answer";
 pub const ASK_CITATION: &str = "citation";
+/// The offer a turn made (section 8). Its `record` is a
+/// [`crate::ask::AskDraft`], `drafted_by` and all.
+pub const ASK_DRAFT: &str = "draft";
 pub const ASK_END: &str = "end";
 
 impl GyldAskRecord {
@@ -330,6 +333,23 @@ impl GyldAskRecord {
         GyldAskRecord {
             record: Some(source),
             ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_CITATION)
+        }
+    }
+
+    /// The draft this turn proposed: an OFFER, carrying the model id that made
+    /// it, so it can never be mistaken for a person's text. It is not a ruling
+    /// and nothing here makes it one — a human takes it, edits it or discards
+    /// it, and the decide window's own refusals are untouched.
+    pub fn draft(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        draft: serde_json::Value,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            record: Some(draft),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_DRAFT)
         }
     }
 

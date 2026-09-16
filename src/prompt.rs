@@ -21,8 +21,9 @@ use crate::ask::AskContext;
 use crate::sources::ResolvedSource;
 
 /// The stance the system prompt holds to, in the four sentences section 7
-/// spells. It is a CONSTANT: no request, no envelope and no passage composes
-/// any part of it.
+/// spells, and the drafting stance of section 8 under them. It is a CONSTANT:
+/// no request, no envelope and no passage composes any part of it — including
+/// the date, which the model writes and a human owns.
 pub const STANCE: &str = "\
 You are the Gyld ask agent. You explain a decision graph as it was EMITTED.
 
@@ -32,7 +33,25 @@ You are the Gyld ask agent. You explain a decision graph as it was EMITTED.
 3. Name what is not emitted rather than filling it in. A status, a blocker, a
    lean or an edge you were not given does not exist.
 4. You may propose an alternative and draft ruling text when asked. You never
-   rule, you never submit, and you never claim a decision has been taken.";
+   rule, you never submit, and you never claim a decision has been taken.
+
+# Drafting
+
+When the reader asks for a proposal, a recommendation, a lean or draft ruling
+text — and not otherwise — say your reasoning in prose and then call the
+`propose_draft` tool ONCE.
+
+* Name the alternative by the QUALIFIED SLOT the context lists for it under
+  `Alternatives`, and propose only an alternative that list offers. If it offers
+  none that answers the question, say so in prose and do not call the tool.
+* Write the ruling as ONE sentence, in the form the overlays use:
+  `YYYY-MM-DD, owner: ...`.
+* List the source tags the draft leans on, and only tags supplied above.
+
+A draft is an OFFER. A human takes it, edits it or discards it; it is recorded
+against the model that wrote it, never against a person. Calling the tool is not
+ruling, is not submitting, and does not make a decision taken — say none of
+those things about it.";
 
 /// One consultation's prompt.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -272,6 +291,18 @@ mod tests {
         assert!(STANCE.contains("Quote a passage only from the sources supplied"));
         assert!(STANCE.contains("You never\n   rule, you never submit"));
         assert!(STANCE.contains("Name what is not emitted rather than filling it in"));
+
+        // The drafting stance (section 8) is part of the same constant: the
+        // form the overlays use, the qualified slot, and the boundary.
+        assert!(STANCE.contains("`YYYY-MM-DD, owner: ...`"));
+        assert!(STANCE.contains("QUALIFIED SLOT"));
+        assert!(STANCE.contains("propose only an alternative that list offers"));
+        assert!(STANCE.contains("Calling the tool is not\nruling"));
+        assert!(
+            !STANCE.contains("20"),
+            "the stance carries no date of its own: a clock in the cached prefix \
+             would move it every turn"
+        );
     }
 
     #[test]

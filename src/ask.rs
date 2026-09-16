@@ -251,6 +251,146 @@ impl AskContext {
     }
 }
 
+/// The draft one turn proposed (GyldAskAgent.md section 8).
+///
+/// `drafted_by` is the MODEL ID, so a draft can never be mistaken for a
+/// person's text — in the window or in the log. Nothing here is a ruling: it is
+/// an offer a human takes, edits or discards, and the decide window's own shape
+/// checks and refusals are untouched by it.
+///
+/// **A draft naming an alternative the envelope does not offer is emitted as
+/// UNRESOLVED with the name it gave, not corrected.** [`AskDraft::alternative`]
+/// is always the model's own string, verbatim; [`AskDraft::alternative_slot`]
+/// is the envelope's qualified slot and is present only when the envelope
+/// actually offers it. Quietly bending a foreign name onto the nearest
+/// alternative would be the supplier inventing a proposal nobody made.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AskDraft {
+    /// The record this draft is for — the ENVELOPE's own slot, never a name
+    /// the model chose.
+    pub slot: String,
+    /// The alternative the model named, verbatim and never corrected.
+    pub alternative: String,
+    /// The envelope's own qualified slot for that alternative, when it offers
+    /// one. Absent on an unresolved draft.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub alternative_slot: Option<String>,
+    /// The one-sentence ruling, in the form the overlays use.
+    pub ruling_text: String,
+    /// The source tags this draft leans on, as the model named them.
+    pub sources: Vec<String>,
+    /// The model id that drafted it.
+    pub drafted_by: String,
+    /// The envelope offers this alternative.
+    pub resolved: bool,
+    /// Why it does not, when it does not.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+}
+
+impl AskDraft {
+    /// Read one draft out of the structured form the model returned it in, and
+    /// resolve the alternative it names against the envelope.
+    ///
+    /// A draft that does not decode is NOT a draft: an `Err` here means nothing
+    /// is offered and the turn's close says why. Half a draft — a slot with no
+    /// ruling text, a ruling with no slot — would become a `Take this draft`
+    /// button over nothing.
+    pub fn parse(
+        input: &serde_json::Value,
+        context: &AskContext,
+        model: &str,
+    ) -> Result<AskDraft, String> {
+        let object = input.as_object().ok_or_else(|| {
+            format!(
+                "the model's draft did not decode as an object: {}",
+                one_line(&input.to_string())
+            )
+        })?;
+        let alternative = text(object.get("alternative"));
+        if alternative.is_empty() {
+            return Err("the model's draft names no `alternative`".into());
+        }
+        let ruling_text = text(object.get("ruling_text"));
+        if ruling_text.is_empty() {
+            return Err(format!(
+                "the model's draft for {alternative:?} carries no `ruling_text`"
+            ));
+        }
+        let sources = match object.get("sources") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(tags)) => tags
+                .iter()
+                .filter_map(|t| t.as_str())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            Some(other) => {
+                return Err(format!(
+                    "the model's draft carries `sources` that are not a list: {}",
+                    one_line(&other.to_string())
+                ));
+            }
+        };
+
+        // The envelope's own slot, when the envelope offers this alternative at
+        // all. Matched on the qualified slot the context lists, and on the
+        // label beside it — the two names the envelope itself gave it.
+        let offered = context
+            .alternatives
+            .iter()
+            .find(|offer| offer.slot.trim() == alternative || offer.label.trim() == alternative);
+        let (alternative_slot, resolved, reason) = match offered {
+            Some(offer) => (Some(offer.slot.clone()), true, None),
+            None if context.alternatives.is_empty() => (
+                None,
+                false,
+                Some("this record emits no alternatives at all, so nothing offers this one".into()),
+            ),
+            None => (
+                None,
+                false,
+                Some(format!(
+                    "this record offers {:?}, and not this one",
+                    context
+                        .alternatives
+                        .iter()
+                        .map(|offer| offer.slot.clone())
+                        .collect::<Vec<_>>()
+                )),
+            ),
+        };
+        Ok(AskDraft {
+            slot: context.record.slot.clone(),
+            alternative,
+            alternative_slot,
+            ruling_text,
+            sources,
+            drafted_by: model.to_string(),
+            resolved,
+            reason,
+        })
+    }
+}
+
+/// One trimmed string field of a draft, or empty when it is absent or is not
+/// a string at all.
+fn text(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// A value on ONE line and bounded, for a refusal that has to name it.
+fn one_line(said: &str) -> String {
+    said.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect()
+}
+
 /// A conversation id, as section 6 mints it: `conv-<tabId>-<slot>-<stamp>`.
 ///
 /// It becomes a LOG KEY, so it is checked the way a stream id is: bounded, and
@@ -617,6 +757,118 @@ pub(crate) mod tests {
         let e = Consultation::resolve(bundle, Some(&envelope()), &elsewhere).unwrap_err();
         assert!(e.says().contains("\"base\""), "{e}");
         assert!(e.says().contains("stream-a"), "{e}");
+    }
+
+    #[test]
+    fn a_well_formed_draft_carries_the_model_the_slot_and_the_qualified_alternative() {
+        let context = AskContext::parse(Some(&envelope())).unwrap();
+        let draft = AskDraft::parse(
+            &serde_json::json!({
+                "alternative": "a1",
+                "ruling_text": "2026-09-16, owner: gianni: keys stay on the device.",
+                "sources": ["Q11", " ", "AZ-7"]
+            }),
+            &context,
+            "claude-opus-5",
+        )
+        .expect("a draft");
+        assert_eq!(draft.slot, "glade_decisions:GladeDecisions.key_custody");
+        assert_eq!(draft.alternative, "a1");
+        assert_eq!(draft.alternative_slot.as_deref(), Some("a1"));
+        assert!(draft.resolved && draft.reason.is_none());
+        assert_eq!(
+            draft.ruling_text,
+            "2026-09-16, owner: gianni: keys stay on the device."
+        );
+        assert_eq!(draft.sources, vec!["Q11", "AZ-7"], "blanks are not tags");
+        assert_eq!(
+            draft.drafted_by, "claude-opus-5",
+            "a draft can never be mistaken for a person's text"
+        );
+
+        // The label the envelope gave it names the same alternative, and the
+        // record still carries the envelope's own qualified slot.
+        let by_label = AskDraft::parse(
+            &serde_json::json!({"alternative": "device", "ruling_text": "2026-09-16, owner: g: yes."}),
+            &context,
+            "claude-opus-5",
+        )
+        .expect("a draft");
+        assert_eq!(by_label.alternative, "device", "verbatim, always");
+        assert_eq!(by_label.alternative_slot.as_deref(), Some("a1"));
+        assert!(by_label.resolved);
+        assert!(
+            by_label.sources.is_empty(),
+            "leaning on nothing is a list of nothing"
+        );
+    }
+
+    #[test]
+    fn a_draft_naming_an_alternative_the_envelope_does_not_offer_is_unresolved_not_corrected() {
+        let context = AskContext::parse(Some(&envelope())).unwrap();
+        let draft = AskDraft::parse(
+            &serde_json::json!({
+                "alternative": "hsm",
+                "ruling_text": "2026-09-16, owner: gianni: put them in an HSM.",
+                "sources": ["Q11"]
+            }),
+            &context,
+            "claude-opus-5",
+        )
+        .expect("a draft, and an unresolved one");
+        assert_eq!(draft.alternative, "hsm", "the name it GAVE, uncorrected");
+        assert_eq!(draft.alternative_slot, None);
+        assert!(!draft.resolved);
+        let reason = draft.reason.clone().unwrap_or_default();
+        assert!(reason.contains("\"a1\""), "{reason}");
+        assert!(reason.contains("not this one"), "{reason}");
+
+        // A record that offers nothing at all says THAT, which is a different
+        // fact from offering others.
+        let mut bare = context.clone();
+        bare.alternatives.clear();
+        let draft = AskDraft::parse(
+            &serde_json::json!({"alternative": "hsm", "ruling_text": "2026-09-16, owner: g: yes."}),
+            &bare,
+            "claude-opus-5",
+        )
+        .unwrap();
+        assert!(!draft.resolved);
+        assert!(draft
+            .reason
+            .unwrap_or_default()
+            .contains("emits no alternatives at all"));
+    }
+
+    #[test]
+    fn a_malformed_draft_is_not_a_draft_and_says_what_was_wrong() {
+        let context = AskContext::parse(Some(&envelope())).unwrap();
+        let bad = |input: serde_json::Value| -> String {
+            AskDraft::parse(&input, &context, "claude-opus-5").expect_err("not a draft")
+        };
+
+        // Not even JSON: the fold hands the raw string over rather than drop it.
+        let e = bad(serde_json::json!("{\"alternative\": \"a1\", trunc"));
+        assert!(e.contains("did not decode as an object"), "{e}");
+        assert!(e.contains("trunc"), "it says what arrived: {e}");
+
+        let e = bad(serde_json::json!({"ruling_text": "2026-09-16, owner: g: yes."}));
+        assert!(e.contains("names no `alternative`"), "{e}");
+
+        let e = bad(serde_json::json!({"alternative": "a1", "ruling_text": "  "}));
+        assert!(e.contains("carries no `ruling_text`"), "{e}");
+        assert!(e.contains("\"a1\""), "{e}");
+
+        let e = bad(serde_json::json!({
+            "alternative": "a1", "ruling_text": "2026-09-16, owner: g: yes.",
+            "sources": "Q11"
+        }));
+        assert!(e.contains("`sources` that are not a list"), "{e}");
+
+        // A control character in a malformed input never breaks the line it is
+        // reported on.
+        let e = bad(serde_json::json!("a\nb"));
+        assert!(!e.contains('\n'), "{e:?}");
     }
 
     #[test]

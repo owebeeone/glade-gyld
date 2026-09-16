@@ -472,6 +472,7 @@ mount in the UI converges without a second round trip:
 | `gyld.decisions` | stream id | that stream's `decide-now.json` |
 | `gyld.lens` | `<stream>/<perspective>` | a `{path, digest, bytes}` pointer |
 | `gyld.file` | `<stream>/<file>` | a `{path, digest, bytes}` pointer |
+| `gyld.file` | `_bundle/<file>` | a `{path, digest, bytes}` pointer |
 
 The stream listing is the authority for which streams exist: a stream the bundle
 does not list is not published, even if a directory for it is lying around.
@@ -495,6 +496,15 @@ root could not read a single record: the only way in was to add the build
 directory as a static root by hand and re-point it after every build. A stream
 that has neither file publishes neither — that is data, not a fault, as with
 `decide-now.json`.
+
+The same surface carries the bundle's OWN documents under the reserved key
+`_bundle`, which no stream id can take. Today that is `sources.json`, the source
+index emitted once per build beside `streams.json` and keyed `_bundle/sources.json`.
+It belongs to the build and not to any one stream, so there is no stream id to
+key it by; without it a glade root told every Ask window that the build emitted
+no source index, which was never true of the build — only of the share. A build
+made with no `--sources-root` emits no index and publishes none: data, not a
+fault.
 
 Publication happens off the exchange's own thread — the answer already carried
 the build directory — and a publication failure is logged, never fatal: a build

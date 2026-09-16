@@ -9,6 +9,7 @@
 //! | `gyld.decisions` | stream id | that stream's `decide-now.json` |
 //! | `gyld.lens` | `<stream>/<perspective>` | a `{path, digest, bytes}` POINTER |
 //! | `gyld.file` | `<stream>/<file>` | a `{path, digest, bytes}` POINTER |
+//! | `gyld.file` | `_bundle/<file>` | a `{path, digest, bytes}` POINTER |
 //!
 //! Lens files are the large ones, so they travel as pointer plus digest and are
 //! fetched over HTTP from grazel's static path (owner ruling O5): grazel serves
@@ -19,6 +20,12 @@
 //! the records cannot be read at all: `projection.json` is the record set every
 //! Gyld record window renders, and before it was published a glade root could
 //! only reach it by having the build directory added as a static root by hand.
+//!
+//! [`BUNDLE_FILES`] are the bundle's OWN documents, published on the same
+//! surface under [`BUNDLE_KEY`] because they belong to the build and not to any
+//! one stream. `sources.json` is the source index the Ask window grounds every
+//! tag against; unpublished, a glade root could only report that the build
+//! emitted none, which was never true of the build — only of the share.
 //!
 //! [`publications`] is the whole decision and it is a pure function of the
 //! emitted directory: it reads the bundle and returns the ops to append. A
@@ -58,6 +65,23 @@ pub const DEFAULT_STATIC_BASE: &str = "/gyld";
 /// in the order they are published. They are the ones a consumer needs whole
 /// and unsummarised: the record set, and the validation report over it.
 pub const STREAM_FILES: [&str; 2] = ["projection.json", "validation.json"];
+
+/// The key a BUNDLE-level file is published under on the `gyld.file` surface,
+/// in place of the stream id a per-stream file carries.
+///
+/// It shares one key space with `<stream>/<file>`, so it must be a name no
+/// stream can have. Emitted stream ids are Python identifiers or dashed slugs
+/// (`base`, `stream-a`, `keys-2026-09-13`); a leading underscore is outside
+/// that shape, and the consumer routes on this exact literal rather than
+/// guessing which half of a key it is holding.
+pub const BUNDLE_KEY: &str = "_bundle";
+
+/// The bundle-root documents published as pointers on the `gyld.file` surface,
+/// keyed `_bundle/<file>`, in the order they are published.
+///
+/// `sources.json` is emitted once per BUILD, beside `streams.json`, so there is
+/// no stream to key it by.
+pub const BUNDLE_FILES: [&str; 1] = ["sources.json"];
 
 impl Default for Surfaces {
     fn default() -> Surfaces {
@@ -116,6 +140,23 @@ pub fn publications(layout: &Layout, output_dir: &Path, surfaces: &Surfaces) -> 
         key: None,
         payload: bytes,
     });
+
+    for file in BUNDLE_FILES {
+        let path = output_dir.join(file);
+        if !path.is_file() {
+            // A build emitted with no `--sources-root` carries no source index;
+            // that is data, not a fault, exactly as with `decide-now.json`.
+            continue;
+        }
+        push_pointer(
+            &mut plan,
+            layout,
+            surfaces,
+            &surfaces.file_id,
+            format!("{BUNDLE_KEY}/{file}"),
+            &path,
+        );
+    }
 
     for id in ids {
         let dir = output_dir.join("streams").join(&id);
@@ -367,6 +408,49 @@ mod tests {
         assert_eq!(
             pointer.path, "/gyld/builds/build-1/streams/base/projection.json",
             "a pointer, not the records: fetched over the static path and checked"
+        );
+        assert_eq!(pointer.bytes, 3);
+        assert_eq!(
+            pointer.digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(layout.bundle_root);
+    }
+
+    #[test]
+    fn the_source_index_travels_as_a_bundle_level_pointer() {
+        let (layout, out) = bundle("sources");
+
+        // A build emitted without a sources root has no index, and that is
+        // data: nothing is published for it and nothing is noted.
+        let plan = publications(&layout, &out, &Surfaces::default());
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+        assert!(
+            !plan
+                .publications
+                .iter()
+                .any(|p| p.key.as_deref() == Some("_bundle/sources.json")),
+            "an absent source index publishes nothing"
+        );
+
+        std::fs::write(out.join("sources.json"), b"abc").unwrap();
+        let plan = publications(&layout, &out, &Surfaces::default());
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+
+        let index = plan
+            .publications
+            .iter()
+            .find(|p| p.key.as_deref() == Some("_bundle/sources.json"))
+            .expect("a source index publication");
+        assert_eq!(
+            index.glade_id, "gyld.file",
+            "the same surface the per-stream files travel on, under a key no \
+             stream id can take"
+        );
+        let pointer: crate::bundle::FilePointer = serde_json::from_slice(&index.payload).unwrap();
+        assert_eq!(
+            pointer.path, "/gyld/builds/build-1/sources.json",
+            "a pointer at the bundle ROOT: one index per build, not per stream"
         );
         assert_eq!(pointer.bytes, 3);
         assert_eq!(

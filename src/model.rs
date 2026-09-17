@@ -30,6 +30,7 @@ use crate::agent::Compat;
 use crate::ask::{AskRefusal, KEY_ENV};
 use crate::conversation::{self, Turn};
 use crate::prompt::Prompt;
+use crate::tools::{ToolPolicy, ToolRegistry};
 
 /// The model `--agent-model` defaults to. Taken from the `claude-api` skill's
 /// model table rather than from memory: `claude-opus-5`, 1M context, $5.00 per
@@ -138,6 +139,9 @@ pub struct ModelConfig {
     /// What the FIRST request of a call carries. The client degrades from here
     /// on what the endpoint actually rejects.
     pub shape: Shape,
+    /// Which tools this desk lets the agent reach for, and what one turn's tool
+    /// use may cost (GyldAskAgent.md section 11.2, 11.3).
+    pub tools: ToolPolicy,
 }
 
 impl Default for ModelConfig {
@@ -153,6 +157,7 @@ impl Default for ModelConfig {
             key_file: PathBuf::new(),
             count_tokens: true,
             shape: Shape::full(),
+            tools: ToolPolicy::default(),
         }
     }
 }
@@ -247,6 +252,24 @@ pub struct ModelRequest {
     /// The conversation so far, oldest first. Empty on a conversation's first
     /// turn (GyldAskAgent.md section 6).
     pub turns: Vec<Turn>,
+    /// Every tool this request DECLARES, in the one order the registry ever
+    /// produces (`ToolRegistry::declarations`): sorted by name, with
+    /// `propose_draft` among them.
+    ///
+    /// Empty means the tool set this verb has always had — the draft tool
+    /// alone. That is not a default hiding a setting: a supplier with no tools
+    /// enabled makes exactly the request it made before section 11 existed.
+    pub tools: Vec<serde_json::Value>,
+    /// What THIS turn has already exchanged with the model: the assistant turn
+    /// that asked for a tool, verbatim, and the user turn that answered it
+    /// (11.1). Empty on a turn's first step, and grown by the loop.
+    ///
+    /// Held apart from `turns` because the two are different things. A prior
+    /// TURN is replayed from the log, as the log tells it; these are this
+    /// turn's own messages, as the API produced them, and they are replayed
+    /// byte for byte because the API rejects a thinking block that was edited
+    /// and 400s a `tool_use` nobody answered.
+    pub steps: Vec<serde_json::Value>,
 }
 
 impl ModelRequest {
@@ -315,12 +338,22 @@ impl ModelRequest {
     }
 
     fn shared_shaped(&self, shape: Shape) -> serde_json::Value {
-        let mut tool = draft_tool();
-        if !shape.strict {
-            if let Some(fields) = tool.as_object_mut() {
-                fields.remove("strict");
-            }
-        }
+        let declared = if self.tools.is_empty() {
+            vec![draft_tool()]
+        } else {
+            self.tools.clone()
+        };
+        let tools: Vec<serde_json::Value> = declared
+            .into_iter()
+            .map(|mut tool| {
+                if !shape.strict {
+                    if let Some(fields) = tool.as_object_mut() {
+                        fields.remove("strict");
+                    }
+                }
+                tool
+            })
+            .collect();
         let mut system = serde_json::json!({
             "type": "text",
             "text": self.prompt.system,
@@ -328,16 +361,42 @@ impl ModelRequest {
         if shape.cache_control {
             system["cache_control"] = serde_json::json!({"type": "ephemeral"});
         }
+        let mut messages =
+            conversation::messages(&self.turns, &self.prompt.user, shape.cache_control);
+        messages.extend(self.steps.iter().cloned());
         serde_json::json!({
             "model": self.config.model,
-            "tools": [tool],
+            "tools": tools,
             "system": [system],
-            "messages": conversation::messages(
-                &self.turns,
-                &self.prompt.user,
-                shape.cache_control,
-            ),
+            "messages": messages,
         })
+    }
+
+    /// The same request, one tool round further on: the assistant turn that
+    /// asked, whole and unedited, then the one user turn that answers every
+    /// call it made.
+    ///
+    /// **One user message, however many tools were called.** The skill's
+    /// parallel-tool rule is explicit: splitting the results across messages
+    /// silently teaches the model to stop calling tools in parallel. And every
+    /// `tool_use` of the assistant turn is answered, including one this
+    /// supplier refused — an unanswered call is a 400, and a dropped one
+    /// teaches nothing.
+    pub fn stepped(
+        &self,
+        asked: &[serde_json::Value],
+        answers: Vec<serde_json::Value>,
+    ) -> ModelRequest {
+        let mut next = self.clone();
+        next.steps.push(serde_json::json!({
+            "role": "assistant",
+            "content": asked,
+        }));
+        next.steps.push(serde_json::json!({
+            "role": "user",
+            "content": answers,
+        }));
+        next
     }
 }
 
@@ -361,6 +420,13 @@ pub enum ModelEvent {
     /// arrives as a string, so the supplier can say what it was rather than
     /// swallow it.
     Draft(serde_json::Value),
+    /// A tool the model asked for, as the loop is about to run it
+    /// (`{id, name, input}`, GyldAskAgent.md 11.4). Emitted BEFORE the call, so
+    /// a reader watching a turn sees what it is waiting on.
+    ToolCall(serde_json::Value),
+    /// What that call answered with (`{id, name, ok, summary, bytes,
+    /// truncated}`). A refusal is `ok: false` and is a record like any other.
+    ToolResult(serde_json::Value),
 }
 
 /// Why the model declined, as data (`stop_reason: "refusal"`).
@@ -381,6 +447,16 @@ pub struct ModelOutcome {
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// The assistant turn's content blocks, in the order they arrived and as
+    /// they arrived: text, thinking with its signature, `tool_use` with its id
+    /// and input, and anything else this endpoint sent.
+    ///
+    /// **Verbatim, because replay demands it.** A turn that asked for a tool is
+    /// appended to `messages` whole before its results are; the API rejects a
+    /// thinking block whose content was modified and 400s a `tool_use` that was
+    /// dropped, so the fold keeps the endpoint's own object and only fills in
+    /// the deltas that belong to it.
+    pub content: Vec<serde_json::Value>,
 }
 
 /// The one clean ending.
@@ -391,17 +467,68 @@ pub const MAX_TOKENS: &str = "max_tokens";
 pub const REFUSAL: &str = "refusal";
 /// The ending that means the turn closed on a tool call.
 ///
-/// A CLEAN ending here. This verb declares exactly one tool, whose whole
-/// purpose is to carry a draft back, and it never answers the call: there is no
-/// loop to continue and nothing more the model would say. A turn that ends by
-/// making the offer the reader asked for is a turn that ended.
+/// A CLEAN ending, still — but for two reasons now rather than one. It is the
+/// ending of a turn that made the OFFER the reader asked for, which this
+/// supplier never answers: `propose_draft` carries a draft back and there is
+/// nothing more the model would say. And it is the ending of a turn the STEP
+/// BUDGET stopped, where the model would have gone on and the supplier chose
+/// not to (11.3) — said in a `note` record, with the prose it had written kept.
+///
+/// Every other `tool_use` is answered and the loop continues, so it is never
+/// what a turn ENDS on.
 pub const TOOL_USE: &str = "tool_use";
 
 impl ModelOutcome {
-    /// The turn ended because the answer ended — or because it ended in the
-    /// draft it was asked for, which is the same thing here (see [`TOOL_USE`]).
+    /// The turn ended because the answer ended — or because it ended in a tool
+    /// call this supplier does not answer (see [`TOOL_USE`]).
     pub fn complete(&self) -> bool {
         self.stop_reason == END_TURN || self.stop_reason == TOOL_USE
+    }
+
+    /// The `tool_use` blocks of this turn that the LOOP must answer: every one
+    /// but the draft tool, which is an offer and not a question.
+    pub fn calls(&self) -> Vec<(String, String, serde_json::Value)> {
+        self.content
+            .iter()
+            .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+            .map(|block| {
+                (
+                    block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .filter(|(_, name, _)| name != DRAFT_TOOL)
+            .collect()
+    }
+
+    /// Add one step's usage to a turn's running total.
+    ///
+    /// A multi-step turn is several calls and ONE turn: what it cost the
+    /// conversation is the sum, and what it ended as is the last step's ending.
+    fn add(&mut self, step: &ModelOutcome) {
+        self.input_tokens = self.input_tokens.saturating_add(step.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(step.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(step.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(step.cache_creation_input_tokens);
+        self.stop_reason = step.stop_reason.clone();
+        self.declined = step.declined.clone();
+        self.content = step.content.clone();
     }
 
     /// What this turn cost, whole: the prompt however it was served — uncached,
@@ -541,42 +668,110 @@ fn one_line(said: &str) -> String {
         .collect()
 }
 
-/// One consultation: count, check both input budgets, then stream.
+/// One consultation, which is a LOOP: count, check both input budgets, stream,
+/// and — while the model asks for a tool it may have — run it, answer it and
+/// call again (GyldAskAgent.md section 11.1).
 ///
-/// The count happens BEFORE the call, so an over-budget turn is refused with
-/// its numbers and costs nothing. `spent` is what this CONVERSATION has already
-/// spent across its earlier turns — the running total of section 7 — and the
-/// turn that would cross the ceiling is refused here rather than sent and
-/// regretted.
+/// The count happens BEFORE every call, so an over-budget step is refused with
+/// its numbers and costs nothing. It is before EVERY call and not only the
+/// first because the body grows: each round appends an assistant turn and its
+/// results, and a budget checked once against the smallest body it will ever
+/// have is not a budget. `spent` is what this CONVERSATION has already spent
+/// across its earlier turns — the running total of section 7 — and this turn's
+/// own steps are added to it as they are paid for.
 ///
 /// The per-run budget is checked first: it is about this question, and a
 /// question too big to ask is too big whatever the conversation has spent.
+///
+/// Four ways out, and each is a fact rather than an accident:
+///
+/// * `end_turn` — the answer ended.
+/// * a turn whose only tool call is `propose_draft` — the offer is the ending
+///   (section 8), and this supplier never answers that call.
+/// * the step budget — the loop stops, a `note` says so, and the turn still
+///   ends cleanly with the prose it had (11.3).
+/// * a transport failure, or a budget crossed — a refusal as data, as before.
+///
+/// Anything else the endpoint says — `max_tokens`, `refusal`, `pause_turn`, a
+/// stop reason nobody has heard of — ends the loop too and is reported as the
+/// turn's own ending, exactly as a single-call turn already reports it.
 pub fn consult(
     client: &dyn ModelClient,
     request: &ModelRequest,
     spent: u64,
+    tools: &ToolRegistry,
     on_event: &mut dyn FnMut(ModelEvent),
 ) -> Result<ModelOutcome, AskRefusal> {
-    let counted = client
-        .count_tokens(request, on_event)
-        .map_err(|reason| AskRefusal::Transport { reason })?;
-    if counted > request.config.max_input_tokens {
-        return Err(AskRefusal::OverInputBudget {
-            counted,
-            budget: request.config.max_input_tokens,
-        });
+    let budgets = tools.budgets();
+    let mut turn = request.clone();
+    let mut total = ModelOutcome::default();
+    for step in 0..=budgets.steps {
+        let counted = client
+            .count_tokens(&turn, on_event)
+            .map_err(|reason| AskRefusal::Transport { reason })?;
+        if counted > turn.config.max_input_tokens {
+            return Err(AskRefusal::OverInputBudget {
+                counted,
+                budget: turn.config.max_input_tokens,
+            });
+        }
+        let budget = turn.config.max_conversation_tokens;
+        let so_far = spent.saturating_add(total.tokens());
+        if budget > 0 && so_far.saturating_add(counted) > budget {
+            return Err(AskRefusal::OverConversationBudget {
+                spent: so_far,
+                counted,
+                budget,
+            });
+        }
+        let outcome = client
+            .stream(&turn, on_event)
+            .map_err(|reason| AskRefusal::Transport { reason })?;
+        total.add(&outcome);
+        let calls = outcome.calls();
+        if outcome.stop_reason != TOOL_USE || calls.is_empty() {
+            return Ok(total);
+        }
+        if step == budgets.steps {
+            // The budget is the gentle boundary: the model would have gone on,
+            // the supplier chose not to, and the reader is told which — with
+            // whatever prose the turn had already written kept.
+            on_event(ModelEvent::Note(format!(
+                "this turn asked for a tool again after {} tool step(s), which is this \
+                 supplier's per-turn budget, so the loop stopped here and the answer may be \
+                 incomplete",
+                budgets.steps
+            )));
+            return Ok(total);
+        }
+        let mut answers: Vec<serde_json::Value> = Vec::new();
+        for (id, name, input) in calls.iter() {
+            on_event(ModelEvent::ToolCall(crate::tools::call_record(
+                id, name, input,
+            )));
+            let answered = tools.call(id, name, input);
+            on_event(ModelEvent::ToolResult(answered.record()));
+            answers.push(answered.block());
+        }
+        // A draft made on the SAME turn as a read is still a tool call the API
+        // expects an answer to, and the honest answer is what happened to it:
+        // it was recorded and shown, and it is not a ruling.
+        for block in outcome.content.iter() {
+            if block.get("name").and_then(|v| v.as_str()) != Some(DRAFT_TOOL) {
+                continue;
+            }
+            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            answers.push(serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "The draft was recorded on this run and offered to the reader, who \
+                            takes it, edits it or discards it. It is not a ruling and no \
+                            decision has been taken.",
+            }));
+        }
+        turn = turn.stepped(&outcome.content, answers);
     }
-    let budget = request.config.max_conversation_tokens;
-    if budget > 0 && spent.saturating_add(counted) > budget {
-        return Err(AskRefusal::OverConversationBudget {
-            spent,
-            counted,
-            budget,
-        });
-    }
-    client
-        .stream(request, on_event)
-        .map_err(|reason| AskRefusal::Transport { reason })
+    Ok(total)
 }
 
 /// The model key, at the moment of the call and nowhere else.
@@ -912,19 +1107,56 @@ impl ModelClient for HttpsModelClient {
     }
 }
 
-/// The in-flight state of one folded stream: the outcome so far, and the tool
-/// inputs still arriving.
+/// The in-flight state of one folded stream: the outcome so far, and the
+/// content blocks still arriving.
 ///
-/// A tool input does NOT arrive whole. It is opened by a `content_block_start`
-/// naming the tool, filled by `input_json_delta` fragments, and closed by a
-/// `content_block_stop` — so the fold has to hold the fragments somewhere until
-/// the block closes. Here, and not on [`ModelOutcome`]: an outcome is what the
-/// turn RESULTED in, and a half-arrived tool input is not a result.
+/// A content block does NOT arrive whole. It is opened by a
+/// `content_block_start` carrying the block's own object, filled by deltas —
+/// `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta` — and
+/// closed by a `content_block_stop`, so the fold has to hold the block
+/// somewhere until it closes. Here, and not on [`ModelOutcome`]: an outcome is
+/// what the turn RESULTED in, and a half-arrived block is not a result.
+///
+/// **The endpoint's own object is what is kept.** The fold starts from the
+/// `content_block` the start event carried and writes the deltas into it,
+/// rather than composing a block of its own from the fields it recognises. A
+/// block it has never heard of therefore survives whole, and a thinking block
+/// keeps the `signature` the API checks — which is what makes
+/// [`ModelOutcome::content`] replayable in the next step of a tool loop.
 #[derive(Debug, Default)]
 pub struct Fold {
     pub outcome: ModelOutcome,
-    /// The open tool blocks: content-block index, tool name, JSON so far.
-    open: Vec<(u64, String, String)>,
+    /// The blocks that have opened and not yet closed.
+    open: Vec<Block>,
+}
+
+/// One content block, mid-arrival.
+#[derive(Debug)]
+struct Block {
+    index: u64,
+    /// The endpoint's own `content_block` object, with every delta so far
+    /// written into it.
+    value: serde_json::Value,
+    /// A `tool_use` input arrives as JSON fragments and is only a value at
+    /// `content_block_stop`.
+    json: String,
+}
+
+impl Block {
+    fn kind(&self) -> &str {
+        self.value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    }
+
+    fn append(&mut self, field: &str, text: &str) {
+        let held = match self.value.get(field).and_then(|v| v.as_str()) {
+            Some(held) => format!("{held}{text}"),
+            None => text.to_string(),
+        };
+        self.value[field] = serde_json::Value::String(held);
+    }
 }
 
 /// Fold an SSE body into events and an outcome. Every line that is not a
@@ -975,21 +1207,18 @@ pub fn fold_event(
             outcome.cache_creation_input_tokens = number(usage, "cache_creation_input_tokens");
         }
         "content_block_start" => {
-            // A tool block opens here and is EMPTY: its input arrives as
-            // fragments and is only whole at `content_block_stop`.
-            let block = value.get("content_block");
-            let kind = block
-                .and_then(|b| b.get("type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if kind == "tool_use" {
-                let name = block
-                    .and_then(|b| b.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                fold.open.push((index_of(&value), name, String::new()));
-            }
+            // Every block opens here, carrying its own object. A tool block's
+            // input is EMPTY at this point: it arrives as fragments and is only
+            // whole at `content_block_stop`.
+            let held = value
+                .get("content_block")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "text", "text": ""}));
+            fold.open.push(Block {
+                index: index_of(&value),
+                value: held,
+                json: String::new(),
+            });
         }
         "content_block_delta" => {
             let delta = value.get("delta");
@@ -997,37 +1226,81 @@ pub fn fold_event(
                 .and_then(|d| d.get("type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            // A `thinking_delta` is reasoning and never reaches a log record.
-            if kind == "text_delta" {
-                if let Some(text) = delta.and_then(|d| d.get("text")).and_then(|v| v.as_str()) {
-                    on_event(ModelEvent::Text(text.to_string()));
-                }
-            }
-            if kind == "input_json_delta" {
-                let fragment = delta
-                    .and_then(|d| d.get("partial_json"))
+            let index = index_of(&value);
+            let said = |field: &str| -> String {
+                delta
+                    .and_then(|d| d.get(field))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let index = index_of(&value);
-                if let Some(open) = fold.open.iter_mut().find(|(i, _, _)| *i == index) {
-                    open.2.push_str(fragment);
+                    .unwrap_or("")
+                    .to_string()
+            };
+            // An endpoint that streams a delta for a block it never opened is
+            // taken at its word: the block is opened here rather than dropped,
+            // so its text still reaches the reader and the replayed turn.
+            if !fold.open.iter().any(|block| block.index == index) {
+                let opening = match kind {
+                    "thinking_delta" | "signature_delta" => {
+                        serde_json::json!({"type": "thinking", "thinking": ""})
+                    }
+                    _ => serde_json::json!({"type": "text", "text": ""}),
+                };
+                fold.open.push(Block {
+                    index,
+                    value: opening,
+                    json: String::new(),
+                });
+            }
+            let block = match fold.open.iter_mut().find(|block| block.index == index) {
+                Some(block) => block,
+                None => {
+                    return Ok(());
                 }
+            };
+            match kind {
+                "text_delta" => {
+                    let text = said("text");
+                    block.append("text", &text);
+                    on_event(ModelEvent::Text(text));
+                }
+                // Reasoning is KEPT on the block and never emitted: a thinking
+                // block has to be replayed to the API unedited, and no
+                // reasoning text may reach a log record.
+                // Only onto a THINKING block. A reasoning delta aimed at a
+                // block of another kind would add a field the API never sent,
+                // and the block is replayed verbatim in the next step of a tool
+                // loop — so a field invented here is a 400 later.
+                "thinking_delta" if block.kind() == "thinking" => {
+                    let text = said("thinking");
+                    block.append("thinking", &text);
+                }
+                "signature_delta" if block.kind() == "thinking" => {
+                    block.value["signature"] = serde_json::Value::String(said("signature"));
+                }
+                "input_json_delta" => {
+                    block.json.push_str(&said("partial_json"));
+                }
+                _ => {}
             }
         }
         "content_block_stop" => {
             let index = index_of(&value);
-            if let Some(at) = fold.open.iter().position(|(i, _, _)| *i == index) {
-                let (_, name, json) = fold.open.remove(at);
-                if name == DRAFT_TOOL {
+            if let Some(at) = fold.open.iter().position(|block| block.index == index) {
+                let mut block = fold.open.remove(at);
+                if block.kind() == "tool_use" {
                     // A tool input that is not even JSON travels as the string
                     // it was, so the supplier can SAY what arrived rather than
                     // quietly drop it.
-                    let input = match serde_json::from_str::<serde_json::Value>(&json) {
+                    let input = match serde_json::from_str::<serde_json::Value>(&block.json) {
                         Ok(value) => value,
-                        Err(_) => serde_json::Value::String(json),
+                        Err(_) if block.json.trim().is_empty() => serde_json::json!({}),
+                        Err(_) => serde_json::Value::String(block.json.clone()),
                     };
-                    on_event(ModelEvent::Draft(input));
+                    block.value["input"] = input.clone();
+                    if block.value.get("name").and_then(|v| v.as_str()) == Some(DRAFT_TOOL) {
+                        on_event(ModelEvent::Draft(input));
+                    }
                 }
+                fold.outcome.content.push(block.value);
             }
         }
         "message_delta" => {
@@ -1113,6 +1386,11 @@ pub(crate) mod tests {
     pub(crate) struct Scripted {
         pub counted: Result<u64, String>,
         pub transcript: String,
+        /// The transcripts the SECOND and later calls of one turn answer with,
+        /// in order — what makes a multi-step turn scriptable. When it runs out,
+        /// `transcript` answers again, which is what a client that keeps asking
+        /// for the same tool looks like.
+        pub then: Mutex<Vec<String>>,
         pub transport: Option<String>,
         pub seen: Mutex<Vec<ModelRequest>>,
     }
@@ -1122,6 +1400,7 @@ pub(crate) mod tests {
             Scripted {
                 counted: Ok(0),
                 transcript: String::new(),
+                then: Mutex::new(Vec::new()),
                 transport: None,
                 seen: Mutex::new(Vec::new()),
             }
@@ -1131,6 +1410,26 @@ pub(crate) mod tests {
     impl Scripted {
         pub fn count(&self) -> usize {
             self.seen.lock().unwrap().len()
+        }
+
+        /// A double that answers each call of one turn with the next
+        /// transcript, and repeats the last one for ever after.
+        pub fn replaying(steps: &[&str]) -> Scripted {
+            let held: Vec<String> = steps.iter().map(|s| (*s).to_string()).collect();
+            let last = held.last().cloned().unwrap_or_default();
+            Scripted {
+                // `transcript` is what a call gets once the script has run out,
+                // so it is the LAST step: a model that kept being asked would
+                // keep saying what it said last.
+                transcript: last,
+                then: Mutex::new(held),
+                ..Default::default()
+            }
+        }
+
+        /// The requests this double was sent, in order.
+        pub fn requests(&self) -> Vec<ModelRequest> {
+            self.seen.lock().unwrap().clone()
         }
     }
 
@@ -1152,8 +1451,16 @@ pub(crate) mod tests {
             if let Some(e) = self.transport.as_deref() {
                 return Err(e.to_string());
             }
+            let next = {
+                let mut held = self.then.lock().unwrap();
+                if held.is_empty() {
+                    self.transcript.clone()
+                } else {
+                    held.remove(0)
+                }
+            };
             let mut fold = Fold::default();
-            fold_stream(self.transcript.as_bytes(), &mut fold, on_event)?;
+            fold_stream(next.as_bytes(), &mut fold, on_event)?;
             Ok(fold.outcome)
         }
     }
@@ -1247,6 +1554,8 @@ pub(crate) mod tests {
 
     pub(crate) fn request() -> ModelRequest {
         ModelRequest {
+            tools: Vec::new(),
+            steps: Vec::new(),
             config: ModelConfig::default(),
             prompt: Prompt {
                 system: "the stance and the passages".into(),
@@ -1254,6 +1563,13 @@ pub(crate) mod tests {
             },
             turns: Vec::new(),
         }
+    }
+
+    /// A registry with no tool in it: what every test that is about the CALL
+    /// rather than about the loop consults with, and the shape a supplier with
+    /// nothing enabled has.
+    pub(crate) fn none() -> crate::tools::ToolRegistry {
+        crate::tools::ToolRegistry::default()
     }
 
     fn collect(transcript: &str) -> (Vec<String>, ModelOutcome) {
@@ -1278,6 +1594,14 @@ pub(crate) mod tests {
             // endpoint, and never anything in the transcript.
             ModelEvent::Note(note) => {
                 panic!("a folded transcript said {note:?}");
+            }
+            // Nor any tool record: those are the LOOP's, made about a call this
+            // supplier ran, and never anything a stream carried.
+            ModelEvent::ToolCall(call) => {
+                panic!("a folded transcript called {call}");
+            }
+            ModelEvent::ToolResult(answered) => {
+                panic!("a folded transcript answered {answered}");
             }
         })
         .expect("the transcript folded");
@@ -1392,11 +1716,12 @@ pub(crate) mod tests {
         };
 
         // Room for it: the turn goes.
-        let outcome = consult(&client, &request, 3_000, &mut |_| {}).expect("within budget");
+        let outcome =
+            consult(&client, &request, 3_000, &none(), &mut |_| {}).expect("within budget");
         assert!(outcome.complete());
 
         // One more turn would cross it, so nothing is sent.
-        let e = consult(&client, &request, 3_900, &mut |_| {}).expect_err("a refusal");
+        let e = consult(&client, &request, 3_900, &none(), &mut |_| {}).expect_err("a refusal");
         assert_eq!(
             e,
             AskRefusal::OverConversationBudget {
@@ -1419,7 +1744,7 @@ pub(crate) mod tests {
 
         // Zero is no ceiling.
         request.config.max_conversation_tokens = 0;
-        assert!(consult(&client, &request, u64::MAX, &mut |_| {}).is_ok());
+        assert!(consult(&client, &request, u64::MAX, &none(), &mut |_| {}).is_ok());
     }
 
     #[test]
@@ -1690,13 +2015,13 @@ pub(crate) mod tests {
             transcript: NORMAL.into(),
             ..Default::default()
         };
-        let e = consult(&client, &request, 0, &mut |_| {}).expect_err("a refusal");
+        let e = consult(&client, &request, 0, &none(), &mut |_| {}).expect_err("a refusal");
         let said = e.says();
         assert!(said.contains("1001") && said.contains("1000"), "{said}");
         assert_eq!(client.count(), 1, "the count happened, the call did not");
 
         request.config.max_input_tokens = 1001;
-        let outcome = consult(&client, &request, 0, &mut |_| {}).expect("within budget");
+        let outcome = consult(&client, &request, 0, &none(), &mut |_| {}).expect("within budget");
         assert!(outcome.complete());
     }
 
@@ -1707,14 +2032,14 @@ pub(crate) mod tests {
             transport: Some("connection reset".into()),
             ..Default::default()
         };
-        let e = consult(&client, &request(), 0, &mut |_| {}).expect_err("a refusal");
+        let e = consult(&client, &request(), 0, &none(), &mut |_| {}).expect_err("a refusal");
         assert!(e.says().contains("connection reset"), "{e}");
 
         let counting = Scripted {
             counted: Err("dns failure".into()),
             ..Default::default()
         };
-        let e = consult(&counting, &request(), 0, &mut |_| {}).expect_err("a refusal");
+        let e = consult(&counting, &request(), 0, &none(), &mut |_| {}).expect_err("a refusal");
         assert!(e.says().contains("dns failure"), "{e}");
     }
 
@@ -1778,5 +2103,435 @@ pub(crate) mod tests {
         let said = scrub("failed for url (https://api.anthropic.com/v1/messages?key=abc)");
         assert!(said.contains("/v1/messages?"), "{said}");
         assert!(!said.contains("key=abc"), "{said}");
+    }
+
+    // ---- The tool loop (GyldAskAgent.md section 11.1, plan step A.1) -------
+
+    /// One SSE body out of the events it carries.
+    fn sse(events: Vec<serde_json::Value>) -> String {
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    /// A turn that says something and then asks for a tool.
+    fn calling(text: &str, calls: &[(&str, &str, serde_json::Value)]) -> String {
+        let mut events = vec![
+            serde_json::json!({"type": "message_start",
+                               "message": {"usage": {"input_tokens": 100}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                               "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "text_delta", "text": text}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+        ];
+        for (at, (id, name, input)) in calls.iter().enumerate() {
+            let index = at + 1;
+            events.push(serde_json::json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}));
+            events.push(serde_json::json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}));
+            events.push(serde_json::json!({"type": "content_block_stop", "index": index}));
+        }
+        events.push(serde_json::json!({"type": "message_delta",
+                                       "delta": {"stop_reason": TOOL_USE},
+                                       "usage": {"output_tokens": 20}}));
+        events.push(serde_json::json!({"type": "message_stop"}));
+        sse(events)
+    }
+
+    /// A turn that answers and ends.
+    fn answering(text: &str) -> String {
+        sse(vec![
+            serde_json::json!({"type": "message_start",
+                               "message": {"usage": {"input_tokens": 300}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                               "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "text_delta", "text": text}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta",
+                               "delta": {"stop_reason": END_TURN},
+                               "usage": {"output_tokens": 40}}),
+            serde_json::json!({"type": "message_stop"}),
+        ])
+    }
+
+    /// Everything one consultation produced, in the order it produced it.
+    fn ran(
+        client: &Scripted,
+        tools: &crate::tools::ToolRegistry,
+    ) -> (Vec<ModelEvent>, ModelOutcome) {
+        let mut events: Vec<ModelEvent> = Vec::new();
+        let outcome = consult(client, &request(), 0, tools, &mut |event| {
+            events.push(event);
+        })
+        .expect("the turn ran");
+        (events, outcome)
+    }
+
+    fn calls_of(events: &[ModelEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn results_of(events: &[ModelEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::ToolResult(answered) => Some(answered.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notes_of(events: &[ModelEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::Note(note) => Some(note.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reading(text: &str) -> crate::tools::ToolRegistry {
+        crate::tools::ToolRegistry::of(
+            vec![crate::tools::tests::Scripted::answering(
+                "read_source",
+                text,
+            )],
+            crate::tools::ToolBudgets::default(),
+        )
+    }
+
+    #[test]
+    fn a_two_step_turn_runs_the_tool_and_answers_with_what_it_returned() {
+        let client = Scripted::replaying(&[
+            &calling(
+                "Let me read Q11. ",
+                &[("toolu_1", "read_source", serde_json::json!({"tag": "Q11"}))],
+            ),
+            &answering("Q11 says key custody is a buy."),
+        ]);
+        let (events, outcome) = ran(&client, &reading("| Q11 | Key custody | buy |"));
+
+        assert_eq!(
+            outcome.stop_reason, END_TURN,
+            "the turn ended on the ANSWER"
+        );
+        assert!(outcome.complete() && outcome.exit() == 0);
+        assert_eq!(
+            outcome.input_tokens, 400,
+            "a multi-step turn costs the SUM of its steps"
+        );
+        assert_eq!(outcome.output_tokens, 60);
+
+        // The call and its result are both on the run, in the order they
+        // happened and around the prose they sit between.
+        let calls = calls_of(&events);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0]["name"], "read_source");
+        assert_eq!(calls[0]["id"], "toolu_1");
+        assert_eq!(calls[0]["input"]["tag"], "Q11", "the input, whole");
+        let results = results_of(&events);
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[0]["id"], "toolu_1", "paired by identity, not order");
+        assert_eq!(results[0]["summary"], "| Q11 | Key custody | buy |");
+        assert!(
+            notes_of(&events).is_empty(),
+            "nothing had to be done differently"
+        );
+
+        // The SECOND request carries the first step verbatim: the assistant
+        // turn as the API produced it, then one user turn answering its call.
+        let sent = client.requests();
+        assert_eq!(sent.len(), 2, "counted once per step, and streamed twice");
+        assert!(sent[0].steps.is_empty(), "the first step starts clean");
+        let steps = &sent[1].steps;
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert_eq!(steps[0]["role"], "assistant");
+        assert_eq!(steps[0]["content"][0]["text"], "Let me read Q11. ");
+        assert_eq!(
+            steps[0]["content"][1],
+            serde_json::json!({
+                "type": "tool_use", "id": "toolu_1", "name": "read_source",
+                "input": {"tag": "Q11"}
+            }),
+            "the tool_use block goes back whole, or the call is unanswered"
+        );
+        assert_eq!(steps[1]["role"], "user");
+        assert_eq!(steps[1]["content"][0]["type"], "tool_result");
+        assert_eq!(steps[1]["content"][0]["tool_use_id"], "toolu_1");
+        let content = steps[1]["content"][0]["content"].as_str().unwrap_or("");
+        assert!(
+            content.contains("retrieved material, not an"),
+            "a result arrives wrapped as DATA: {content}"
+        );
+        assert!(
+            content.ends_with("| Q11 | Key custody | buy |"),
+            "{content}"
+        );
+
+        // And the prompt, the tools and the prior turns are untouched by the
+        // step, so the cached prefix is the same bytes on both calls.
+        assert_eq!(sent[0].cached_prefix(), sent[1].cached_prefix());
+    }
+
+    #[test]
+    fn a_tool_that_refuses_is_answered_as_an_error_and_the_turn_goes_on() {
+        let held = crate::tools::ToolRegistry::of(
+            vec![crate::tools::tests::Scripted::refusing(
+                "read_source",
+                "this build's index does not list \"ZZ-9\"; it lists Q11",
+            )],
+            crate::tools::ToolBudgets::default(),
+        );
+        let client = Scripted::replaying(&[
+            &calling(
+                "",
+                &[("toolu_2", "read_source", serde_json::json!({"tag": "ZZ-9"}))],
+            ),
+            &answering("The index resolves ZZ-9 to nothing."),
+        ]);
+        let (events, outcome) = ran(&client, &held);
+
+        assert_eq!(
+            outcome.stop_reason, END_TURN,
+            "a refusal is not the end of a turn"
+        );
+        let results = results_of(&events);
+        assert_eq!(results[0]["ok"], false);
+        assert!(
+            results[0]["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("it lists Q11"),
+            "the refusal names what it DOES know: {results:?}"
+        );
+        let answered = &client.requests()[1].steps[1]["content"][0];
+        assert_eq!(answered["is_error"], true, "{answered}");
+        assert_eq!(
+            answered["content"], "this build's index does not list \"ZZ-9\"; it lists Q11",
+            "a refusal is this supplier's own sentence, unwrapped"
+        );
+    }
+
+    #[test]
+    fn the_step_budget_stops_the_loop_as_data_and_the_turn_still_ends_cleanly() {
+        let held = crate::tools::ToolRegistry::of(
+            vec![crate::tools::tests::Scripted::answering(
+                "read_source",
+                "a passage",
+            )],
+            crate::tools::ToolBudgets {
+                steps: 1,
+                ..Default::default()
+            },
+        );
+        // A model that asks for the same tool for ever.
+        let client = Scripted {
+            transcript: calling(
+                "again. ",
+                &[("toolu_3", "read_source", serde_json::json!({"tag": "Q11"}))],
+            ),
+            ..Default::default()
+        };
+        let (events, outcome) = ran(&client, &held);
+
+        assert_eq!(client.count(), 2, "one step, then the budget");
+        assert_eq!(calls_of(&events).len(), 1, "one tool was RUN");
+        let notes = notes_of(&events);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("per-turn budget"), "{notes:?}");
+        assert!(notes[0].contains("1 tool step"), "{notes:?}");
+        assert!(
+            outcome.complete() && outcome.exit() == 0,
+            "the budget is a fact about the run, not a failure of it: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.says(64_000),
+            None,
+            "the close says nothing; the note already said it"
+        );
+    }
+
+    #[test]
+    fn a_result_over_the_byte_cap_is_cut_marked_and_said_to_be_a_prefix() {
+        let held = crate::tools::ToolRegistry::of(
+            vec![crate::tools::tests::Scripted::answering(
+                "read_source",
+                &"p".repeat(200),
+            )],
+            crate::tools::ToolBudgets {
+                bytes: 20,
+                ..Default::default()
+            },
+        );
+        let client = Scripted::replaying(&[
+            &calling("", &[("toolu_4", "read_source", serde_json::json!({}))]),
+            &answering("done"),
+        ]);
+        let (events, _) = ran(&client, &held);
+        let results = results_of(&events);
+        assert_eq!(results[0]["truncated"], true);
+        assert_eq!(results[0]["bytes"], 200, "the size BEFORE the cut");
+        assert_eq!(results[0]["summary"], "p".repeat(20));
+        let content = client.requests()[1].steps[1]["content"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content.contains("capped") && content.contains("a prefix"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_tool_the_allow_list_does_not_carry_is_refused_as_data_without_running() {
+        let client = Scripted::replaying(&[
+            &calling(
+                "",
+                &[(
+                    "toolu_5",
+                    "fetch_url",
+                    serde_json::json!({"url": "https://example.test/"}),
+                )],
+            ),
+            &answering("I cannot reach a page from here."),
+        ]);
+        let (events, outcome) = ran(&client, &reading("never asked for"));
+
+        assert_eq!(outcome.stop_reason, END_TURN);
+        let results = results_of(&events);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ok"], false);
+        let said = results[0]["summary"].as_str().unwrap_or("").to_string();
+        assert!(said.contains("no tool \"fetch_url\" is enabled"), "{said}");
+        assert!(
+            said.contains("read_source"),
+            "it names what IS enabled: {said}"
+        );
+        assert_eq!(
+            client.requests()[1].steps[1]["content"][0]["is_error"],
+            true,
+            "the call is ANSWERED, because an unanswered tool_use is a 400"
+        );
+    }
+
+    #[test]
+    fn a_turn_whose_only_call_is_the_draft_still_ends_and_one_beside_a_read_does_not() {
+        // The draft alone: the offer IS the ending, and no tool runs (section 8).
+        let only = Scripted {
+            transcript: calling(
+                "I propose owner_held_only. ",
+                &[(
+                    "toolu_6",
+                    DRAFT_TOOL,
+                    serde_json::json!({"alternative": "a1", "ruling_text": "x", "sources": []}),
+                )],
+            ),
+            ..Default::default()
+        };
+        let (events, outcome) = ran(&only, &reading("a passage"));
+        assert_eq!(only.count(), 1, "one call, and no second");
+        assert_eq!(outcome.stop_reason, TOOL_USE);
+        assert!(outcome.complete());
+        assert!(
+            calls_of(&events).is_empty(),
+            "the supplier never runs the draft tool"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ModelEvent::Draft(_)))
+                .count(),
+            1,
+            "and the draft still arrives"
+        );
+
+        // Beside a read, the turn continues — and the draft's own call is
+        // answered too, because every tool_use of a replayed turn must be.
+        let beside = Scripted::replaying(&[
+            &calling(
+                "",
+                &[
+                    ("toolu_7", "read_source", serde_json::json!({"tag": "Q11"})),
+                    (
+                        "toolu_8",
+                        DRAFT_TOOL,
+                        serde_json::json!({"alternative": "a1", "ruling_text": "x", "sources": []}),
+                    ),
+                ],
+            ),
+            &answering("and that is why."),
+        ]);
+        let (events, outcome) = ran(&beside, &reading("a passage"));
+        assert_eq!(outcome.stop_reason, END_TURN);
+        assert_eq!(calls_of(&events).len(), 1, "only the read is run");
+        let answers = beside.requests()[1].steps[1]["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(answers.len(), 2, "both calls are answered: {answers:?}");
+        let ids: Vec<&str> = answers
+            .iter()
+            .map(|a| a["tool_use_id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["toolu_7", "toolu_8"]);
+        assert!(
+            answers[1]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not a ruling"),
+            "{answers:?}"
+        );
+    }
+
+    #[test]
+    fn a_thinking_block_is_kept_whole_for_replay_and_never_reaches_a_record() {
+        let transcript = sse(vec![
+            serde_json::json!({"type": "message_start", "message": {"usage": {}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                               "content_block": {"type": "thinking", "thinking": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "thinking_delta", "thinking": "weighing it"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "signature_delta", "signature": "sig-abc"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                               "content_block": {"type": "tool_use", "id": "toolu_9",
+                                                 "name": "read_source", "input": {}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                               "delta": {"type": "input_json_delta",
+                                         "partial_json": "{\"tag\":\"Q11\"}"}}),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": TOOL_USE}}),
+        ]);
+        let client = Scripted::replaying(&[&transcript, &answering("read.")]);
+        let (events, _) = ran(&client, &reading("a passage"));
+
+        assert!(
+            !events.iter().any(|event| matches!(
+                event, ModelEvent::Text(chunk) if chunk.contains("weighing")
+            )),
+            "reasoning is not text and reaches no record: {events:?}"
+        );
+        let replayed = &client.requests()[1].steps[0]["content"][0];
+        assert_eq!(
+            replayed,
+            &serde_json::json!({
+                "type": "thinking", "thinking": "weighing it", "signature": "sig-abc"
+            }),
+            "the block goes back exactly as it arrived, signature and all"
+        );
     }
 }

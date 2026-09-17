@@ -40,6 +40,10 @@
 //!   invocation, or a refusal, with no filesystem effect.
 //! * [`exec`] — the bounded runner (wall clock and output bytes).
 //! * [`publish`] — what a successful build puts on the value surfaces.
+//! * [`tools`] — the [`tools::Tool`] trait, the allow-list registry and the
+//!   budgets one turn's tool use runs under (section 11); the loop that drives
+//!   them is [`model::consult`].
+//! * [`toolset`] — the tools this supplier actually offers over a build.
 //! * [`supplier`] — [`serve`], [`GyldConfig`], [`GyldSupplier`]: attach and serve,
 //!   publishing the bundle root's current build the moment it is serving and
 //!   making the first build itself when the root has none.
@@ -55,6 +59,8 @@ pub mod prompt;
 pub mod publish;
 pub mod sources;
 pub mod supplier;
+pub mod tools;
+pub mod toolset;
 pub mod verbs;
 
 pub use agent::{
@@ -65,10 +71,10 @@ pub use ask::{
     AgentState, AskContext, AskDraft, AskRefusal, Consultation, ASK_CONTEXT_FORMAT, SOURCES_FILE,
 };
 pub use bundle::{FilePointer, Layout};
-pub use conversation::{Ledger, Turn};
+pub use conversation::{Ledger, Turn, TurnPart};
 pub use envelope::{
     GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, ASK_ANSWER, ASK_CITATION,
-    ASK_DRAFT, ASK_END, ASK_NOTE, ASK_QUESTION,
+    ASK_DRAFT, ASK_END, ASK_NOTE, ASK_QUESTION, ASK_TOOL_CALL, ASK_TOOL_RESULT,
 };
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
@@ -86,5 +92,9 @@ pub use sources::{ResolvedSource, SourceIndex, SOURCES_FORMAT};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
     DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_ID,
+};
+pub use tools::{
+    Tool, ToolAnswer, ToolBudgets, ToolContext, ToolOutput, ToolPolicy, ToolRefusal, ToolRegistry,
+    DEFAULT_TOOL_RESULT_BYTES, DEFAULT_TOOL_STEPS, DEFAULT_TOOL_TIMEOUT_SECS,
 };
 pub use verbs::{Plan, PlannedWrite, ALLOWED_VERBS, NO_BUNDLE};

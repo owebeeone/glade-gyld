@@ -257,7 +257,8 @@ pub struct GyldAskRecord {
     pub exit: Option<i32>,
 }
 
-/// The record streams a consultation emits. `draft` is phase 3.
+/// The record streams a consultation emits. `draft` is phase 3; `tool_call`
+/// and `tool_result` are phase A.
 ///
 /// `question` is the reader's own turn, appended before anything the model
 /// produces. Section 6 says the transcript IS the log share; without the
@@ -282,6 +283,20 @@ pub const ASK_DRAFT: &str = "draft";
 /// at a weaker answer can see what weakened it, in the same place as the
 /// answer, rather than in a terminal log nobody is reading.
 pub const ASK_NOTE: &str = "note";
+
+/// A tool the agent reached for, as the loop is about to run it
+/// (GyldAskAgent.md 11.4). Its `record` is `{id, name, input}`, where `id` is
+/// the API's own `tool_use_id` — so a result is paired with its call by
+/// identity and never by position, which matters because one turn may call two
+/// tools at once.
+pub const ASK_TOOL_CALL: &str = "tool_call";
+
+/// What that call answered with: `{id, name, ok, summary, bytes, truncated}`.
+/// A tool that refused is `ok: false` with the reason in `summary`, and a
+/// result the byte budget cut says so in `truncated` with the size it was
+/// before the cut in `bytes`.
+pub const ASK_TOOL_RESULT: &str = "tool_result";
+
 pub const ASK_END: &str = "end";
 
 impl GyldAskRecord {
@@ -377,6 +392,36 @@ impl GyldAskRecord {
         GyldAskRecord {
             record: Some(draft),
             ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_DRAFT)
+        }
+    }
+
+    /// One tool the agent reached for, before it is run. It is appended BEFORE
+    /// the call so a reader watching a turn sees what it is waiting on.
+    pub fn tool_call(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        call: serde_json::Value,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            record: Some(call),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_TOOL_CALL)
+        }
+    }
+
+    /// What one tool call answered with — including a refusal, which is data
+    /// here like everywhere else.
+    pub fn tool_result(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        conversation: &str,
+        answered: serde_json::Value,
+    ) -> GyldAskRecord {
+        GyldAskRecord {
+            record: Some(answered),
+            ..GyldAskRecord::of(run_id, seq, who, conversation, ASK_TOOL_RESULT)
         }
     }
 

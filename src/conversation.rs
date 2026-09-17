@@ -23,7 +23,33 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::envelope::{GyldAskRecord, ASK_ANSWER, ASK_DRAFT, ASK_END, ASK_QUESTION};
+use crate::envelope::{
+    GyldAskRecord, ASK_ANSWER, ASK_DRAFT, ASK_END, ASK_QUESTION, ASK_TOOL_CALL, ASK_TOOL_RESULT,
+};
+use crate::tools::{capped, REPLAYED_RESULT_CHARS};
+
+/// One thing a prior turn did, in the order it did it.
+///
+/// A multi-step turn is prose, then a tool call, then its result, then more
+/// prose — and a follow-up that was replayed the prose alone would be reading a
+/// transcript in which the agent knew things it was never told. So the parts
+/// are ORDERED and the replay renders them in order (GyldAskAgent.md 11.1, and
+/// the A.1 step of the plan).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnPart {
+    /// A run of the answer's own prose, as the `answer` chunks joined it.
+    Prose(String),
+    /// A tool this turn called: the name and its input, as the `tool_call`
+    /// record carried them.
+    Called { name: String, input: String },
+    /// What that call answered: the summary, as the `tool_result` record
+    /// carried it, and whether it refused.
+    Returned {
+        name: String,
+        ok: bool,
+        summary: String,
+    },
+}
 
 /// One turn of this conversation as its own records tell it: what was asked,
 /// what came back, and how it closed when the close said anything.
@@ -33,9 +59,9 @@ pub struct Turn {
     pub run_id: String,
     /// The question, as the reader typed it.
     pub question: String,
-    /// The prose, as the model streamed it — the `answer` chunks joined in the
-    /// order they were appended.
-    pub answer: String,
+    /// What the turn produced, in the order it produced it: the prose the model
+    /// streamed and the tools it called along the way.
+    pub parts: Vec<TurnPart>,
     /// What this turn's `end` record said, when it said anything: a partial
     /// answer, a decline, a refusal, a transport failure.
     pub closed: Option<String>,
@@ -45,6 +71,17 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// The prose alone: the `answer` chunks, joined in the order they arrived.
+    pub fn answer(&self) -> String {
+        let mut out = String::new();
+        for part in self.parts.iter() {
+            if let TurnPart::Prose(text) = part {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
     /// The assistant text this turn is replayed as.
     ///
     /// A turn that ended in anything but a clean end is replayed SAYING so: the
@@ -52,13 +89,30 @@ impl Turn {
     /// a whole one would have it build on ground that is not there. A turn that
     /// produced no prose at all is replayed as that fact rather than as an
     /// empty assistant turn, which is not a message the API accepts.
+    ///
+    /// **Tool calls are replayed as TEXT, not as `tool_use` blocks.** Two
+    /// reasons, both structural. The log carries what happened, not the API
+    /// objects it happened in — there is no `tool_use_id` and no thinking
+    /// signature on a record — and a replayed `tool_use` that could not be
+    /// paired with its `tool_result` is a 400 rather than a transcript. And a
+    /// replayed RESULT is a prefix ([`REPLAYED_RESULT_CHARS`]): what one call
+    /// may hand a model now is the byte budget's business, and what every call
+    /// of every earlier turn hands it for ever after is this one's.
     pub fn assistant(&self) -> String {
-        let answer = self.answer.trim();
-        let mut said = match (answer.is_empty(), self.closed.as_deref()) {
+        let answer = self.answer();
+        let answer = answer.trim();
+        let steps = self.steps();
+        let body = match (answer.is_empty(), steps.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => steps,
+            (false, true) => answer.to_string(),
+            (false, false) => format!("{answer}\n\n{steps}"),
+        };
+        let mut said = match (body.is_empty(), self.closed.as_deref()) {
             (true, Some(closed)) => format!("[this turn produced no answer: {closed}]"),
             (true, None) => "[this turn produced no answer]".to_string(),
-            (false, Some(closed)) => format!("{answer}\n\n[this turn ended: {closed}]"),
-            (false, None) => answer.to_string(),
+            (false, Some(closed)) => format!("{body}\n\n[this turn ended: {closed}]"),
+            (false, None) => body,
         };
         // The offer is part of the turn that made it. Replaying the prose alone
         // would have the model reading a transcript in which it never proposed
@@ -67,6 +121,33 @@ impl Turn {
             said.push_str(&format!("\n\n[this turn drafted: {drafted}]"));
         }
         said
+    }
+
+    /// The tool calls and results of this turn, in order, as the lines a
+    /// replayed transcript carries them on.
+    fn steps(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for part in self.parts.iter() {
+            match part {
+                TurnPart::Prose(_) => {}
+                TurnPart::Called { name, input } => {
+                    lines.push(format!("[this turn called the tool `{name}` with {input}]"));
+                }
+                TurnPart::Returned { name, ok, summary } => {
+                    let (held, cut) = capped(summary, REPLAYED_RESULT_CHARS);
+                    lines.push(format!(
+                        "[the tool `{name}` {}: {held}{}]",
+                        if *ok { "returned" } else { "refused" },
+                        if cut {
+                            " …(a prefix, for replay)"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -108,7 +189,40 @@ pub fn turns(records: &[Vec<u8>]) -> Vec<Turn> {
                 }
             }
             ASK_ANSWER => {
-                turn.answer.push_str(record.line.as_deref().unwrap_or(""));
+                let chunk = record.line.unwrap_or_default();
+                // Two chunks in a row are one run of prose; a chunk after a
+                // tool step opens a new one, so the order survives the fold.
+                match turn.parts.last_mut() {
+                    Some(TurnPart::Prose(held)) => {
+                        held.push_str(&chunk);
+                    }
+                    _ => {
+                        turn.parts.push(TurnPart::Prose(chunk));
+                    }
+                }
+            }
+            ASK_TOOL_CALL => {
+                if let Some(call) = record.record.as_ref() {
+                    turn.parts.push(TurnPart::Called {
+                        name: text_of(call, "name"),
+                        input: call
+                            .get("input")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "no input".to_string()),
+                    });
+                }
+            }
+            ASK_TOOL_RESULT => {
+                if let Some(answered) = record.record.as_ref() {
+                    turn.parts.push(TurnPart::Returned {
+                        name: text_of(answered, "name"),
+                        ok: answered
+                            .get("ok")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        summary: text_of(answered, "summary"),
+                    });
+                }
             }
             ASK_DRAFT => {
                 turn.drafted = record.record.as_ref().map(drafted);
@@ -126,6 +240,15 @@ pub fn turns(records: &[Vec<u8>]) -> Vec<Turn> {
         .filter_map(|run_id| held.remove(run_id))
         .filter(|turn| !turn.question.trim().is_empty())
         .collect()
+}
+
+/// One string field of a record, or an empty one.
+fn text_of(record: &serde_json::Value, field: &str) -> String {
+    record
+        .get(field)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One draft record, in the one line a replayed turn carries it as. The
@@ -316,11 +439,11 @@ pub(crate) mod tests {
         assert_eq!(folded.len(), 2);
         assert_eq!(folded[0].run_id, "run-1");
         assert_eq!(folded[0].question, "why is this blocked?");
-        assert_eq!(folded[0].answer, "It is blocked.", "the chunks rejoin");
+        assert_eq!(folded[0].answer(), "It is blocked.", "the chunks rejoin");
         assert_eq!(folded[0].closed, None);
         assert_eq!(folded[1].run_id, "run-2");
         assert_eq!(folded[1].question, "by what?");
-        assert_eq!(folded[1].answer, "By proof_family.");
+        assert_eq!(folded[1].answer(), "By proof_family.");
     }
 
     #[test]
@@ -329,7 +452,7 @@ pub(crate) mod tests {
         records.insert(2, b"not a record at all".to_vec());
         let folded = turns(&records);
         assert_eq!(folded.len(), 2, "{folded:?}");
-        assert_eq!(folded[0].answer, "It is blocked.");
+        assert_eq!(folded[0].answer(), "It is blocked.");
     }
 
     #[test]
@@ -479,6 +602,121 @@ pub(crate) mod tests {
         assert!(
             said.contains("hsm (which this record does not offer)"),
             "{said}"
+        );
+    }
+
+    /// The records a turn that used a tool appends, in the supplier's order:
+    /// the question, the citations, prose, the call, its result, more prose.
+    fn with_a_tool(run_id: &str, ok: bool, summary: &str) -> Vec<Vec<u8>> {
+        let who = Some("gianni".to_string());
+        let conversation = "conv-tab1-key_custody-1789";
+        let mut out = vec![GyldAskRecord::question(
+            run_id,
+            1,
+            &who,
+            conversation,
+            "what did stream-a decide?".into(),
+        )
+        .to_bytes()];
+        out.push(
+            GyldAskRecord::answer(run_id, 2, &who, conversation, "Let me look. ".into()).to_bytes(),
+        );
+        out.push(
+            GyldAskRecord::tool_call(
+                run_id,
+                3,
+                &who,
+                conversation,
+                serde_json::json!({"id": "toolu_1", "name": "gyld_query",
+                                   "input": {"kind": "rulings", "slot": "s"}}),
+            )
+            .to_bytes(),
+        );
+        out.push(
+            GyldAskRecord::tool_result(
+                run_id,
+                4,
+                &who,
+                conversation,
+                serde_json::json!({"id": "toolu_1", "name": "gyld_query", "ok": ok,
+                                   "summary": summary, "bytes": summary.len(),
+                                   "truncated": false}),
+            )
+            .to_bytes(),
+        );
+        out.push(
+            GyldAskRecord::answer(run_id, 5, &who, conversation, "stream-a took 1.2.0.".into())
+                .to_bytes(),
+        );
+        out.push(GyldAskRecord::end(run_id, 6, &who, conversation, 0, None).to_bytes());
+        out
+    }
+
+    #[test]
+    fn a_turn_that_used_a_tool_folds_into_its_parts_in_the_order_they_happened() {
+        let folded = turns(&with_a_tool("run-1", true, "the version_pin ruling"));
+        assert_eq!(folded.len(), 1);
+        assert_eq!(
+            folded[0].parts,
+            vec![
+                TurnPart::Prose("Let me look. ".into()),
+                TurnPart::Called {
+                    name: "gyld_query".into(),
+                    input: "{\"kind\":\"rulings\",\"slot\":\"s\"}".into(),
+                },
+                TurnPart::Returned {
+                    name: "gyld_query".into(),
+                    ok: true,
+                    summary: "the version_pin ruling".into(),
+                },
+                TurnPart::Prose("stream-a took 1.2.0.".into()),
+            ],
+        );
+        assert_eq!(
+            folded[0].answer(),
+            "Let me look. stream-a took 1.2.0.",
+            "the prose alone is still the prose alone"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_replays_the_tool_calls_and_their_results() {
+        let folded = turns(&with_a_tool("run-1", true, "the version_pin ruling"));
+        let said = folded[0].assistant();
+        assert!(
+            said.starts_with("Let me look. stream-a took 1.2.0."),
+            "{said}"
+        );
+        assert!(
+            said.contains("[this turn called the tool `gyld_query` with {\"kind\":\"rulings\""),
+            "{said}"
+        );
+        assert!(
+            said.contains("[the tool `gyld_query` returned: the version_pin ruling]"),
+            "{said}"
+        );
+        let at_call = said.find("called the tool").expect("the call");
+        let at_result = said.find("returned:").expect("the result");
+        assert!(at_call < at_result, "in the order they happened: {said}");
+
+        // A refusal is replayed AS a refusal: a follow-up that read "returned"
+        // over a tool that would not run would build on ground that is not
+        // there.
+        let refused = turns(&with_a_tool("run-2", false, "no such stream"))[0].assistant();
+        assert!(
+            refused.contains("[the tool `gyld_query` refused: no such stream]"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_result_is_a_prefix_and_says_so() {
+        let long = "x".repeat(REPLAYED_RESULT_CHARS + 500);
+        let said = turns(&with_a_tool("run-1", true, &long))[0].assistant();
+        assert!(said.contains("…(a prefix, for replay)"), "{said}");
+        assert!(
+            !said.contains(&"x".repeat(REPLAYED_RESULT_CHARS + 1)),
+            "a whole conversation of whole results would spend the input budget re-reading"
         );
     }
 

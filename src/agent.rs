@@ -34,6 +34,10 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::model::{ModelConfig, Shape, DEFAULT_AGENT_MODEL, DEFAULT_BASE_URL};
+use crate::tools::{
+    ToolBudgets, ToolPolicy, DEFAULT_TOOL_RESULT_BYTES, DEFAULT_TOOL_STEPS,
+    DEFAULT_TOOL_TIMEOUT_SECS,
+};
 
 /// The endpoint, when the environment names one. The name Anthropic-shaped
 /// clients already use, including the dabeest launchers.
@@ -210,6 +214,16 @@ pub struct AgentOverrides {
     pub cache_control: Option<bool>,
     /// Count the input with the endpoint before the call, or don't.
     pub count_tokens: Option<bool>,
+    /// Which tools the agent may reach for, by name. `None` is "every local
+    /// tool this supplier offers" (GyldAskAgent.md 11.2); `Some(vec![])` is a
+    /// desk that turned them all off.
+    pub tools: Option<Vec<String>>,
+    /// Tool-running rounds one turn may take.
+    pub tool_steps: Option<usize>,
+    /// The cap on one tool result's text, in bytes.
+    pub tool_result_bytes: Option<usize>,
+    /// The wall clock one tool call gets.
+    pub tool_timeout_secs: Option<u64>,
 }
 
 impl AgentOverrides {
@@ -231,6 +245,10 @@ impl AgentOverrides {
             strict: higher.strict.or(self.strict),
             cache_control: higher.cache_control.or(self.cache_control),
             count_tokens: higher.count_tokens.or(self.count_tokens),
+            tools: higher.tools.clone().or(self.tools),
+            tool_steps: higher.tool_steps.or(self.tool_steps),
+            tool_result_bytes: higher.tool_result_bytes.or(self.tool_result_bytes),
+            tool_timeout_secs: higher.tool_timeout_secs.or(self.tool_timeout_secs),
         }
     }
 
@@ -351,6 +369,10 @@ impl AgentOverrides {
                 strict: held.strict,
                 cache_control: held.cache_control,
                 count_tokens: held.count_tokens,
+                tools: held.tools,
+                tool_steps: held.tool_steps,
+                tool_result_bytes: held.tool_result_bytes,
+                tool_timeout_secs: held.tool_timeout_secs,
             },
             notes,
         )
@@ -383,6 +405,14 @@ struct AgentFile {
     cache_control: Option<bool>,
     #[serde(default)]
     count_tokens: Option<bool>,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    tool_steps: Option<usize>,
+    #[serde(default)]
+    tool_result_bytes: Option<usize>,
+    #[serde(default)]
+    tool_timeout_secs: Option<u64>,
 }
 
 impl AgentFile {
@@ -401,6 +431,10 @@ impl AgentFile {
         "strict",
         "cache_control",
         "count_tokens",
+        "tools",
+        "tool_steps",
+        "tool_result_bytes",
+        "tool_timeout_secs",
     ];
 }
 
@@ -490,6 +524,20 @@ pub fn resolve_from(bundle_root: &Path, merged: AgentOverrides, notes: Vec<Strin
             key_file,
             count_tokens: merged.count_tokens.unwrap_or(compat.counts_tokens()),
             shape,
+            tools: ToolPolicy {
+                allow: merged.tools,
+                budgets: ToolBudgets {
+                    steps: merged.tool_steps.unwrap_or(DEFAULT_TOOL_STEPS),
+                    bytes: merged
+                        .tool_result_bytes
+                        .unwrap_or(DEFAULT_TOOL_RESULT_BYTES),
+                    timeout: Duration::from_secs(
+                        merged
+                            .tool_timeout_secs
+                            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS),
+                    ),
+                },
+            },
         },
         notes,
     }
@@ -524,6 +572,11 @@ mod tests {
             crate::model::DEFAULT_MAX_INPUT_TOKENS
         );
         assert_eq!(config.key_file, bundle().join("agent/api-key"));
+        assert_eq!(
+            config.tools,
+            ToolPolicy::default(),
+            "no `tools` key means every local tool this supplier offers, at the default budgets"
+        );
         assert_eq!(
             config,
             ModelConfig::default_at(&bundle()),
@@ -659,7 +712,11 @@ mod tests {
             "key_file": "agent/other-key",
             "strict": false,
             "cache_control": false,
-            "count_tokens": false
+            "count_tokens": false,
+            "tools": ["read_source"],
+            "tool_steps": 3,
+            "tool_result_bytes": 4096,
+            "tool_timeout_secs": 9
         }"#;
         let (held, notes) = AgentOverrides::from_json(text, Path::new("config.json"));
         assert!(notes.is_empty(), "{notes:?}");
@@ -681,6 +738,18 @@ mod tests {
             "the profile can start degraded instead of discovering it"
         );
         assert!(!config.count_tokens);
+        assert_eq!(
+            config.tools.allow.as_deref(),
+            Some(["read_source".to_string()].as_slice())
+        );
+        assert_eq!(
+            config.tools.budgets,
+            ToolBudgets {
+                steps: 3,
+                bytes: 4096,
+                timeout: Duration::from_secs(9)
+            }
+        );
 
         // An absolute key file is taken as it stands.
         let (held, _) = AgentOverrides::from_json(r#"{"key_file": "/etc/k"}"#, Path::new("c"));

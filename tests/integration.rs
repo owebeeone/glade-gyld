@@ -1163,7 +1163,7 @@ async fn a_third_turn_replays_both_prior_turns_in_order_behind_one_cached_prefix
         third
             .turns
             .iter()
-            .all(|t| t.answer == "It is blocked by proof_family (Q11)."),
+            .all(|t| t.answer() == "It is blocked by proof_family (Q11)."),
         "the chunks rejoin into the prose that was streamed: {:?}",
         third.turns
     );
@@ -1555,6 +1555,8 @@ async fn the_real_model_client_answers_with_data_from_a_blocking_task() {
     };
     let client = glade_gyld::model::HttpsModelClient::new(config.clone());
     let request = ModelRequest {
+        tools: Vec::new(),
+        steps: Vec::new(),
         config,
         prompt: glade_gyld::Prompt {
             system: "the stance".into(),
@@ -1765,6 +1767,8 @@ fn agent_key(tmp: &Tmp, value: &str) -> PathBuf {
 /// A request aimed at `endpoint`, in `compat`.
 fn request_to(base_url: &str, compat: glade_gyld::Compat, key: PathBuf) -> ModelRequest {
     ModelRequest {
+        tools: Vec::new(),
+        steps: Vec::new(),
         config: glade_gyld::ModelConfig {
             base_url: base_url.into(),
             compat,

@@ -42,6 +42,8 @@ use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
 use crate::prompt::{self, Prompt};
 use crate::publish::{self, Surfaces};
 use crate::sources::{self, ResolvedSource};
+use crate::tools;
+use crate::toolset;
 use crate::verbs::{self, Plan};
 
 /// The default surfaces a gyld supplier stands behind (`gyld-app.glade`).
@@ -754,6 +756,15 @@ async fn consult_run(
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
             let (sources, prompt) = ground(&consult)?;
+            // The tools this desk allows, over the build this consultation was
+            // grounded in — so a tool's answer and a citation can never name
+            // two different snapshots (GyldAskAgent.md 11.6).
+            let context = tools::ToolContext::beside(&consult.sources);
+            let (registry, said) =
+                tools::ToolRegistry::build(&model_config.tools, toolset::local(&context));
+            for note in said.into_iter() {
+                let _ = tx.send(Reply::Note(note));
+            }
             // The citations first, so a reader sees what the answer is grounded in
             // before the prose arrives — and sees it even when the call then fails.
             for source in sources.iter() {
@@ -765,8 +776,10 @@ async fn consult_run(
                 config: model_config,
                 prompt,
                 turns: prior,
+                tools: registry.declarations(),
+                steps: Vec::new(),
             };
-            model::consult(model.as_ref(), &request, spent, &mut |event| {
+            model::consult(model.as_ref(), &request, spent, &registry, &mut |event| {
                 let reply = match event {
                     // A fallback the call had to make. It rides the same
                     // channel as the answer so it lands in the records in the
@@ -780,6 +793,12 @@ async fn consult_run(
                     ModelEvent::Draft(input) => {
                         Reply::Draft(AskDraft::parse(&input, &consult.context, &drafted_by))
                     }
+                    // A tool the agent reached for, and what it answered. Both
+                    // ride the same channel as the prose, so they land in the
+                    // records in the ORDER they happened — which is what lets a
+                    // follow-up replay the turn as it ran (11.4).
+                    ModelEvent::ToolCall(call) => Reply::ToolCall(call),
+                    ModelEvent::ToolResult(answered) => Reply::ToolResult(answered),
                 };
                 let _ = tx.send(reply);
             })
@@ -798,6 +817,12 @@ async fn consult_run(
                 GyldAskRecord::answer(&run_id, seq + 1, &who, &conversation, chunk)
             }
             Reply::Note(note) => GyldAskRecord::note(&run_id, seq + 1, &who, &conversation, note),
+            Reply::ToolCall(call) => {
+                GyldAskRecord::tool_call(&run_id, seq + 1, &who, &conversation, call)
+            }
+            Reply::ToolResult(answered) => {
+                GyldAskRecord::tool_result(&run_id, seq + 1, &who, &conversation, answered)
+            }
             Reply::Draft(Ok(draft)) => GyldAskRecord::draft(
                 &run_id,
                 seq + 1,
@@ -847,6 +872,10 @@ enum Reply {
     Answer(String),
     /// Something the call had to do differently, on its way to a `note` record.
     Note(String),
+    /// A tool the agent reached for, on its way to a `tool_call` record.
+    ToolCall(serde_json::Value),
+    /// What that call answered, on its way to a `tool_result` record.
+    ToolResult(serde_json::Value),
     /// A draft, read against the envelope — or the reason it was not a draft.
     Draft(Result<AskDraft, String>),
 }

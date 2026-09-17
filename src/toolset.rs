@@ -6,9 +6,9 @@
 //!
 //! The two tools this module DEFINES are read-only over the build
 //! `latest.json` names and over nothing else. The network tools live in their
-//! own modules ([`crate::fetch`], and `web_search` in phase C) and are assembled
-//! here by [`offered`], because what a desk may reach for is one question with
-//! one answer.
+//! own modules ([`crate::fetch`], [`crate::github`], and `web_search` in phase
+//! C) and are assembled here by [`offered`], because what a desk may reach for
+//! is one question with one answer.
 //!
 //! **Two guards, and they are the planner's own** (`crate::verbs`). Every
 //! stream id a model names is checked against Gyld's `ID_PATTERN` before it can
@@ -29,6 +29,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::bundle;
+use crate::github::Token;
 use crate::sources::{self, SourceIndex};
 use crate::tools::{Tool, ToolContext, ToolOutput, ToolPolicy, ToolRefusal};
 use crate::verbs::valid_stream_id;
@@ -81,11 +82,16 @@ pub fn local(context: &ToolContext) -> Vec<Arc<dyn Tool>> {
 /// that refuses as data and names the setting it is missing — rather than a
 /// note saying this supplier has never heard of it. What an absent `tools` key
 /// enables is the separate question [`on_by_default`] answers.
-pub fn offered(context: &ToolContext, policy: &ToolPolicy) -> Vec<Arc<dyn Tool>> {
+pub fn offered(context: &ToolContext, policy: &ToolPolicy, token: &Token) -> Vec<Arc<dyn Tool>> {
     let mut held = local(context);
     held.push(crate::fetch::FetchUrl::offering(
         policy.fetch.clone(),
         policy.budgets.timeout,
+    ));
+    held.push(crate::github::GitHub::offering(
+        token.clone(),
+        policy.budgets.timeout,
+        policy.budgets.bytes,
     ));
     held
 }
@@ -96,10 +102,17 @@ pub fn offered(context: &ToolContext, policy: &ToolPolicy) -> Vec<Arc<dyn Tool>>
 /// in. A network one only when the thing it needs is already there, which is
 /// how "local tools are on by default, network tools are off until configured"
 /// stays one rule rather than a second allow-list (11.2).
-pub fn on_by_default(policy: &ToolPolicy) -> Vec<String> {
+pub fn on_by_default(policy: &ToolPolicy, token: &Token) -> Vec<String> {
     let mut held = vec![READ_SOURCE.to_string(), GYLD_QUERY.to_string()];
     if !policy.fetch.hosts.is_empty() {
         held.push(crate::fetch::FETCH_URL.to_string());
+    }
+    // A token, because GitHub rate-limits an unauthenticated caller to sixty
+    // requests an hour and refuses code search outright: a `github` that is on
+    // by default and spends its trickle on the first question is worse than one
+    // a desk turns on deliberately.
+    if token.found() {
+        held.push(crate::github::GITHUB.to_string());
     }
     held
 }
@@ -108,8 +121,8 @@ pub fn on_by_default(policy: &ToolPolicy) -> Vec<String> {
 /// named none, and why each network tool is or is not among them.
 ///
 /// It names hosts and counts, never a credential and never a page.
-pub fn says(policy: &ToolPolicy) -> String {
-    let mut held = format!("tools on by default {:?}", on_by_default(policy));
+pub fn says(policy: &ToolPolicy, token: &Token) -> String {
+    let mut held = format!("tools on by default {:?}", on_by_default(policy, token));
     if policy.fetch.hosts.is_empty() {
         held.push_str("; fetch_url off (`fetch_hosts` names no host)");
     } else {
@@ -118,6 +131,15 @@ pub fn says(policy: &ToolPolicy) -> String {
             policy.fetch.hosts, policy.fetch.bytes
         ));
     }
+    held.push_str(&format!(
+        "; github has {}{}",
+        token.source.says(),
+        if token.found() {
+            ""
+        } else {
+            ", so it is off by default"
+        }
+    ));
     held
 }
 
@@ -1231,15 +1253,19 @@ mod tests {
     fn a_network_tool_is_offered_always_and_enabled_only_once_it_is_configured() {
         let context = fixture("network");
         let bare = ToolPolicy::default();
+        // No token, whatever this machine's own `gh` would say: the discovery
+        // is threaded in rather than reached for, so the test is the same on
+        // every desk.
+        let none = crate::github::Token::default();
         assert_eq!(
-            on_by_default(&bare),
+            on_by_default(&bare, &none),
             vec![READ_SOURCE.to_string(), GYLD_QUERY.to_string()],
             "nobody wrote `tools` and nobody wrote `fetch_hosts`, so the local two"
         );
 
         // Offered is not enabled: the tool EXISTS so a desk can name it, and
         // the default allow-list simply does not carry it.
-        let names: Vec<String> = offered(&context, &bare)
+        let names: Vec<String> = offered(&context, &bare, &none)
             .iter()
             .map(|tool| tool.name().to_string())
             .collect();
@@ -1248,8 +1274,8 @@ mod tests {
             "{names:?}"
         );
         let (registry, notes) = ToolRegistry::build(
-            &bare.allowing(on_by_default(&bare)),
-            offered(&context, &bare),
+            &bare.allowing(on_by_default(&bare, &none)),
+            offered(&context, &bare, &none),
         );
         assert_eq!(registry.names(), vec![GYLD_QUERY, READ_SOURCE]);
         assert!(notes.is_empty(), "{notes:?}");
@@ -1263,10 +1289,10 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(on_by_default(&configured).contains(&crate::fetch::FETCH_URL.to_string()));
+        assert!(on_by_default(&configured, &none).contains(&crate::fetch::FETCH_URL.to_string()));
         let (registry, notes) = ToolRegistry::build(
-            &configured.allowing(on_by_default(&configured)),
-            offered(&context, &configured),
+            &configured.allowing(on_by_default(&configured, &none)),
+            offered(&context, &configured, &none),
         );
         assert_eq!(
             registry.names(),
@@ -1281,8 +1307,8 @@ mod tests {
             ..Default::default()
         };
         let (registry, notes) = ToolRegistry::build(
-            &named.allowing(on_by_default(&named)),
-            offered(&context, &named),
+            &named.allowing(on_by_default(&named, &none)),
+            offered(&context, &named, &none),
         );
         assert_eq!(registry.names(), vec![crate::fetch::FETCH_URL]);
         assert!(notes.is_empty(), "{notes:?}");
@@ -1294,10 +1320,27 @@ mod tests {
         assert!(!answered.ok);
         assert!(answered.summary.contains("`fetch_hosts`"), "{answered:?}");
 
-        // The attach line says which, and where — hosts and counts, no secret.
-        assert!(says(&bare).contains("fetch_url off"), "{}", says(&bare));
-        let said = says(&configured);
+        // A token is github's own switch, and it is the only one: a desk with
+        // no token does not get it by default, and a desk with one does.
+        let held = crate::github::Token::of(crate::github::Source::Env, Some("t".to_string()));
+        assert!(!on_by_default(&bare, &none).contains(&crate::github::GITHUB.to_string()));
+        assert!(on_by_default(&bare, &held).contains(&crate::github::GITHUB.to_string()));
+
+        // The attach line says which, and where — hosts, counts and the token's
+        // SOURCE, never a secret.
+        let bare_says = says(&bare, &none);
+        assert!(bare_says.contains("fetch_url off"), "{bare_says}");
+        assert!(
+            bare_says.contains("github has no token (unauthenticated), so it is off by default"),
+            "{bare_says}"
+        );
+        let said = says(&configured, &none);
         assert!(said.contains("docs.rs") && said.contains("4096"), "{said}");
+        let with_token = says(&configured, &held);
+        assert!(
+            with_token.contains("github has a token from GITHUB_TOKEN"),
+            "{with_token}"
+        );
         let _ = std::fs::remove_dir_all(context.build.parent().unwrap().parent().unwrap());
     }
 }

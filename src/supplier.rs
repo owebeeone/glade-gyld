@@ -183,11 +183,12 @@ pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSuppli
     // whether there is one — that is the refusal's business, per request.
     let resolved = config.resolve_agent();
     eprintln!("glade-gyld: agent {}", resolved.says());
-    // And which tools this desk gets, and where the network ones may go. Hosts
-    // and counts only: no key, no token and no page.
+    // And which tools this desk gets, and where the network ones may go. Hosts,
+    // counts and the SOURCE of the github token: no key, no token value and no
+    // page. The token is discovered here, once, for the life of the process.
     eprintln!(
         "glade-gyld: agent {}",
-        toolset::says(&resolved.config.tools)
+        toolset::says(&resolved.config.tools, crate::github::discovered())
     );
     for note in resolved.notes.iter() {
         eprintln!("glade-gyld: agent config: {note}");
@@ -769,12 +770,13 @@ async fn consult_run(
             // The allow-list a desk that wrote none means, resolved against
             // what IS configured: the local tools always, and a network tool
             // only where the thing it needs is already there (11.2, 11.7).
+            let token = crate::github::discovered();
             let policy = model_config
                 .tools
-                .allowing(toolset::on_by_default(&model_config.tools));
+                .allowing(toolset::on_by_default(&model_config.tools, token));
             let (registry, said) = tools::ToolRegistry::build(
                 &policy,
-                toolset::offered(&context, &model_config.tools),
+                toolset::offered(&context, &model_config.tools, token),
             );
             for note in said.into_iter() {
                 let _ = tx.send(Reply::Note(note));

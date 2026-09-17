@@ -4,10 +4,11 @@
 //! one call may cost. This is the SET: the two concrete tools a build can be
 //! asked about, and the one function the supplier calls to offer them.
 //!
-//! Everything here is read-only over the build `latest.json` names, and over
-//! nothing else. There is no network tool in this module: `fetch_url`, `github`
-//! and `web_search` are phases B and C, and each arrives with its own
-//! configuration and its own refusal when that configuration is absent.
+//! The two tools this module DEFINES are read-only over the build
+//! `latest.json` names and over nothing else. The network tools live in their
+//! own modules ([`crate::fetch`], and `web_search` in phase C) and are assembled
+//! here by [`offered`], because what a desk may reach for is one question with
+//! one answer.
 //!
 //! **Two guards, and they are the planner's own** (`crate::verbs`). Every
 //! stream id a model names is checked against Gyld's `ID_PATTERN` before it can
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::bundle;
 use crate::sources::{self, SourceIndex};
-use crate::tools::{Tool, ToolContext, ToolOutput, ToolRefusal};
+use crate::tools::{Tool, ToolContext, ToolOutput, ToolPolicy, ToolRefusal};
 use crate::verbs::valid_stream_id;
 
 /// The tool that reads a passage out of the build's source index.
@@ -70,6 +71,54 @@ pub fn local(context: &ToolContext) -> Vec<Arc<dyn Tool>> {
             context: context.clone(),
         }),
     ]
+}
+
+/// Every tool this supplier can offer this desk: the local ones over
+/// `context`'s build, and the network ones of 11.7 under `policy`.
+///
+/// Offered is not enabled. A network tool is constructed whatever the
+/// configuration says, so that a desk which NAMES it in `tools` gets a tool
+/// that refuses as data and names the setting it is missing — rather than a
+/// note saying this supplier has never heard of it. What an absent `tools` key
+/// enables is the separate question [`on_by_default`] answers.
+pub fn offered(context: &ToolContext, policy: &ToolPolicy) -> Vec<Arc<dyn Tool>> {
+    let mut held = local(context);
+    held.push(crate::fetch::FetchUrl::offering(
+        policy.fetch.clone(),
+        policy.budgets.timeout,
+    ));
+    held
+}
+
+/// The tools a desk that wrote no `tools` key gets.
+///
+/// The local ones always — they read the build this answer is already grounded
+/// in. A network one only when the thing it needs is already there, which is
+/// how "local tools are on by default, network tools are off until configured"
+/// stays one rule rather than a second allow-list (11.2).
+pub fn on_by_default(policy: &ToolPolicy) -> Vec<String> {
+    let mut held = vec![READ_SOURCE.to_string(), GYLD_QUERY.to_string()];
+    if !policy.fetch.hosts.is_empty() {
+        held.push(crate::fetch::FETCH_URL.to_string());
+    }
+    held
+}
+
+/// The one line the attach log carries about tools: what this desk gets when it
+/// named none, and why each network tool is or is not among them.
+///
+/// It names hosts and counts, never a credential and never a page.
+pub fn says(policy: &ToolPolicy) -> String {
+    let mut held = format!("tools on by default {:?}", on_by_default(policy));
+    if policy.fetch.hosts.is_empty() {
+        held.push_str("; fetch_url off (`fetch_hosts` names no host)");
+    } else {
+        held.push_str(&format!(
+            "; fetch_url may reach {:?} (up to {} bytes a page)",
+            policy.fetch.hosts, policy.fetch.bytes
+        ));
+    }
+    held
 }
 
 /// Read one cited passage, or a document's passages, out of the build's index.
@@ -1175,6 +1224,80 @@ mod tests {
                 "{input} was pretty-printed, which spends the budget on whitespace"
             );
         }
+        let _ = std::fs::remove_dir_all(context.build.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn a_network_tool_is_offered_always_and_enabled_only_once_it_is_configured() {
+        let context = fixture("network");
+        let bare = ToolPolicy::default();
+        assert_eq!(
+            on_by_default(&bare),
+            vec![READ_SOURCE.to_string(), GYLD_QUERY.to_string()],
+            "nobody wrote `tools` and nobody wrote `fetch_hosts`, so the local two"
+        );
+
+        // Offered is not enabled: the tool EXISTS so a desk can name it, and
+        // the default allow-list simply does not carry it.
+        let names: Vec<String> = offered(&context, &bare)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(
+            names.contains(&crate::fetch::FETCH_URL.to_string()),
+            "{names:?}"
+        );
+        let (registry, notes) = ToolRegistry::build(
+            &bare.allowing(on_by_default(&bare)),
+            offered(&context, &bare),
+        );
+        assert_eq!(registry.names(), vec![GYLD_QUERY, READ_SOURCE]);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // `fetch_hosts` is the switch: writing it turns the tool on for a desk
+        // that named no `tools` at all.
+        let configured = ToolPolicy {
+            fetch: crate::tools::FetchPolicy {
+                hosts: vec!["docs.rs".to_string()],
+                bytes: 4096,
+            },
+            ..Default::default()
+        };
+        assert!(on_by_default(&configured).contains(&crate::fetch::FETCH_URL.to_string()));
+        let (registry, notes) = ToolRegistry::build(
+            &configured.allowing(on_by_default(&configured)),
+            offered(&context, &configured),
+        );
+        assert_eq!(
+            registry.names(),
+            vec![crate::fetch::FETCH_URL, GYLD_QUERY, READ_SOURCE]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // A desk that NAMES it with no hosts gets it, and it refuses as data
+        // naming the setting — not a note saying the tool does not exist.
+        let named = ToolPolicy {
+            allow: Some(vec![crate::fetch::FETCH_URL.to_string()]),
+            ..Default::default()
+        };
+        let (registry, notes) = ToolRegistry::build(
+            &named.allowing(on_by_default(&named)),
+            offered(&context, &named),
+        );
+        assert_eq!(registry.names(), vec![crate::fetch::FETCH_URL]);
+        assert!(notes.is_empty(), "{notes:?}");
+        let answered = registry.call(
+            "toolu_1",
+            crate::fetch::FETCH_URL,
+            &json!({"url": "https://docs.rs/"}),
+        );
+        assert!(!answered.ok);
+        assert!(answered.summary.contains("`fetch_hosts`"), "{answered:?}");
+
+        // The attach line says which, and where — hosts and counts, no secret.
+        assert!(says(&bare).contains("fetch_url off"), "{}", says(&bare));
+        let said = says(&configured);
+        assert!(said.contains("docs.rs") && said.contains("4096"), "{said}");
         let _ = std::fs::remove_dir_all(context.build.parent().unwrap().parent().unwrap());
     }
 }

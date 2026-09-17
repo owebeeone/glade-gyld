@@ -45,6 +45,14 @@ pub const DEFAULT_TOOL_RESULT_BYTES: usize = 16 * 1024;
 /// The wall clock one tool call gets.
 pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 20;
 
+/// What one `fetch_url` call reads off the socket before it stops.
+///
+/// 256 KiB, which is a long article and a short specification. It is the READ
+/// cap and not the result cap: the body is cut here so a model's choice cannot
+/// pull a video into memory, and [`DEFAULT_TOOL_RESULT_BYTES`] then bounds what
+/// of it reaches the model.
+pub const DEFAULT_FETCH_BYTES: usize = 256 * 1024;
+
 /// The most of a prior turn's tool result that is REPLAYED into a follow-up.
 ///
 /// Much smaller than the byte cap, and deliberately. The cap bounds what one
@@ -151,6 +159,51 @@ impl Default for ToolBudgets {
 pub struct ToolPolicy {
     pub allow: Option<Vec<String>>,
     pub budgets: ToolBudgets,
+    /// Where `fetch_url` may go, and how much of a page it may read
+    /// (GyldAskAgent.md 11.7). Empty hosts is the default and means the tool is
+    /// not offered at all.
+    pub fetch: FetchPolicy,
+}
+
+impl ToolPolicy {
+    /// This policy with its allow-list RESOLVED: whatever the desk wrote, or
+    /// the tools that are on when nobody wrote a `tools` key.
+    ///
+    /// The default set is computed rather than constant because it depends on
+    /// what is configured — a network tool is on by default only when the thing
+    /// it needs is already there ([`crate::toolset::on_by_default`]). Naming a
+    /// tool in `tools` still wins either way, including naming one whose
+    /// configuration is absent: it is then enabled, and refuses as data.
+    pub fn allowing(&self, by_default: Vec<String>) -> ToolPolicy {
+        ToolPolicy {
+            allow: Some(self.allow.clone().unwrap_or(by_default)),
+            budgets: self.budgets,
+            fetch: self.fetch.clone(),
+        }
+    }
+}
+
+/// What `fetch_url` is allowed to reach.
+///
+/// `hosts` is the whole of the tool's authority. Empty — the default — is a
+/// desk that has not configured it, and the tool is not offered. `["*"]` is the
+/// owner saying *any host*, which is documented as a choice and is still not a
+/// licence to reach a private or loopback address: one of those has to be named
+/// outright.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchPolicy {
+    pub hosts: Vec<String>,
+    /// What one call reads off the socket, in bytes.
+    pub bytes: usize,
+}
+
+impl Default for FetchPolicy {
+    fn default() -> FetchPolicy {
+        FetchPolicy {
+            hosts: Vec::new(),
+            bytes: DEFAULT_FETCH_BYTES,
+        }
+    }
 }
 
 /// Where the local tools read from: the build `latest.json` names.
@@ -568,7 +621,7 @@ pub(crate) mod tests {
         ];
         let policy = ToolPolicy {
             allow: Some(vec!["read_source".into(), "fetch_url".into()]),
-            budgets: ToolBudgets::default(),
+            ..Default::default()
         };
         let (held, notes) = ToolRegistry::build(&policy, offered);
         assert_eq!(held.names(), vec!["read_source"], "only what was allowed");
@@ -608,6 +661,47 @@ pub(crate) mod tests {
         );
         assert!(off.names().is_empty());
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn an_absent_allow_list_resolves_to_the_tools_that_are_on_by_default() {
+        let by_default = vec!["read_source".to_string(), "gyld_query".to_string()];
+        let absent = ToolPolicy::default().allowing(by_default.clone());
+        assert_eq!(
+            absent.allow.as_deref(),
+            Some(by_default.as_slice()),
+            "nobody wrote `tools`, so the default set is the list"
+        );
+
+        // A desk that DID write one keeps it, including a tool whose own
+        // configuration is absent: naming it enables it, and it refuses as data.
+        let written = ToolPolicy {
+            allow: Some(vec!["fetch_url".to_string()]),
+            ..Default::default()
+        }
+        .allowing(by_default);
+        assert_eq!(
+            written.allow.as_deref(),
+            Some(&["fetch_url".to_string()][..])
+        );
+
+        // An EMPTY list is still a desk that turned them off.
+        let off = ToolPolicy {
+            allow: Some(Vec::new()),
+            ..Default::default()
+        }
+        .allowing(vec!["read_source".to_string()]);
+        assert_eq!(off.allow.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn fetch_url_reaches_nowhere_until_a_desk_says_where() {
+        let fetch = FetchPolicy::default();
+        assert!(
+            fetch.hosts.is_empty(),
+            "a network tool is off until configured (11.2)"
+        );
+        assert_eq!(fetch.bytes, DEFAULT_FETCH_BYTES);
     }
 
     #[test]

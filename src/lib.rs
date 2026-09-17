@@ -44,6 +44,8 @@
 //!   budgets one turn's tool use runs under (section 11); the loop that drives
 //!   them is [`model::consult`].
 //! * [`toolset`] — the tools this supplier actually offers over a build.
+//! * [`fetch`] — `fetch_url`: one page, from a host the desk allow-listed
+//!   (section 11.7).
 //! * [`supplier`] — [`serve`], [`GyldConfig`], [`GyldSupplier`]: attach and serve,
 //!   publishing the bundle root's current build the moment it is serving and
 //!   making the first build itself when the root has none.
@@ -54,6 +56,7 @@ pub mod bundle;
 pub mod conversation;
 pub mod envelope;
 pub mod exec;
+pub mod fetch;
 pub mod model;
 pub mod prompt;
 pub mod publish;

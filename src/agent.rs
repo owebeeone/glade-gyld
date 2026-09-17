@@ -35,8 +35,8 @@ use serde::Deserialize;
 
 use crate::model::{ModelConfig, Shape, DEFAULT_AGENT_MODEL, DEFAULT_BASE_URL};
 use crate::tools::{
-    ToolBudgets, ToolPolicy, DEFAULT_TOOL_RESULT_BYTES, DEFAULT_TOOL_STEPS,
-    DEFAULT_TOOL_TIMEOUT_SECS,
+    FetchPolicy, ToolBudgets, ToolPolicy, DEFAULT_FETCH_BYTES, DEFAULT_TOOL_RESULT_BYTES,
+    DEFAULT_TOOL_STEPS, DEFAULT_TOOL_TIMEOUT_SECS,
 };
 
 /// The endpoint, when the environment names one. The name Anthropic-shaped
@@ -224,6 +224,12 @@ pub struct AgentOverrides {
     pub tool_result_bytes: Option<usize>,
     /// The wall clock one tool call gets.
     pub tool_timeout_secs: Option<u64>,
+    /// The hosts `fetch_url` may reach. `None` and `Some(vec![])` are the same
+    /// thing here — nowhere — and the tool is not offered
+    /// (GyldAskAgent.md 11.7).
+    pub fetch_hosts: Option<Vec<String>>,
+    /// What one `fetch_url` call reads off the socket.
+    pub fetch_bytes: Option<usize>,
 }
 
 impl AgentOverrides {
@@ -249,6 +255,8 @@ impl AgentOverrides {
             tool_steps: higher.tool_steps.or(self.tool_steps),
             tool_result_bytes: higher.tool_result_bytes.or(self.tool_result_bytes),
             tool_timeout_secs: higher.tool_timeout_secs.or(self.tool_timeout_secs),
+            fetch_hosts: higher.fetch_hosts.clone().or(self.fetch_hosts),
+            fetch_bytes: higher.fetch_bytes.or(self.fetch_bytes),
         }
     }
 
@@ -373,6 +381,8 @@ impl AgentOverrides {
                 tool_steps: held.tool_steps,
                 tool_result_bytes: held.tool_result_bytes,
                 tool_timeout_secs: held.tool_timeout_secs,
+                fetch_hosts: held.fetch_hosts,
+                fetch_bytes: held.fetch_bytes,
             },
             notes,
         )
@@ -413,6 +423,10 @@ struct AgentFile {
     tool_result_bytes: Option<usize>,
     #[serde(default)]
     tool_timeout_secs: Option<u64>,
+    #[serde(default)]
+    fetch_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    fetch_bytes: Option<usize>,
 }
 
 impl AgentFile {
@@ -435,6 +449,8 @@ impl AgentFile {
         "tool_steps",
         "tool_result_bytes",
         "tool_timeout_secs",
+        "fetch_hosts",
+        "fetch_bytes",
     ];
 }
 
@@ -536,6 +552,16 @@ pub fn resolve_from(bundle_root: &Path, merged: AgentOverrides, notes: Vec<Strin
                             .tool_timeout_secs
                             .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS),
                     ),
+                },
+                fetch: FetchPolicy {
+                    hosts: merged
+                        .fetch_hosts
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|host| host.trim().to_ascii_lowercase())
+                        .filter(|host| !host.is_empty())
+                        .collect(),
+                    bytes: merged.fetch_bytes.unwrap_or(DEFAULT_FETCH_BYTES),
                 },
             },
         },
@@ -716,7 +742,9 @@ mod tests {
             "tools": ["read_source"],
             "tool_steps": 3,
             "tool_result_bytes": 4096,
-            "tool_timeout_secs": 9
+            "tool_timeout_secs": 9,
+            "fetch_hosts": ["docs.rs", " GitHub.com "],
+            "fetch_bytes": 4096
         }"#;
         let (held, notes) = AgentOverrides::from_json(text, Path::new("config.json"));
         assert!(notes.is_empty(), "{notes:?}");
@@ -751,9 +779,36 @@ mod tests {
             }
         );
 
+        assert_eq!(
+            config.tools.fetch,
+            FetchPolicy {
+                hosts: vec!["docs.rs".to_string(), "github.com".to_string()],
+                bytes: 4096
+            },
+            "a host is trimmed and lowercased, because a URL's host is compared \
+             against it"
+        );
+
         // An absolute key file is taken as it stands.
         let (held, _) = AgentOverrides::from_json(r#"{"key_file": "/etc/k"}"#, Path::new("c"));
         assert_eq!(resolved(held).key_file, PathBuf::from("/etc/k"));
+    }
+
+    #[test]
+    fn a_desk_that_named_no_fetch_hosts_has_nowhere_to_fetch_from() {
+        let config = resolved(AgentOverrides::default());
+        assert_eq!(
+            config.tools.fetch,
+            FetchPolicy::default(),
+            "`fetch_hosts` is empty by default, so `fetch_url` is off until configured"
+        );
+        assert!(config.tools.fetch.hosts.is_empty());
+        assert_eq!(config.tools.fetch.bytes, DEFAULT_FETCH_BYTES);
+
+        // The owner's own choice, written down as one.
+        let (held, notes) = AgentOverrides::from_json(r#"{"fetch_hosts": ["*"]}"#, Path::new("c"));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(resolved(held).tools.fetch.hosts, vec!["*".to_string()]);
     }
 
     #[test]

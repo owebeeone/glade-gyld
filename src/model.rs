@@ -1358,7 +1358,10 @@ fn number(value: Option<&serde_json::Value>, field: &str) -> u64 {
 /// Strip anything that could be a credential out of a transport error before it
 /// becomes data. A reqwest error names the URL, never a header, but a redacted
 /// query is cheaper than trusting that forever.
-fn scrub(said: &str) -> String {
+///
+/// `pub(crate)` because the network tools of section 11.7 report their own
+/// transport failures as data and must redact them the same way.
+pub(crate) fn scrub(said: &str) -> String {
     said.split_whitespace()
         .map(|word| match word.split_once('?') {
             Some((head, _)) => format!("{head}?…"),

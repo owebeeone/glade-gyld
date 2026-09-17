@@ -183,6 +183,12 @@ pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSuppli
     // whether there is one — that is the refusal's business, per request.
     let resolved = config.resolve_agent();
     eprintln!("glade-gyld: agent {}", resolved.says());
+    // And which tools this desk gets, and where the network ones may go. Hosts
+    // and counts only: no key, no token and no page.
+    eprintln!(
+        "glade-gyld: agent {}",
+        toolset::says(&resolved.config.tools)
+    );
     for note in resolved.notes.iter() {
         eprintln!("glade-gyld: agent config: {note}");
     }
@@ -760,8 +766,16 @@ async fn consult_run(
             // grounded in — so a tool's answer and a citation can never name
             // two different snapshots (GyldAskAgent.md 11.6).
             let context = tools::ToolContext::beside(&consult.sources);
-            let (registry, said) =
-                tools::ToolRegistry::build(&model_config.tools, toolset::local(&context));
+            // The allow-list a desk that wrote none means, resolved against
+            // what IS configured: the local tools always, and a network tool
+            // only where the thing it needs is already there (11.2, 11.7).
+            let policy = model_config
+                .tools
+                .allowing(toolset::on_by_default(&model_config.tools));
+            let (registry, said) = tools::ToolRegistry::build(
+                &policy,
+                toolset::offered(&context, &model_config.tools),
+            );
             for note in said.into_iter() {
                 let _ = tx.send(Reply::Note(note));
             }

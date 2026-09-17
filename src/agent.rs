@@ -24,9 +24,13 @@
 //! unusable, which is the whole reason this module is not a `ModelConfig` with
 //! defaults in it.
 //!
-//! **No key value is ever read here.** The key file's PATH is configuration;
-//! the key itself is read by the model client at the moment of the call
-//! ([`crate::model::discover_key`]) and by nothing else.
+//! **No key is ever READ here.** A key file's path is configuration, and so is
+//! the one key a desk may write inline (`search_key`, which a provider's own
+//! dashboard hands out as a string). Neither value is opened, logged or
+//! recorded by this module: the model key is read by the model client at the
+//! moment of the call ([`crate::model::discover_key`]), the search key by
+//! [`crate::websearch::SearchKey`] at the moment of ITS call, and by nothing
+//! else.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,6 +42,7 @@ use crate::tools::{
     FetchPolicy, ToolBudgets, ToolPolicy, DEFAULT_FETCH_BYTES, DEFAULT_TOOL_RESULT_BYTES,
     DEFAULT_TOOL_STEPS, DEFAULT_TOOL_TIMEOUT_SECS,
 };
+use crate::websearch::{Provider, SearchKey, SearchPolicy};
 
 /// The endpoint, when the environment names one. The name Anthropic-shaped
 /// clients already use, including the dabeest launchers.
@@ -230,6 +235,16 @@ pub struct AgentOverrides {
     pub fetch_hosts: Option<Vec<String>>,
     /// What one `fetch_url` call reads off the socket.
     pub fetch_bytes: Option<usize>,
+    /// Which provider `web_search` goes through. `None` is no provider, and
+    /// the tool is not offered (GyldAskAgent.md 11.8).
+    pub search_provider: Option<Provider>,
+    /// The SearXNG base URL.
+    pub search_url: Option<String>,
+    /// The Brave key, as the desk wrote it.
+    pub search_key: Option<String>,
+    /// A file holding the Brave key, resolved against the bundle root unless
+    /// it is absolute, and mode checked at the moment of the call.
+    pub search_key_file: Option<PathBuf>,
 }
 
 impl AgentOverrides {
@@ -257,6 +272,10 @@ impl AgentOverrides {
             tool_timeout_secs: higher.tool_timeout_secs.or(self.tool_timeout_secs),
             fetch_hosts: higher.fetch_hosts.clone().or(self.fetch_hosts),
             fetch_bytes: higher.fetch_bytes.or(self.fetch_bytes),
+            search_provider: higher.search_provider.or(self.search_provider),
+            search_url: higher.search_url.clone().or(self.search_url),
+            search_key: higher.search_key.clone().or(self.search_key),
+            search_key_file: higher.search_key_file.clone().or(self.search_key_file),
         }
     }
 
@@ -364,6 +383,18 @@ impl AgentOverrides {
             },
             None => None,
         };
+        // A misspelt provider is a note and NO provider, never the other one:
+        // a desk's questions must not go somewhere it did not choose.
+        let search_provider = match held.search_provider.as_deref() {
+            Some(text) => match Provider::parse(text) {
+                Ok(provider) => Some(provider),
+                Err(reason) => {
+                    notes.push(format!("{}: {reason}", path.display()));
+                    None
+                }
+            },
+            None => None,
+        };
         (
             AgentOverrides {
                 model: held.model,
@@ -383,6 +414,10 @@ impl AgentOverrides {
                 tool_timeout_secs: held.tool_timeout_secs,
                 fetch_hosts: held.fetch_hosts,
                 fetch_bytes: held.fetch_bytes,
+                search_provider,
+                search_url: held.search_url,
+                search_key: held.search_key,
+                search_key_file: held.search_key_file.map(PathBuf::from),
             },
             notes,
         )
@@ -427,6 +462,14 @@ struct AgentFile {
     fetch_hosts: Option<Vec<String>>,
     #[serde(default)]
     fetch_bytes: Option<usize>,
+    #[serde(default)]
+    search_provider: Option<String>,
+    #[serde(default)]
+    search_url: Option<String>,
+    #[serde(default)]
+    search_key: Option<String>,
+    #[serde(default)]
+    search_key_file: Option<String>,
 }
 
 impl AgentFile {
@@ -451,6 +494,10 @@ impl AgentFile {
         "tool_timeout_secs",
         "fetch_hosts",
         "fetch_bytes",
+        "search_provider",
+        "search_url",
+        "search_key",
+        "search_key_file",
     ];
 }
 
@@ -562,6 +609,23 @@ pub fn resolve_from(bundle_root: &Path, merged: AgentOverrides, notes: Vec<Strin
                         .filter(|host| !host.is_empty())
                         .collect(),
                     bytes: merged.fetch_bytes.unwrap_or(DEFAULT_FETCH_BYTES),
+                },
+                search: SearchPolicy {
+                    provider: merged.search_provider,
+                    url: merged.search_url.unwrap_or_default().trim().to_string(),
+                    // The PATH is resolved here, against the app's own
+                    // directory exactly as the model key file is. The value
+                    // behind it is not read here and not read at attach.
+                    key: SearchKey::of(
+                        merged.search_key,
+                        merged.search_key_file.map(|path| {
+                            if path.is_absolute() {
+                                path
+                            } else {
+                                bundle_root.join(path)
+                            }
+                        }),
+                    ),
                 },
             },
         },
@@ -744,7 +808,10 @@ mod tests {
             "tool_result_bytes": 4096,
             "tool_timeout_secs": 9,
             "fetch_hosts": ["docs.rs", " GitHub.com "],
-            "fetch_bytes": 4096
+            "fetch_bytes": 4096,
+            "search_provider": "searxng",
+            "search_url": " http://searx.lan:8888/ ",
+            "search_key_file": "agent/search-key"
         }"#;
         let (held, notes) = AgentOverrides::from_json(text, Path::new("config.json"));
         assert!(notes.is_empty(), "{notes:?}");
@@ -789,9 +856,79 @@ mod tests {
              against it"
         );
 
-        // An absolute key file is taken as it stands.
+        assert_eq!(config.tools.search.provider, Some(Provider::SearxNG));
+        assert_eq!(
+            config.tools.search.url, "http://searx.lan:8888/",
+            "trimmed, and otherwise as the desk wrote it"
+        );
+        assert!(config.tools.search.configured());
+        assert_eq!(
+            config.tools.search.says(),
+            "web_search through searxng at http://searx.lan:8888/"
+        );
+
+        // An absolute key file is taken as it stands, and so is an absolute
+        // search key file; a relative one is the app's own directory.
         let (held, _) = AgentOverrides::from_json(r#"{"key_file": "/etc/k"}"#, Path::new("c"));
         assert_eq!(resolved(held).key_file, PathBuf::from("/etc/k"));
+    }
+
+    #[test]
+    fn a_desk_that_named_no_search_provider_has_nowhere_to_search() {
+        let config = resolved(AgentOverrides::default());
+        assert_eq!(
+            config.tools.search,
+            SearchPolicy::default(),
+            "`search_provider` is absent by default, so `web_search` is off until configured"
+        );
+        assert!(!config.tools.search.configured());
+        assert_eq!(
+            config.tools.search.says(),
+            "web_search off (`search_provider` names no provider)"
+        );
+
+        // A provider nobody has heard of is a NOTE and no provider — never the
+        // other one, because a desk's questions must not go somewhere it did
+        // not choose.
+        let (held, notes) =
+            AgentOverrides::from_json(r#"{"search_provider": "gogle"}"#, Path::new("c"));
+        assert_eq!(held.search_provider, None);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("unknown search provider \"gogle\""),
+            "{notes:?}"
+        );
+
+        // The key file is resolved against the app's own directory, and an
+        // absolute one is taken as it stands. The VALUE behind either is not
+        // read here.
+        let (held, _) = AgentOverrides::from_json(
+            r#"{"search_provider": "brave", "search_key_file": "agent/search-key"}"#,
+            Path::new("c"),
+        );
+        let search = resolved(held).tools.search;
+        assert!(search.configured());
+        assert_eq!(
+            search.says(),
+            "web_search through brave with a key from `search_key_file`"
+        );
+        assert!(
+            format!("{search:?}").contains("agent/search-key"),
+            "the PATH is configuration and is printable: {search:?}"
+        );
+
+        // An inline key is configuration too, and never printed.
+        let (held, _) = AgentOverrides::from_json(
+            r#"{"search_provider": "brave", "search_key": "sk-inline-secret"}"#,
+            Path::new("c"),
+        );
+        let search = resolved(held).tools.search;
+        assert!(search.configured());
+        assert!(
+            !format!("{search:?}").contains("sk-inline-secret"),
+            "{search:?}"
+        );
+        assert!(!search.says().contains("sk-inline-secret"));
     }
 
     #[test]

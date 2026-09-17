@@ -813,8 +813,12 @@ pub fn discover_key(key_file: &Path) -> Result<String, AskRefusal> {
 
 /// The key file's mode check, behind an explicit platform boundary (the
 /// workzone's conditional-compilation rule: no bare `#[cfg]` on a declaration).
+///
+/// `pub(crate)` because the search key gets the SAME check
+/// ([`crate::websearch::SearchKey`]): a second, slightly different rule about
+/// who may read a credential would be a rule nobody could state.
 #[cfg(unix)]
-mod platform {
+pub(crate) mod platform {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -841,7 +845,7 @@ mod platform {
 }
 
 #[cfg(not(unix))]
-mod platform {
+pub(crate) mod platform {
     use std::path::Path;
 
     use crate::ask::AskRefusal;

@@ -7,9 +7,9 @@
 //! The two tools this module DEFINES are read-only over the build
 //! `latest.json` names and over nothing else. The other local tool
 //! ([`crate::search`]) and the network ones ([`crate::fetch`],
-//! [`crate::github`], and `web_search` in phase C) live in their own modules
-//! and are assembled here by [`offered`], because what a desk may reach for is
-//! one question with one answer.
+//! [`crate::github`], [`crate::websearch`]) live in their own modules and are
+//! assembled here by [`offered`], because what a desk may reach for is one
+//! question with one answer.
 //!
 //! **Two guards, and they are the planner's own** (`crate::verbs`). Every
 //! stream id a model names is checked against Gyld's `ID_PATTERN` before it can
@@ -96,6 +96,10 @@ pub fn offered(context: &ToolContext, policy: &ToolPolicy, token: &Token) -> Vec
         policy.budgets.timeout,
         policy.budgets.bytes,
     ));
+    held.push(crate::websearch::WebSearch::offering(
+        policy.search.clone(),
+        policy.budgets.timeout,
+    ));
     held
 }
 
@@ -120,6 +124,12 @@ pub fn on_by_default(policy: &ToolPolicy, token: &Token) -> Vec<String> {
     // a desk turns on deliberately.
     if token.found() {
         held.push(crate::github::GITHUB.to_string());
+    }
+    // A provider AND the thing that provider needs. A desk that named
+    // `search_provider` and forgot the URL or the key has half a setting, and
+    // half a setting is not a tool — the attach line says which half.
+    if policy.search.configured() {
+        held.push(crate::websearch::WEB_SEARCH.to_string());
     }
     held
 }
@@ -147,6 +157,7 @@ pub fn says(policy: &ToolPolicy, token: &Token) -> String {
             ", so it is off by default"
         }
     ));
+    held.push_str(&format!("; {}", policy.search.says()));
     held
 }
 
@@ -1364,6 +1375,106 @@ mod tests {
         assert!(
             with_token.contains("github has a token from GITHUB_TOKEN"),
             "{with_token}"
+        );
+        assert!(
+            bare_says.contains("web_search off (`search_provider` names no provider)"),
+            "{bare_says}"
+        );
+        let _ = std::fs::remove_dir_all(context.build.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn web_search_is_offered_always_and_on_by_default_only_once_a_provider_answers() {
+        let context = fixture("search");
+        let none = crate::github::Token::default();
+        let bare = ToolPolicy::default();
+        assert!(!on_by_default(&bare, &none).contains(&crate::websearch::WEB_SEARCH.to_string()));
+
+        // Offered whatever the configuration says, so a desk that NAMES it
+        // gets a tool that refuses as data naming the settings it lacks —
+        // rather than a note saying this supplier has never heard of it.
+        let names: Vec<String> = offered(&context, &bare, &none)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(
+            names.contains(&crate::websearch::WEB_SEARCH.to_string()),
+            "{names:?}"
+        );
+
+        // Half a setting is not a tool, and the attach line says which half.
+        let half = ToolPolicy {
+            search: crate::websearch::SearchPolicy {
+                provider: Some(crate::websearch::Provider::Brave),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!on_by_default(&half, &none).contains(&crate::websearch::WEB_SEARCH.to_string()));
+        let said = says(&half, &none);
+        assert!(
+            said.contains("web_search off (`search_provider` is \"brave\""),
+            "{said}"
+        );
+
+        // Both halves, and it is on — with the provider NAMED on the attach
+        // line and no key anywhere near it.
+        let whole = ToolPolicy {
+            search: crate::websearch::SearchPolicy {
+                provider: Some(crate::websearch::Provider::SearxNG),
+                url: "http://searx.lan".into(),
+                key: Default::default(),
+            },
+            ..Default::default()
+        };
+        assert!(on_by_default(&whole, &none).contains(&crate::websearch::WEB_SEARCH.to_string()));
+        let (registry, notes) = ToolRegistry::build(
+            &whole.allowing(on_by_default(&whole, &none)),
+            offered(&context, &whole, &none),
+        );
+        assert_eq!(
+            registry.names(),
+            vec![
+                GYLD_QUERY,
+                READ_SOURCE,
+                crate::search::SEARCH_SOURCES,
+                crate::websearch::WEB_SEARCH
+            ]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        let said = says(&whole, &none);
+        assert!(
+            said.contains("web_search through searxng at http://searx.lan"),
+            "{said}"
+        );
+
+        // And a desk that names it with nothing configured gets the refusal,
+        // not a hang and not a crash.
+        let named = ToolPolicy {
+            allow: Some(vec![crate::websearch::WEB_SEARCH.to_string()]),
+            ..Default::default()
+        };
+        let (registry, notes) = ToolRegistry::build(
+            &named.allowing(on_by_default(&named, &none)),
+            offered(&context, &named, &none),
+        );
+        assert_eq!(registry.names(), vec![crate::websearch::WEB_SEARCH]);
+        assert!(notes.is_empty(), "{notes:?}");
+        let answered = registry.call(
+            "toolu_1",
+            crate::websearch::WEB_SEARCH,
+            &json!({"query": "iroh"}),
+        );
+        assert!(!answered.ok, "{answered:?}");
+        assert!(
+            answered
+                .summary
+                .contains("web_search is not configured on this desk"),
+            "{answered:?}"
+        );
+        assert!(
+            answered.summary.contains("`search_provider`"),
+            "{answered:?}"
         );
         let _ = std::fs::remove_dir_all(context.build.parent().unwrap().parent().unwrap());
     }

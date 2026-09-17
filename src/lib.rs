@@ -50,6 +50,8 @@
 //!   (section 11.7).
 //! * [`github`] — `github`: a README, a file, a tree and a code search over the
 //!   REST API, under a token discovered once at attach (section 11.7).
+//! * [`websearch`] — `web_search`: one query, through the provider the desk
+//!   configured, behind a trait with a SearXNG and a Brave backend (11.8).
 //! * [`supplier`] — [`serve`], [`GyldConfig`], [`GyldSupplier`]: attach and serve,
 //!   publishing the bundle root's current build the moment it is serving and
 //!   making the first build itself when the root has none.
@@ -71,6 +73,7 @@ pub mod supplier;
 pub mod tools;
 pub mod toolset;
 pub mod verbs;
+pub mod websearch;
 
 pub use agent::{
     resolve as resolve_agent, AgentOverrides, Compat, Resolved, AUTH_TOKEN_ENV, BASE_URL_ENV,
@@ -108,3 +111,7 @@ pub use tools::{
     DEFAULT_TOOL_RESULT_BYTES, DEFAULT_TOOL_STEPS, DEFAULT_TOOL_TIMEOUT_SECS,
 };
 pub use verbs::{Plan, PlannedWrite, ALLOWED_VERBS, NO_BUNDLE};
+pub use websearch::{
+    Provider, SearchHit, SearchKey, SearchPolicy, SearchProvider, WebSearch, BRAVE_API,
+    DEFAULT_WEB_HITS, MAX_WEB_HITS, WEB_SEARCH,
+};

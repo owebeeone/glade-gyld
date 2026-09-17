@@ -163,6 +163,10 @@ pub struct ToolPolicy {
     /// (GyldAskAgent.md 11.7). Empty hosts is the default and means the tool is
     /// not offered at all.
     pub fetch: FetchPolicy,
+    /// Which provider `web_search` goes through, and what that provider needs
+    /// (GyldAskAgent.md 11.8). No provider is the default and means the tool is
+    /// not offered at all.
+    pub search: crate::websearch::SearchPolicy,
 }
 
 impl ToolPolicy {
@@ -179,6 +183,7 @@ impl ToolPolicy {
             allow: Some(self.allow.clone().unwrap_or(by_default)),
             budgets: self.budgets,
             fetch: self.fetch.clone(),
+            search: self.search.clone(),
         }
     }
 }

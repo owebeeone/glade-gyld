@@ -206,9 +206,10 @@ impl Default for FetchPolicy {
     }
 }
 
-/// Where the local tools read from: the build `latest.json` names.
+/// Where the local tools read from: the build `latest.json` names, and the two
+/// directories a source index measures its own root against.
 ///
-/// One value rather than two paths threaded separately, because every local
+/// One value rather than four paths threaded separately, because every local
 /// tool answers about the SAME build the prompt was grounded in — an answer
 /// composed from a different build than the citations would be a quiet lie
 /// about which snapshot the reader is looking at.
@@ -218,18 +219,35 @@ pub struct ToolContext {
     pub build: PathBuf,
     /// Its `sources.json`, which is what [`crate::ask::Consultation`] carries.
     pub sources: PathBuf,
+    /// The Gyld checkout. A `sources.json` whose `root` is relative records
+    /// what it was measured against, and `"checkout"` means this — the
+    /// directory the emitting host was run out of
+    /// ([`crate::bundle::Layout::gyld_root`]).
+    pub checkout: PathBuf,
+    /// The staging repository the hosts are pointed at
+    /// ([`crate::bundle::Layout::stage`]), which is what a root recorded
+    /// `relative_to` `"repository"` was measured against.
+    pub repository: PathBuf,
 }
 
 impl ToolContext {
     /// The context of the consultation's own index — the build directory is the
-    /// directory that index is in, so the two can never name different builds.
-    pub fn beside(sources: &Path) -> ToolContext {
+    /// directory that index is in, so the two can never name different builds —
+    /// under the layout this supplier serves.
+    ///
+    /// The layout is taken whole rather than a resolved document root, because
+    /// which of its two directories a root is measured from is a fact the INDEX
+    /// records ([`crate::sources::SourceRoot::relative_to`]) and not one the
+    /// caller gets to decide.
+    pub fn beside(sources: &Path, layout: &crate::bundle::Layout) -> ToolContext {
         ToolContext {
             build: sources
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from(".")),
             sources: sources.to_path_buf(),
+            checkout: layout.gyld_root.clone(),
+            repository: layout.stage(),
         }
     }
 }
@@ -813,13 +831,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_context_is_the_build_the_index_is_in() {
-        let held = ToolContext::beside(Path::new("/b/builds/build-1/sources.json"));
+    fn the_context_is_the_build_the_index_is_in_and_the_layout_it_was_built_under() {
+        let layout = crate::bundle::Layout::new(PathBuf::from("/g"), PathBuf::from("/b"));
+        let held = ToolContext::beside(Path::new("/b/builds/build-1/sources.json"), &layout);
         assert_eq!(held.build, PathBuf::from("/b/builds/build-1"));
         assert_eq!(
             held.sources,
             PathBuf::from("/b/builds/build-1/sources.json"),
             "one build, so an answer and a citation can never name two"
+        );
+        assert_eq!(held.checkout, PathBuf::from("/g"), "the Gyld checkout");
+        assert_eq!(
+            held.repository,
+            PathBuf::from("/b/stage"),
+            "the repository the hosts are pointed at, which is not the checkout"
         );
     }
 }

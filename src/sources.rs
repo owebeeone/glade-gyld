@@ -33,18 +33,37 @@ pub const SOURCES_FORMAT: &str = "gyld.sources.v1";
 pub const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The workzone the cited documents were read out of, as the emitting run
-/// recorded it. Carried for provenance; never opened.
+/// recorded it.
+///
+/// Provenance for [`crate::sources::read`] and for a citation, and the ONE
+/// place that says where the documents themselves are: `given` is the root as
+/// the emitting run spelled it and [`SourceRoot::relative_to`] names what a
+/// relative spelling was measured against, which is the emitting host's own
+/// distinction and not the reader's ([`crate::search`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SourceRoot {
     #[serde(default)]
     pub option: String,
+    /// Which of the two spelled it: the option, or the default.
+    #[serde(default)]
+    pub chosen: Option<String>,
     #[serde(default)]
     pub given: String,
+    /// `"checkout"`, `"repository"`, or absent for a root that was already
+    /// absolute.
+    #[serde(default)]
+    pub relative_to: Option<String>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub found: bool,
 }
+
+/// A relative root measured from the Gyld checkout the host was run out of.
+pub const RELATIVE_TO_CHECKOUT: &str = "checkout";
+
+/// A relative root measured from the `--repository` the host was pointed at.
+pub const RELATIVE_TO_REPOSITORY: &str = "repository";
 
 /// One document the index was pointed at.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

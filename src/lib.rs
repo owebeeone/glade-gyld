@@ -44,6 +44,8 @@
 //!   budgets one turn's tool use runs under (section 11); the loop that drives
 //!   them is [`model::consult`].
 //! * [`toolset`] — the tools this supplier actually offers over a build.
+//! * [`search`] — `search_sources`: a plain-text pass over the documents the
+//!   build's index lists and over the build's own records (phase C).
 //! * [`fetch`] — `fetch_url`: one page, from a host the desk allow-listed
 //!   (section 11.7).
 //! * [`github`] — `github`: a README, a file, a tree and a code search over the
@@ -63,6 +65,7 @@ pub mod github;
 pub mod model;
 pub mod prompt;
 pub mod publish;
+pub mod search;
 pub mod sources;
 pub mod supplier;
 pub mod tools;
@@ -94,6 +97,7 @@ pub use model::{
 };
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
+pub use search::{SearchSources, SEARCH_SOURCES};
 pub use sources::{ResolvedSource, SourceIndex, SOURCES_FORMAT};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,

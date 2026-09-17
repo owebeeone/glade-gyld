@@ -5,10 +5,11 @@
 //! asked about, and the one function the supplier calls to offer them.
 //!
 //! The two tools this module DEFINES are read-only over the build
-//! `latest.json` names and over nothing else. The network tools live in their
-//! own modules ([`crate::fetch`], [`crate::github`], and `web_search` in phase
-//! C) and are assembled here by [`offered`], because what a desk may reach for
-//! is one question with one answer.
+//! `latest.json` names and over nothing else. The other local tool
+//! ([`crate::search`]) and the network ones ([`crate::fetch`],
+//! [`crate::github`], and `web_search` in phase C) live in their own modules
+//! and are assembled here by [`offered`], because what a desk may reach for is
+//! one question with one answer.
 //!
 //! **Two guards, and they are the planner's own** (`crate::verbs`). Every
 //! stream id a model names is checked against Gyld's `ID_PATTERN` before it can
@@ -20,8 +21,9 @@
 //! **Neither tool opens a cited document.** `read_source` answers out of the
 //! index's own passages, which is what section 5 already says the supplier
 //! resolves a citation from: *if the index does not carry a passage, there is
-//! no passage, and the model is told so*. A tool that grepped the corpus would
-//! be a different feature with a different design.
+//! no passage, and the model is told so*. The tool that DOES grep the corpus is
+//! the separate feature that turned out to be — [`crate::search`] — and it
+//! reaches only the documents this same index lists.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +73,7 @@ pub fn local(context: &ToolContext) -> Vec<Arc<dyn Tool>> {
         Arc::new(GyldQuery {
             context: context.clone(),
         }),
+        crate::search::SearchSources::offering(context),
     ]
 }
 
@@ -103,7 +106,11 @@ pub fn offered(context: &ToolContext, policy: &ToolPolicy, token: &Token) -> Vec
 /// how "local tools are on by default, network tools are off until configured"
 /// stays one rule rather than a second allow-list (11.2).
 pub fn on_by_default(policy: &ToolPolicy, token: &Token) -> Vec<String> {
-    let mut held = vec![READ_SOURCE.to_string(), GYLD_QUERY.to_string()];
+    let mut held = vec![
+        READ_SOURCE.to_string(),
+        GYLD_QUERY.to_string(),
+        crate::search::SEARCH_SOURCES.to_string(),
+    ];
     if !policy.fetch.hosts.is_empty() {
         held.push(crate::fetch::FETCH_URL.to_string());
     }
@@ -753,7 +760,7 @@ fn string(value: &Value, field: &str) -> String {
         .to_string()
 }
 
-fn text(value: &Value, field: &str) -> String {
+pub(crate) fn text(value: &Value, field: &str) -> String {
     value
         .get(field)
         .and_then(|v| v.as_str())
@@ -761,7 +768,7 @@ fn text(value: &Value, field: &str) -> String {
         .to_string()
 }
 
-fn array<'a>(value: &'a Value, field: &str) -> &'a [Value] {
+pub(crate) fn array<'a>(value: &'a Value, field: &str) -> &'a [Value] {
     value
         .get(field)
         .and_then(|v| v.as_array())
@@ -893,6 +900,8 @@ mod tests {
         );
         ToolContext {
             sources: build.join("sources.json"),
+            checkout: root.join("gyld"),
+            repository: root.join("stage"),
             build,
         }
     }
@@ -920,10 +929,13 @@ mod tests {
     }
 
     #[test]
-    fn both_local_tools_are_offered_and_declare_a_schema_each() {
+    fn every_local_tool_is_offered_and_declares_a_schema_each() {
         let context = fixture("offered");
         let registry = held(&context);
-        assert_eq!(registry.names(), vec![GYLD_QUERY, READ_SOURCE]);
+        assert_eq!(
+            registry.names(),
+            vec![GYLD_QUERY, READ_SOURCE, crate::search::SEARCH_SOURCES]
+        );
         for declared in registry.declarations().iter() {
             assert!(declared.get("description").is_some(), "{declared}");
             assert_eq!(declared["input_schema"]["type"], "object", "{declared}");
@@ -1259,8 +1271,12 @@ mod tests {
         let none = crate::github::Token::default();
         assert_eq!(
             on_by_default(&bare, &none),
-            vec![READ_SOURCE.to_string(), GYLD_QUERY.to_string()],
-            "nobody wrote `tools` and nobody wrote `fetch_hosts`, so the local two"
+            vec![
+                READ_SOURCE.to_string(),
+                GYLD_QUERY.to_string(),
+                crate::search::SEARCH_SOURCES.to_string()
+            ],
+            "nobody wrote `tools` and nobody wrote `fetch_hosts`, so the local three"
         );
 
         // Offered is not enabled: the tool EXISTS so a desk can name it, and
@@ -1277,7 +1293,10 @@ mod tests {
             &bare.allowing(on_by_default(&bare, &none)),
             offered(&context, &bare, &none),
         );
-        assert_eq!(registry.names(), vec![GYLD_QUERY, READ_SOURCE]);
+        assert_eq!(
+            registry.names(),
+            vec![GYLD_QUERY, READ_SOURCE, crate::search::SEARCH_SOURCES]
+        );
         assert!(notes.is_empty(), "{notes:?}");
 
         // `fetch_hosts` is the switch: writing it turns the tool on for a desk
@@ -1296,7 +1315,12 @@ mod tests {
         );
         assert_eq!(
             registry.names(),
-            vec![crate::fetch::FETCH_URL, GYLD_QUERY, READ_SOURCE]
+            vec![
+                crate::fetch::FETCH_URL,
+                GYLD_QUERY,
+                READ_SOURCE,
+                crate::search::SEARCH_SOURCES
+            ]
         );
         assert!(notes.is_empty(), "{notes:?}");
 

@@ -759,6 +759,9 @@ async fn consult_run(
     }
     let model_config = resolved.config;
     let drafted_by = model_config.model.clone();
+    // The two roots a source index measures itself against, carried onto the
+    // blocking task with everything else the tools need.
+    let layout = config.layout.clone();
     let spent = ledger.spent(&conversation);
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
@@ -766,7 +769,7 @@ async fn consult_run(
             // The tools this desk allows, over the build this consultation was
             // grounded in — so a tool's answer and a citation can never name
             // two different snapshots (GyldAskAgent.md 11.6).
-            let context = tools::ToolContext::beside(&consult.sources);
+            let context = tools::ToolContext::beside(&consult.sources, &layout);
             // The allow-list a desk that wrote none means, resolved against
             // what IS configured: the local tools always, and a network tool
             // only where the thing it needs is already there (11.2, 11.7).

@@ -10,10 +10,12 @@
 //!
 //! ```text
 //! <bundle-root>/
-//!   overlays/           the writable examples tree: one symlink per file of
-//!                       <gyld-root>/examples, plus the overlay modules the
-//!                       supplier writes (a written file shadows nothing — the
-//!                       symlinks are only seeded where no file exists).
+//!   overlays/           the examples tree the hosts read: one symlink per file
+//!                       of <gyld-root>/examples, one symlink per NOTEBOOK in
+//!                       the decisions root, and — only where no decisions root
+//!                       is configured — the overlay modules themselves. A
+//!                       seed is laid only where no name exists, so the owner's
+//!                       notebook shadows the checkout's sample.
 //!   stage/examples  ->  ../overlays      (`--repository <bundle-root>/stage`)
 //!   builds/<stamp>/     one emitted bundle per build; never overwritten.
 //!   latest.json         {"output_dir": "builds/<stamp>"} — swapped after a
@@ -24,6 +26,28 @@
 //! `--gyld-root` is therefore used for exactly two things: running the scripts
 //! out of `<gyld-root>/scripts`, and seeding the overlays tree with the base
 //! example sources. Nothing under it is ever written.
+//!
+//! That promise used to be one this module could only make on its own behalf.
+//! `overlays/` is a tree of LINKS into the checkout, and a writer that opens a
+//! target by name follows them: an `answer` on a shipped sample stream rewrote
+//! the checkout's own `examples/glade-decisions-stream-a.gyld.py`, and neither
+//! [`contained`] (lexical, and the path really was under the bundle root) nor
+//! this header noticed. Every write here now goes to a sibling temporary file
+//! and is RENAMED over its target, which replaces a link instead of following
+//! it: [`relink`], [`adopt`] and the supplier's own `write_overlay`.
+//!
+//! ## Where a written overlay lives
+//!
+//! [`Layout::decisions_root`] — the app's `--decisions-root` — is the owner's
+//! git-tracked folder for the modules the desk writes ("notebooks"). With one
+//! configured, a notebook is written THERE and `overlays/` holds a link to it,
+//! so what the desk writes is a file the owner reviews and commits on his own
+//! schedule. The supplier never runs git; a notebook simply appears in
+//! `git status`, and a notebook deleted through git is gone from the next build
+//! ([`ensure_stage`] drops the link that no longer leads anywhere).
+//!
+//! Without one, nothing changes: a written module lives in `overlays/`, which is
+//! under a running instance's data directory.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};

@@ -8,22 +8,27 @@ to a glade node as an ordinary authority session (over the wire, via
 stream verbs by invoking the Gyld hosts as subprocesses. It is the write path of
 `gyld-wz/dev-docs/ui/GyldGrythPlugins.md` section 4.7, phase 4.
 
-## Two roots, two very different rights
+## Three roots, three very different rights
 
 - `--gyld-root` is a **Gyld checkout and is read only**. The supplier runs the
   hosts out of its `scripts/` and seeds its own overlays tree from its
   `examples/`. It never writes a byte there, so the checkout's committed
   examples stay committed examples.
 - `--bundle-root` is **app-owned storage the supplier owns outright**: the
-  overlay modules it writes, the staging repository the hosts are pointed at,
-  and one directory per build. The root is the app's, never derived from a
-  request, and nothing is ever built over an existing build.
+  staging repository the hosts are pointed at, and one directory per build. The
+  root is the app's, never derived from a request, and nothing is ever built
+  over an existing build.
+- `--decisions-root` is **the owner's folder, and the supplier only adds files
+  to it**. Optional. It is where a written overlay module — a *notebook* — is
+  left, and it is a git-tracked folder the owner commits when he chooses. The
+  supplier never runs git. See [Where rulings live](#where-rulings-live).
 
 ## Run
 
 ```sh
 glade-gyld --node ws://127.0.0.1:9099 \
   --gyld-root /path/to/gyld-wz/gyld --bundle-root /path/to/data/files/gyld \
+  [--decisions-root /path/to/glade-wz/decisions] \
   [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] \
   [--ask-id gyld.ask] \
   [--streams-id gyld.streams] [--stream-id gyld.stream] \
@@ -44,10 +49,12 @@ Python 3.13 and the system `python3` is 3.10, on which they fail.
 
 ```text
 <bundle-root>/
-  overlays/           the writable examples tree: one symlink per file of
-                      <gyld-root>/examples, plus the overlay modules the
-                      supplier writes. A written overlay always wins, because a
-                      seed is only laid where no file exists.
+  overlays/           the examples tree the hosts read: one symlink per file of
+                      <gyld-root>/examples, one symlink per notebook in the
+                      decisions root, and — only with no decisions root — the
+                      overlay modules themselves. A seed is laid only where no
+                      name exists, so a notebook always wins over the
+                      checkout's sample of the same name.
   stage/examples  ->  ../overlays      (the hosts' `--repository <bundle-root>/stage`)
   builds/<stamp>/     one emitted bundle per build; never overwritten.
   latest.json         {"output_dir": "builds/<stamp>"} — swapped after a
@@ -64,6 +71,52 @@ module from `<repository>/examples` and `manage_decision_streams.py` writes a
 generated overlay to that same directory. Pointing `--repository` at the staging
 root gives the hosts a writable examples tree that is entirely inside the bundle
 root.
+
+## Where rulings live
+
+An `answer`, an `ask`, a `fork` and a `link` each leave one overlay module
+behind — a **notebook**. With `--decisions-root` set, that file lives in the
+owner's folder and `overlays/` holds a link to it:
+
+```text
+<decisions-root>/glade-decisions-<stream>.gyld.py    the notebook, the owner's file
+<bundle-root>/overlays/glade-decisions-<stream>.gyld.py -> the notebook
+```
+
+Each verb's success answer carries `overlay_file`: the absolute path of the file
+it left behind, beside the host's own JSON in `stdout` (which names the staging
+path the host wrote — the host is not rewritten). A verb whose file is not there
+yet, such as a streamed `fork` answering before its host has run, names none.
+
+`ensure_stage` runs before every verb and keeps the two trees agreeing, in this
+order:
+
+1. **Adopt.** A regular, non-symlink `*.gyld.py` in `overlays/` is a module a
+   Gyld host wrote (a seed is a link; an adopted notebook is a link). It is moved
+   into the decisions root and a link is left in its place. A name the decisions
+   root already holds with *different* bytes is left alone on both sides, with
+   one log line naming both paths: losing one of two notebooks to a tidying step
+   is not a thing this supplier does.
+2. **Link.** Every notebook in the decisions root is linked into `overlays/`,
+   re-pointing a link that leads elsewhere. A seed link into the checkout is
+   exactly that, which is how the owner's copy of a shipped sample
+   (`stream-a`, `stream-b`, `fork-a`) comes to be the one the hosts read while
+   the sample itself is never touched — copy-on-write, not an edit.
+3. **Drop what leads nowhere.** A link whose notebook is gone is removed, so
+   deleting a notebook (`git checkout`, `rm`) deletes the stream at the next
+   build rather than failing it. If the checkout ships a sample of that name, the
+   seeding step puts the sample back.
+4. **Seed**, as ever, only where no name exists.
+
+Every step treats "already done by the other caller" as success: two callers
+ensure the stage at the same moment in production (every verb on the exchange
+path, and the first build on its own task).
+
+**The supplier never runs git.** A new ruling shows up in the owner's
+`git status`; he commits it when he means it.
+
+With no `--decisions-root`, none of this happens: a written module lives in
+`overlays/` under the running instance's data directory, as it did before.
 
 ### The first build is the supplier's own
 

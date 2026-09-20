@@ -182,11 +182,29 @@ pub fn lexically_normalize(path: &Path) -> Option<PathBuf> {
 /// every verb ensures the stage on the exchange path while the first build
 /// ensures it on its own task, so on a fresh bundle root two callers reach the
 /// same absent link at once. See [`already_laid`].
+///
+/// With a decisions root configured, three more steps run first, in this order:
+/// the notebooks a host wrote into the staging tree are ADOPTED into the
+/// decisions root ([`adopt`]), every notebook in the decisions root is LINKED
+/// into the staging tree, and a link left DANGLING by a notebook the owner
+/// deleted (through git, or by hand) is removed — so deleting a file really does
+/// delete the notebook at the next build. Only then are the checkout's examples
+/// seeded, and only where no name exists, which is what makes the owner's copy
+/// shadow a shipped sample rather than fight it.
 pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
     let overlays = layout.overlays();
     std::fs::create_dir_all(&overlays)?;
     std::fs::create_dir_all(layout.builds())?;
     std::fs::create_dir_all(layout.stage())?;
+
+    if let Some(decisions) = layout.decisions_root.as_ref() {
+        std::fs::create_dir_all(decisions)?;
+        for note in adopt(layout)?.notes() {
+            eprintln!("glade-gyld: {note}");
+        }
+        link_notebooks(decisions, &overlays)?;
+        drop_dangling(&overlays)?;
+    }
 
     let source = layout.gyld_root.join("examples");
     if source.is_dir() {
@@ -210,6 +228,173 @@ pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
+/// The authoring suffix every overlay module carries.
+const NOTEBOOK_SUFFIX: &str = ".gyld.py";
+
+/// Is `name` a notebook — an overlay module the owner's folder holds?
+fn is_notebook(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().ends_with(NOTEBOOK_SUFFIX)
+}
+
+/// What one [`adopt`] pass did, so the caller can say it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Adopted {
+    /// The notebooks now in the decisions root, linked back into the stage.
+    pub taken: Vec<PathBuf>,
+    /// `(staged, kept)` — a name both trees hold, with different bytes. NEITHER
+    /// was touched.
+    pub conflicts: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Adopted {
+    /// One line per conflict. An adoption that went through says nothing: the
+    /// answer already named the file.
+    pub fn notes(&self) -> Vec<String> {
+        self.conflicts
+            .iter()
+            .map(|(staged, kept)| {
+                format!(
+                    "{} and {} are two different notebooks of the same name; neither was changed",
+                    staged.display(),
+                    kept.display()
+                )
+            })
+            .collect()
+    }
+}
+
+/// Move every notebook a Gyld host WROTE into the staging tree over to the
+/// decisions root, and leave a link behind in its place.
+///
+/// `fork` and `link` are the hosts' own business: they write a real module into
+/// `<stage>/examples` — which is the overlays tree — and read it back to check
+/// it. Nothing about that changes. Afterwards the file is the OWNER's, so it is
+/// moved to where his files live and the staging tree points at it. A regular,
+/// non-symlink `*.gyld.py` in the overlays tree is exactly "a module a host
+/// wrote": a seed is a link, and an adopted notebook is a link.
+///
+/// A name the decisions root already holds is not overwritten in either
+/// direction. Identical bytes are the idempotent case — the adoption simply
+/// finishes. DIFFERENT bytes are two notebooks, and losing one of them to a
+/// tidying step is not something a tool gets to do: both stay, and the caller
+/// says so.
+///
+/// Concurrency-safe by CLAIMING: the staged file is renamed to a sibling
+/// temporary first, so of two callers reaching the same file only one can win
+/// and the loser sees `NotFound` and moves on. A caller that checked the file
+/// and then renamed it could instead rename the LINK the winner had just laid,
+/// and leave it pointing at itself.
+pub fn adopt(layout: &Layout) -> io::Result<Adopted> {
+    let decisions = match layout.decisions_root.as_ref() {
+        Some(root) => root,
+        None => {
+            return Ok(Adopted::default());
+        }
+    };
+    let overlays = layout.overlays();
+    let mut adopted = Adopted::default();
+    if !overlays.is_dir() {
+        return Ok(adopted);
+    }
+    std::fs::create_dir_all(decisions)?;
+    for entry in std::fs::read_dir(&overlays)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !is_notebook(&entry.file_name()) {
+            continue;
+        }
+        let staged = entry.path();
+        let kept = decisions.join(entry.file_name());
+        let claimed = sibling_temp(&staged);
+        match std::fs::rename(&staged, &claimed) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
+            other => other?,
+        }
+        if kept.symlink_metadata().is_ok() {
+            if std::fs::read(&claimed)? == std::fs::read(&kept)? {
+                std::fs::remove_file(&claimed)?;
+            } else {
+                // Put it back exactly where the host left it and say so. A
+                // stream whose notebook is in dispute keeps building from the
+                // staged one until somebody reads the line.
+                std::fs::rename(&claimed, &staged)?;
+                adopted.conflicts.push((staged.clone(), kept.clone()));
+                continue;
+            }
+        } else {
+            move_file(&claimed, &kept)?;
+            adopted.taken.push(kept.clone());
+        }
+        relink(&kept, &staged)?;
+    }
+    Ok(adopted)
+}
+
+/// Move `from` onto `to`, across filesystems if it comes to that. The decisions
+/// root is the owner's folder and need not be on the bundle root's volume.
+fn move_file(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(from, to)?;
+            std::fs::remove_file(from)
+        }
+    }
+}
+
+/// Link every notebook of the decisions root into the staging tree, RE-POINTING
+/// a link that leads somewhere else — a seed link into the Gyld checkout is
+/// exactly that, and re-pointing it is how the owner's copy of a shipped sample
+/// comes to be the one the hosts read.
+///
+/// A real file at that name is left alone: [`adopt`] has already run this pass,
+/// so a regular file still there is one of its conflicts.
+fn link_notebooks(decisions: &Path, overlays: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(decisions)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !is_notebook(&entry.file_name()) {
+            continue;
+        }
+        let kept = entry.path();
+        let target = overlays.join(entry.file_name());
+        match target.symlink_metadata() {
+            Err(_) => {
+                already_laid(platform::link_file(&kept, &target))?;
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let points_at = std::fs::read_link(&target).ok();
+                if points_at.as_deref() != Some(kept.as_path()) {
+                    relink(&kept, &target)?;
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Remove every link in the staging tree that leads nowhere.
+///
+/// That is what a notebook the owner deleted looks like from here: the link is
+/// still in the tree and the file it named is gone. Left there, the capture host
+/// would fail on it and take the build down with it; removed, the stream is
+/// simply no longer declared — and if the checkout ships a sample of that name,
+/// the seeding step below puts the sample back.
+fn drop_dangling(overlays: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(overlays)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let link = entry.path();
+        if !link.exists() {
+            already_gone(std::fs::remove_file(&link))?;
+        }
+    }
+    Ok(())
+}
+
 /// Treat `AlreadyExists` from laying a link as the success it is.
 ///
 /// The seeding above is check-then-act — `symlink_metadata`, then link — and
@@ -227,6 +412,16 @@ pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
 fn already_laid(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
+}
+
+/// And the other half of it: treat `NotFound` from REMOVING something as the
+/// success it is. [`drop_dangling`] is check-then-act in the same way, so the
+/// caller that loses the race has the outcome it asked for — the link is gone.
+fn already_gone(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
 }
@@ -516,6 +711,244 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(&seeded).unwrap(), "base\n");
             }
             assert_eq!(std::fs::read_dir(layout.overlays()).unwrap().count(), 8);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A checkout holding `named` samples, a bundle root beside it, and the
+    /// owner's decisions folder — the three trees of the real arrangement.
+    fn three_trees(tag: &str, named: &[&str]) -> (PathBuf, Layout) {
+        let root = tmp(tag);
+        let gyld = root.join("gyld");
+        std::fs::create_dir_all(gyld.join("examples")).unwrap();
+        for name in named.iter() {
+            std::fs::write(gyld.join("examples").join(name), "shipped\n").unwrap();
+        }
+        let layout = Layout::new(gyld, root.join("bundle"))
+            .with_decisions_root(Some(root.join("decisions")));
+        (root, layout)
+    }
+
+    /// Where a name in the staging tree leads: `None` for a real file.
+    fn points_at(overlays: &Path, name: &str) -> Option<PathBuf> {
+        std::fs::read_link(overlays.join(name)).ok()
+    }
+
+    #[test]
+    fn a_host_written_notebook_is_adopted_into_the_decisions_root_and_linked_back() {
+        let (root, layout) = three_trees("adopt", &["glade-decisions.gyld.py"]);
+        ensure_stage(&layout).unwrap();
+
+        // What `fork` does: the host writes a real module into the staging tree.
+        let name = "glade-decisions-keys-a.gyld.py";
+        let staged = layout.overlays().join(name);
+        std::fs::write(&staged, "forked\n").unwrap();
+
+        let adopted = adopt(&layout).unwrap();
+        let kept = root.join("decisions").join(name);
+        assert_eq!(adopted.taken, vec![kept.clone()]);
+        assert!(adopted.conflicts.is_empty() && adopted.notes().is_empty());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "forked\n");
+        assert_eq!(
+            points_at(&layout.overlays(), name),
+            Some(kept.clone()),
+            "the staging tree points at the owner's file"
+        );
+        // And the hosts still read it through the staging repository.
+        assert_eq!(
+            std::fs::read_to_string(layout.stage_examples().join(name)).unwrap(),
+            "forked\n"
+        );
+
+        // Twice over is nothing: a link is not a host-written file.
+        let again = adopt(&layout).unwrap();
+        assert_eq!(again, Adopted::default());
+        ensure_stage(&layout).unwrap();
+        assert_eq!(points_at(&layout.overlays(), name), Some(kept));
+        assert_eq!(
+            std::fs::read_dir(root.join("decisions")).unwrap().count(),
+            1
+        );
+
+        // With no decisions root, nothing is adopted at all.
+        let plain = Layout::new(layout.gyld_root.clone(), root.join("plain"));
+        std::fs::create_dir_all(plain.overlays()).unwrap();
+        std::fs::write(plain.overlays().join(name), "forked\n").unwrap();
+        assert_eq!(adopt(&plain).unwrap(), Adopted::default());
+        assert!(plain.overlays().join(name).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_different_notebooks_of_one_name_are_both_left_where_they_are() {
+        let (root, layout) = three_trees("adopt-clash", &[]);
+        ensure_stage(&layout).unwrap();
+        let name = "glade-decisions-keys-a.gyld.py";
+        let kept = root.join("decisions").join(name);
+        std::fs::write(&kept, "the owner's\n").unwrap();
+        let staged = layout.overlays().join(name);
+        std::fs::write(&staged, "the host's\n").unwrap();
+
+        let adopted = adopt(&layout).unwrap();
+        assert_eq!(adopted.taken, Vec::<PathBuf>::new());
+        assert_eq!(adopted.conflicts, vec![(staged.clone(), kept.clone())]);
+        let note = adopted.notes().join("");
+        assert!(
+            note.contains(&staged.display().to_string())
+                && note.contains(&kept.display().to_string())
+                && note.contains("neither was changed"),
+            "{note}"
+        );
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "the owner's\n");
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "the host's\n");
+        assert_eq!(
+            points_at(&layout.overlays(), name),
+            None,
+            "the staged file is still the real file the host wrote"
+        );
+
+        // The same bytes are the idempotent case, not a clash: the adoption
+        // finishes rather than reporting one.
+        std::fs::write(&staged, "the owner's\n").unwrap();
+        let adopted = adopt(&layout).unwrap();
+        assert!(adopted.conflicts.is_empty() && adopted.taken.is_empty());
+        assert_eq!(points_at(&layout.overlays(), name), Some(kept));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_decisions_root_shadows_the_checkout_and_a_deleted_notebook_disappears() {
+        let sample = "glade-decisions-stream-a.gyld.py";
+        let (root, layout) = three_trees("seeding", &["glade-decisions.gyld.py", sample]);
+        let overlays = layout.overlays();
+
+        // First pass: nothing of the owner's yet, so both samples are seeded
+        // from the checkout exactly as they always were.
+        ensure_stage(&layout).unwrap();
+        assert_eq!(
+            points_at(&overlays, sample),
+            Some(layout.gyld_root.join("examples").join(sample)),
+            "with no copy of his own, the owner reads the shipped sample"
+        );
+
+        // The owner answers a question in the shipped sample: his copy lands in
+        // the decisions root, and the seed link is RE-POINTED at it.
+        let kept = root.join("decisions").join(sample);
+        std::fs::write(&kept, "the owner's copy\n").unwrap();
+        ensure_stage(&layout).unwrap();
+        assert_eq!(points_at(&overlays, sample), Some(kept.clone()));
+        assert_eq!(
+            std::fs::read_to_string(layout.stage_examples().join(sample)).unwrap(),
+            "the owner's copy\n"
+        );
+        // And the shipped sample is untouched: copy-on-write, not an edit.
+        assert_eq!(
+            std::fs::read_to_string(layout.gyld_root.join("examples").join(sample)).unwrap(),
+            "shipped\n"
+        );
+
+        // A notebook with no sample behind it: `git checkout` takes it away, and
+        // the next build must not see a stream that is no longer declared.
+        let own = "glade-decisions-keys-a.gyld.py";
+        std::fs::write(root.join("decisions").join(own), "mine\n").unwrap();
+        ensure_stage(&layout).unwrap();
+        assert!(overlays.join(own).exists());
+        std::fs::remove_file(root.join("decisions").join(own)).unwrap();
+        ensure_stage(&layout).unwrap();
+        assert!(
+            overlays.join(own).symlink_metadata().is_err(),
+            "a dangling link is removed, so deleting the file deletes the notebook"
+        );
+
+        // Reverting the owner's copy of a SAMPLE puts the sample back.
+        std::fs::remove_file(&kept).unwrap();
+        ensure_stage(&layout).unwrap();
+        assert_eq!(
+            points_at(&overlays, sample),
+            Some(layout.gyld_root.join("examples").join(sample))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensuring_one_fresh_stage_with_a_decisions_root_from_several_callers_is_not_an_error() {
+        // The no-decisions case above; now with the owner's folder in the middle,
+        // which adds the adoption, the linking and the dangling sweep to the
+        // steps two callers reach at the same moment.
+        let root = tmp("stage-race-decisions");
+        let gyld = root.join("gyld");
+        std::fs::create_dir_all(gyld.join("examples")).unwrap();
+        for n in 0..8 {
+            std::fs::write(gyld.join(format!("examples/s{n}.gyld.py")), "shipped\n").unwrap();
+        }
+
+        for attempt in 0..8 {
+            let decisions = root.join(format!("decisions-{attempt}"));
+            std::fs::create_dir_all(&decisions).unwrap();
+            // Four the owner already holds, and four a host has just written
+            // into the staging tree for the adoption to find.
+            for n in 0..4 {
+                std::fs::write(decisions.join(format!("own{n}.gyld.py")), "mine\n").unwrap();
+            }
+            let layout = Layout::new(gyld.clone(), root.join(format!("bundle-{attempt}")))
+                .with_decisions_root(Some(decisions.clone()));
+            std::fs::create_dir_all(layout.overlays()).unwrap();
+            for n in 0..4 {
+                std::fs::write(
+                    layout.overlays().join(format!("forked{n}.gyld.py")),
+                    "forked\n",
+                )
+                .unwrap();
+            }
+
+            let start = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                let start = &start;
+                let layout = &layout;
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            start.wait();
+                            ensure_stage(layout)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .expect("the staging thread ran")
+                        .expect("a concurrent ensure_stage is not a failure");
+                }
+            });
+
+            // One stage, whoever laid it: every seed, every notebook of the
+            // owner's and every adopted fork reachable once through the stage.
+            for n in 0..8 {
+                assert_eq!(
+                    std::fs::read_to_string(layout.stage_examples().join(format!("s{n}.gyld.py")))
+                        .unwrap(),
+                    "shipped\n"
+                );
+            }
+            for n in 0..4 {
+                let own = format!("own{n}.gyld.py");
+                assert_eq!(
+                    points_at(&layout.overlays(), &own),
+                    Some(decisions.join(&own))
+                );
+                let forked = format!("forked{n}.gyld.py");
+                assert_eq!(
+                    points_at(&layout.overlays(), &forked),
+                    Some(decisions.join(&forked)),
+                    "the adoption happened exactly once"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(decisions.join(&forked)).unwrap(),
+                    "forked\n"
+                );
+            }
+            assert_eq!(std::fs::read_dir(layout.overlays()).unwrap().count(), 16);
+            assert_eq!(std::fs::read_dir(&decisions).unwrap().count(), 8);
         }
         let _ = std::fs::remove_dir_all(&root);
     }

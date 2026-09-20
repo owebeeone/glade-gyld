@@ -2261,6 +2261,7 @@ fn the_emit_host_answers_help_as_a_real_subprocess() {
         output_dir: None,
         read: None,
         consult: None,
+        overlay: None,
     };
     let limits = Limits {
         timeout: Duration::from_secs(60),

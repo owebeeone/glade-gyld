@@ -512,7 +512,7 @@ fn overlay_text(verb: &str, args: &GyldArgs) -> Result<String, String> {
 /// yet, which the first ruling in a stream always is. What the filesystem has
 /// to say about a symlinked directory is the WRITER's question, asked at the
 /// moment of the write.
-fn writable(layout: &Layout, path: &PathBuf) -> bool {
+fn writable(layout: &Layout, path: &std::path::Path) -> bool {
     if contained(&layout.bundle_root, path) {
         return true;
     }

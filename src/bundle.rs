@@ -27,6 +27,7 @@
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -199,6 +200,53 @@ fn already_laid(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         other => other,
+    }
+}
+
+/// Lay a link at `target` pointing at `source`, failing with `AlreadyExists`
+/// when the name is taken. The overlays tree's one linking primitive, public so
+/// a caller outside this module lays a seed the same way the seeding does — and
+/// so no test needs a `#[cfg]` of its own to make one.
+pub fn link(source: &Path, target: &Path) -> io::Result<()> {
+    platform::link_file(source, target)
+}
+
+/// Point `target` at `source`, REPLACING whatever is at `target` — a link into
+/// the Gyld checkout, an older real file, nothing at all.
+///
+/// The link is laid at a sibling temporary name and RENAMED over the target,
+/// because that is the one sequence with no window in which the name is absent
+/// and no step that follows the link already there. `remove_file` then
+/// `symlink` would have both.
+pub fn relink(source: &Path, target: &Path) -> io::Result<()> {
+    let temp = sibling_temp(target);
+    platform::link_file(source, &temp)?;
+    match std::fs::rename(&temp, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e)
+        }
+    }
+}
+
+/// A sibling temporary name for an atomic replace: `<dir>/.<name>.tmp-<pid>-<n>`.
+///
+/// A SIBLING, not a name in the system temporary directory: `rename` is only
+/// atomic within one filesystem, and the whole point of the temporary is the
+/// rename. Hidden and counted, so two callers replacing the same target at the
+/// same moment never collide on the temporary itself.
+pub fn sibling_temp(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "overlay".to_string());
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let temp = format!(".{name}.tmp-{}-{n}", std::process::id());
+    match path.parent() {
+        Some(dir) => dir.join(temp),
+        None => PathBuf::from(temp),
     }
 }
 

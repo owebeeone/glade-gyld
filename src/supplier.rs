@@ -480,6 +480,20 @@ fn ground(consult: &Consultation) -> Result<(Vec<ResolvedSource>, Prompt), Strin
 
 /// Write the planned overlay module, refusing to clobber one unless the plan
 /// says so. A write failure is data.
+///
+/// NEVER THROUGH A SYMLINK. `overlays/` holds one seed link per file of the Gyld
+/// checkout's `examples`, and `std::fs::write` follows a link: a write to
+/// `overlays/glade-decisions-stream-a.gyld.py` used to land in the owner's
+/// checkout, which the containment check could not see because it is lexical and
+/// the path it was handed really is under the bundle root. So the text goes to a
+/// sibling temporary file and is RENAMED over the target — `rename` replaces the
+/// link itself instead of following it, and makes the write atomic into the
+/// bargain: a reader of that name sees the old module or the new one, never half
+/// of either.
+///
+/// The `exists` test does not follow a link either ([`std::fs::symlink_metadata`]):
+/// a seed link IS something at that name, and an unforced write must refuse it
+/// rather than ask what it points at.
 fn write_overlay(plan: &Plan) -> Result<(), String> {
     let write = match plan.write.as_ref() {
         Some(w) => w,
@@ -487,7 +501,7 @@ fn write_overlay(plan: &Plan) -> Result<(), String> {
             return Ok(());
         }
     };
-    if !write.force && write.path.exists() {
+    if !write.force && write.path.symlink_metadata().is_ok() {
         return Err(format!(
             "{} exists; nothing is overwritten",
             write.path.display()
@@ -497,8 +511,13 @@ fn write_overlay(plan: &Plan) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    std::fs::write(&write.path, &write.text)
-        .map_err(|e| format!("cannot write {}: {e}", write.path.display()))
+    let temp = bundle::sibling_temp(&write.path);
+    std::fs::write(&temp, &write.text)
+        .map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
+    std::fs::rename(&temp, &write.path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("cannot write {}: {e}", write.path.display())
+    })
 }
 
 /// Record a successful build as the bundle root's latest, publish its documents
@@ -1171,6 +1190,63 @@ mod tests {
         write_overlay(&plan).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defect this test exists for: `overlays/` holds one SEED LINK per file
+    /// of the Gyld checkout's `examples`, and a write through one of them lands
+    /// in the checkout. `std::fs::write` opens the target and follows the link;
+    /// the containment check is lexical and sees only a path under the bundle
+    /// root. An `answer` on a shipped sample stream therefore rewrote
+    /// `gyld/examples/glade-decisions-stream-a.gyld.py` in the owner's checkout.
+    #[test]
+    fn a_write_through_a_seed_link_never_reaches_the_checkout() {
+        let dir = root("seed-link");
+        let examples = dir.join("checkout/examples");
+        std::fs::create_dir_all(&examples).unwrap();
+        let shipped = examples.join("glade-decisions-stream-a.gyld.py");
+        std::fs::write(&shipped, "shipped sample\n").unwrap();
+
+        let overlays = dir.join("bundle/overlays");
+        std::fs::create_dir_all(&overlays).unwrap();
+        let staged = overlays.join("glade-decisions-stream-a.gyld.py");
+        bundle::link(&shipped, &staged).unwrap();
+
+        let plan = forced_write(&staged, "the owner's ruling\n");
+        write_overlay(&plan).expect("the write lands");
+
+        assert_eq!(
+            std::fs::read_to_string(&shipped).unwrap(),
+            "shipped sample\n",
+            "the checkout is read-only to the supplier, seed link or not"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&staged).unwrap(),
+            "the owner's ruling\n"
+        );
+        assert!(
+            !staged.symlink_metadata().unwrap().file_type().is_symlink(),
+            "the write replaced the link rather than following it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan whose only business is one forced write at `path`.
+    fn forced_write(path: &std::path::Path, text: &str) -> Plan {
+        let mut plan = verbs::plan(
+            &Layout::new(PathBuf::from("/g"), PathBuf::from("/b")),
+            &GyldRequest::parse(br#"{"verb":"fork","args":{"parent":"base","stream":"a-b"}}"#)
+                .unwrap(),
+            None,
+            "build-1",
+            &AgentState::default(),
+        )
+        .unwrap();
+        plan.write = Some(verbs::PlannedWrite {
+            path: path.to_path_buf(),
+            text: text.to_string(),
+            force: true,
+        });
+        plan
     }
 
     #[test]

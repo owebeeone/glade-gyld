@@ -401,7 +401,7 @@ fn answer(
     };
     let run_id = format!("run-{}", runs.fetch_add(1, Ordering::SeqCst) + 1);
 
-    if let Err(e) = write_overlay(&plan) {
+    if let Err(e) = write_overlay(&config.layout, &plan) {
         return GyldResponse::failed(e, who);
     }
 
@@ -494,7 +494,14 @@ fn ground(consult: &Consultation) -> Result<(Vec<ResolvedSource>, Prompt), Strin
 /// The `exists` test does not follow a link either ([`std::fs::symlink_metadata`]):
 /// a seed link IS something at that name, and an unforced write must refuse it
 /// rather than ask what it points at.
-fn write_overlay(plan: &Plan) -> Result<(), String> {
+///
+/// AND NOT THROUGH A SYMLINKED DIRECTORY. The planner's containment check is
+/// lexical, which is what keeps it pure; that leaves the filesystem's own
+/// question — where does this directory actually lead — to be asked here, where
+/// there is a filesystem to ask. The target's parent is canonicalized and must
+/// come out inside the canonicalized [`Layout::overlay_home`], so a directory
+/// link laid in the tree cannot redirect a ruling somewhere else.
+fn write_overlay(layout: &Layout, plan: &Plan) -> Result<(), String> {
     let write = match plan.write.as_ref() {
         Some(w) => w,
         None => {
@@ -507,10 +514,34 @@ fn write_overlay(plan: &Plan) -> Result<(), String> {
             write.path.display()
         ));
     }
-    if let Some(parent) = write.path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let home = layout.overlay_home();
+    std::fs::create_dir_all(&home).map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+    // Lexically first, so nothing is CREATED outside the home on the way to
+    // finding out that the write does not belong there.
+    if !bundle::contained(&home, &write.path) {
+        return Err(format!(
+            "cannot write {}: it is not in the overlay home {}",
+            write.path.display(),
+            home.display()
+        ));
     }
+    let parent = write
+        .path
+        .parent()
+        .ok_or_else(|| format!("cannot write {}: it has no directory", write.path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let real_home = canonical(&home)?;
+    let real_parent = canonical(parent)?;
+    if !real_parent.starts_with(&real_home) {
+        return Err(format!(
+            "cannot write {}: {} leads outside the overlay home {}",
+            write.path.display(),
+            real_parent.display(),
+            real_home.display()
+        ));
+    }
+
     let temp = bundle::sibling_temp(&write.path);
     std::fs::write(&temp, &write.text)
         .map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
@@ -518,6 +549,12 @@ fn write_overlay(plan: &Plan) -> Result<(), String> {
         let _ = std::fs::remove_file(&temp);
         format!("cannot write {}: {e}", write.path.display())
     })
+}
+
+/// Where a directory really is, links resolved. A failure is data, like every
+/// other refusal on the write path.
+fn canonical(dir: &std::path::Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve {}: {e}", dir.display()))
 }
 
 /// Record a successful build as the bundle root's latest, publish its documents
@@ -1156,39 +1193,73 @@ mod tests {
 
     #[test]
     fn a_planned_write_refuses_to_clobber_unless_forced() {
-        let dir = std::env::temp_dir().join(format!("glade-gyld-write-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("glade-decisions-a.gyld.py");
+        let dir = root("write");
+        let layout = Layout::new(dir.join("gyld"), dir.clone());
+        let path = layout.overlays().join("glade-decisions-a.gyld.py");
 
-        let mut plan = verbs::plan(
-            &Layout::new(PathBuf::from("/g"), PathBuf::from("/b")),
-            &GyldRequest::parse(br#"{"verb":"fork","args":{"parent":"base","stream":"a-b"}}"#)
-                .unwrap(),
-            None,
-            "build-1",
-            &AgentState::default(),
-        )
-        .unwrap();
-
-        plan.write = Some(verbs::PlannedWrite {
-            path: path.clone(),
-            text: "one\n".into(),
-            force: false,
-        });
-        write_overlay(&plan).unwrap();
+        let mut plan = forced_write(&path, "one\n");
+        plan.write.as_mut().unwrap().force = false;
+        write_overlay(&layout, &plan).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
 
-        let e = write_overlay(&plan).unwrap_err();
+        let e = write_overlay(&layout, &plan).unwrap_err();
         assert!(e.contains("nothing is overwritten"), "{e}");
 
-        plan.write = Some(verbs::PlannedWrite {
-            path: path.clone(),
-            text: "two\n".into(),
-            force: true,
-        });
-        write_overlay(&plan).unwrap();
+        let forced = forced_write(&path, "two\n");
+        write_overlay(&layout, &forced).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+
+        // A seed LINK is something at that name too: an unforced write refuses
+        // it rather than asking what it points at.
+        let seeded = layout.overlays().join("glade-decisions-b.gyld.py");
+        bundle::link(&path, &seeded).unwrap();
+        let mut unforced = forced_write(&seeded, "three\n");
+        unforced.write.as_mut().unwrap().force = false;
+        let e = write_overlay(&layout, &unforced).unwrap_err();
+        assert!(e.contains("nothing is overwritten"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The write's OWN check, past the planner's lexical one: a directory link
+    /// in the tree must not redirect a ruling out of the overlay home.
+    #[test]
+    fn a_write_refuses_a_path_that_leads_outside_the_overlay_home() {
+        let dir = root("home");
+        let decisions = dir.join("decisions");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&decisions).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let layout = Layout::new(dir.join("gyld"), dir.join("bundle"))
+            .with_decisions_root(Some(decisions.clone()));
+
+        // A path in another tree altogether: refused lexically, and nothing is
+        // laid down on the way to finding out.
+        let outside = elsewhere.join("glade-decisions-a.gyld.py");
+        let e = write_overlay(&layout, &forced_write(&outside, "no\n")).unwrap_err();
+        assert!(e.contains("not in the overlay home"), "{e}");
+        assert!(!outside.exists());
+
+        // A DIRECTORY link inside the home, pointing out of it. Lexically the
+        // path is in the home; the filesystem says otherwise, and the filesystem
+        // is who the writer asks.
+        bundle::link(&elsewhere, &decisions.join("sub")).unwrap();
+        let through = decisions.join("sub/glade-decisions-a.gyld.py");
+        let e = write_overlay(&layout, &forced_write(&through, "no\n")).unwrap_err();
+        assert!(e.contains("leads outside the overlay home"), "{e}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        // And a home that is ITSELF reached through a link still writes: both
+        // sides are canonicalized, so /tmp and /private/tmp are one home.
+        let linked = dir.join("linked-decisions");
+        bundle::link(&decisions, &linked).unwrap();
+        let through_home = Layout::new(dir.join("gyld"), dir.join("bundle"))
+            .with_decisions_root(Some(linked.clone()));
+        let notebook = linked.join("glade-decisions-a.gyld.py");
+        write_overlay(&through_home, &forced_write(&notebook, "yes\n")).expect("the write lands");
+        assert_eq!(
+            std::fs::read_to_string(decisions.join("glade-decisions-a.gyld.py")).unwrap(),
+            "yes\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1206,13 +1277,14 @@ mod tests {
         let shipped = examples.join("glade-decisions-stream-a.gyld.py");
         std::fs::write(&shipped, "shipped sample\n").unwrap();
 
-        let overlays = dir.join("bundle/overlays");
+        let layout = Layout::new(dir.join("checkout"), dir.join("bundle"));
+        let overlays = layout.overlays();
         std::fs::create_dir_all(&overlays).unwrap();
         let staged = overlays.join("glade-decisions-stream-a.gyld.py");
         bundle::link(&shipped, &staged).unwrap();
 
         let plan = forced_write(&staged, "the owner's ruling\n");
-        write_overlay(&plan).expect("the write lands");
+        write_overlay(&layout, &plan).expect("the write lands");
 
         assert_eq!(
             std::fs::read_to_string(&shipped).unwrap(),

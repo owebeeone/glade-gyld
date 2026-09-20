@@ -157,6 +157,15 @@ pub struct Plan {
     /// conversation the reply is keyed by. Never accompanied by a `write` or
     /// an `argv`.
     pub consult: Option<Consultation>,
+    /// The overlay module FILE this verb leaves behind — the notebook, in the
+    /// decisions root when one is configured.
+    ///
+    /// Set for the four verbs that produce one: `answer` and `ask` (which the
+    /// supplier writes itself, so it is `write.path` too) and `fork` and `link`
+    /// (which a Gyld host writes into the staging tree, from where it is
+    /// adopted). It is what the answer tells the requester, so a ruling is never
+    /// a file nobody named.
+    pub overlay: Option<PathBuf>,
 }
 
 /// Resolve a request into a [`Plan`], or a refusal. PURE: it touches no file,
@@ -206,6 +215,7 @@ pub fn plan(
         output_dir: None,
         read: None,
         consult: None,
+        overlay: None,
     };
 
     match request.verb.as_str() {
@@ -228,13 +238,18 @@ pub fn plan(
             let text = overlay_text(&request.verb, args)?;
             let bundle = latest.ok_or(NO_BUNDLE)?;
             let output = layout.new_build_dir(stamp);
+            // The notebook's home, which is the decisions root when the app
+            // configured one: a ruling is the owner's file, and it is written
+            // where he keeps his files. The staging tree LINKS to it.
+            let notebook = layout.overlay_home().join(overlay_file(stream));
             plan.write = Some(PlannedWrite {
-                path: layout.overlays().join(overlay_file(stream)),
+                path: notebook.clone(),
                 text,
                 // An answer or a question is appended to a stream that already
                 // exists, so its module is replaced by the exported text.
                 force: true,
             });
+            plan.overlay = Some(notebook);
             plan.argv = base(rebuild_argv(bundle, &output, args.built.as_deref()));
             plan.output_dir = Some(output);
         }
@@ -256,6 +271,9 @@ pub fn plan(
                 argv.push("--force".into());
             }
             plan.argv = base(argv);
+            // The host writes the module into the staging tree itself; the
+            // notebook it becomes is the one the adoption leaves in the home.
+            plan.overlay = Some(layout.overlay_home().join(overlay_file(stream)));
         }
         "rebuild" => {
             let bundle = latest.ok_or(NO_BUNDLE)?;
@@ -289,15 +307,15 @@ pub fn plan(
         }
     }
 
-    // Containment, last and unconditional: every path this plan writes, builds
-    // into or reads must be under the bundle root. The bundle a verb was handed
-    // is checked too, so a stale pointer cannot aim a build elsewhere.
+    // Containment, last and unconditional. A path this plan BUILDS INTO or READS
+    // must be under the bundle root; a path it WRITES may also be under the
+    // decisions root, which is the one other tree the app gave the supplier.
+    // The bundle a verb was handed is checked too, so a stale pointer cannot aim
+    // a build elsewhere.
     let root = &layout.bundle_root;
     for path in plan
-        .write
+        .output_dir
         .iter()
-        .map(|w| &w.path)
-        .chain(plan.output_dir.iter())
         .chain(plan.read.iter())
         .chain(plan.consult.iter().map(|c| &c.sources))
     {
@@ -307,6 +325,16 @@ pub fn plan(
                 path.display(),
                 root.display()
             ));
+        }
+    }
+    for path in plan
+        .write
+        .iter()
+        .map(|w| &w.path)
+        .chain(plan.overlay.iter())
+    {
+        if !writable(layout, path) {
+            return Err(format!("path {} leaves {}", path.display(), homes(layout)));
         }
     }
     if let Some(bundle) = latest {
@@ -356,6 +384,7 @@ pub fn discover_plan(layout: &Layout) -> Plan {
         output_dir: None,
         read: None,
         consult: None,
+        overlay: None,
     }
 }
 
@@ -414,6 +443,7 @@ pub fn first_build_plan(layout: &Layout, stamp: &str, declared: &[String]) -> Pl
         output_dir: Some(layout.new_build_dir(stamp)),
         read: None,
         consult: None,
+        overlay: None,
     }
 }
 
@@ -472,6 +502,33 @@ fn overlay_text(verb: &str, args: &GyldArgs) -> Result<String, String> {
         ));
     }
     Ok(text)
+}
+
+/// May this plan write at `path`? Under the bundle root, always; under the
+/// decisions root, when the app configured one.
+///
+/// Two roots and no more. The check stays [`contained`] — LEXICAL, so `plan`
+/// remains pure and answers the same way for a notebook that does not exist
+/// yet, which the first ruling in a stream always is. What the filesystem has
+/// to say about a symlinked directory is the WRITER's question, asked at the
+/// moment of the write.
+fn writable(layout: &Layout, path: &PathBuf) -> bool {
+    if contained(&layout.bundle_root, path) {
+        return true;
+    }
+    match layout.decisions_root.as_ref() {
+        Some(root) => contained(root, path),
+        None => false,
+    }
+}
+
+/// The roots a written path may be under, as a refusal says them.
+fn homes(layout: &Layout) -> String {
+    let bundle = format!("the bundle root {}", layout.bundle_root.display());
+    match layout.decisions_root.as_ref() {
+        Some(root) => format!("{bundle} or the decisions root {}", root.display()),
+        None => bundle,
+    }
 }
 
 /// A named stream id, validated. A missing or malformed id is a refusal, never
@@ -657,6 +714,96 @@ mod tests {
             ]
         );
         assert_eq!(p.output_dir, Some(PathBuf::from("/b/builds/build-1")));
+    }
+
+    /// The same layout with the owner's decisions folder configured.
+    fn with_decisions() -> Layout {
+        layout().with_decisions_root(Some(PathBuf::from("/glade-wz/decisions")))
+    }
+
+    fn planned_in(layout: &Layout, json: &str) -> Plan {
+        plan(
+            layout,
+            &request(json),
+            Some(Path::new("/b/builds/build-0")),
+            "build-1",
+            &agent(),
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn a_configured_decisions_root_is_where_every_written_notebook_is_planned() {
+        let owned = with_decisions();
+        let answer = planned_in(
+            &owned,
+            r#"{"verb":"answer","args":{"stream":"keys-a","overlay":"text"}}"#,
+        );
+        let notebook = PathBuf::from("/glade-wz/decisions/glade-decisions-keys-a.gyld.py");
+        assert_eq!(answer.write.as_ref().expect("a write").path, notebook);
+        assert_eq!(
+            answer.overlay.as_ref(),
+            Some(&notebook),
+            "the answer names the file the ruling was left in"
+        );
+        // The build is still the bundle root's own business.
+        assert_eq!(answer.output_dir, Some(PathBuf::from("/b/builds/build-1")));
+
+        // fork and link write no file here — the host does — but they name the
+        // notebook the adoption leaves behind all the same.
+        let fork = planned_in(
+            &owned,
+            r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#,
+        );
+        assert!(fork.write.is_none());
+        assert_eq!(fork.overlay.as_ref(), Some(&notebook));
+        // And nothing of the argv moved: the host still writes into the stage.
+        assert_eq!(fork.argv[2], "/b/stage");
+
+        // A verb that leaves no notebook names none.
+        for json in [r#"{"verb":"list"}"#, r#"{"verb":"rebuild"}"#] {
+            assert_eq!(planned_in(&owned, json).overlay, None, "{json}");
+        }
+
+        // With no decisions root the same two verbs plan into the staging tree.
+        let staged = PathBuf::from("/b/overlays/glade-decisions-keys-a.gyld.py");
+        let answer = planned(r#"{"verb":"answer","args":{"stream":"keys-a","overlay":"text"}}"#);
+        assert_eq!(answer.write.expect("a write").path, staged);
+        assert_eq!(answer.overlay, Some(staged.clone()));
+        let fork = planned(r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#);
+        assert_eq!(fork.overlay, Some(staged));
+    }
+
+    #[test]
+    fn a_written_path_may_leave_the_bundle_root_only_for_the_decisions_root() {
+        let plain = layout();
+        let owned = with_decisions();
+        let notebook = PathBuf::from("/glade-wz/decisions/glade-decisions-a.gyld.py");
+
+        assert!(writable(&plain, &PathBuf::from("/b/overlays/x.gyld.py")));
+        assert!(writable(&owned, &PathBuf::from("/b/overlays/x.gyld.py")));
+        assert!(
+            writable(&owned, &notebook),
+            "the decisions root is the second home, and only when configured"
+        );
+        assert!(
+            !writable(&plain, &notebook),
+            "a decisions path is nowhere at all when no decisions root was given"
+        );
+        for elsewhere in [
+            "/etc/passwd",
+            "/glade-wz/decisions/../../etc/passwd",
+            "/bb/x",
+        ] {
+            assert!(!writable(&owned, &PathBuf::from(elsewhere)), "{elsewhere}");
+        }
+
+        // And the refusal says which homes it means, both ways.
+        assert_eq!(homes(&plain), "the bundle root /b");
+        assert_eq!(
+            homes(&owned),
+            "the bundle root /b or the decisions root /glade-wz/decisions"
+        );
     }
 
     #[test]

@@ -32,11 +32,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-/// The bundle-root layout, resolved once from the two configured roots.
+/// The bundle-root layout, resolved once from the configured roots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub gyld_root: PathBuf,
     pub bundle_root: PathBuf,
+    /// Where a written overlay module — a NOTEBOOK — is left, when the app
+    /// configured somewhere for them (`--decisions-root`).
+    ///
+    /// The owner's ruling: a notebook the desk writes is his, and his files live
+    /// in a git-tracked folder he commits when he chooses, not in a running
+    /// instance's scratch directory. `None` keeps the earlier arrangement, in
+    /// which a written module lives in the bundle root's own overlays tree.
+    pub decisions_root: Option<PathBuf>,
 }
 
 impl Layout {
@@ -44,12 +52,32 @@ impl Layout {
         Layout {
             gyld_root,
             bundle_root,
+            decisions_root: None,
         }
     }
 
-    /// The writable examples tree (also the overlays home).
+    /// The same layout with a configured decisions root.
+    pub fn with_decisions_root(mut self, decisions_root: Option<PathBuf>) -> Layout {
+        self.decisions_root = decisions_root;
+        self
+    }
+
+    /// The writable examples tree (also the STAGING home: every module the
+    /// capture hosts read is reachable from here, written or seeded).
     pub fn overlays(&self) -> PathBuf {
         self.bundle_root.join("overlays")
+    }
+
+    /// The home of WRITTEN overlays: the decisions root when one is configured,
+    /// else the overlays tree itself.
+    ///
+    /// The one answer to "where does a ruling land", asked by the planner (which
+    /// plans the write) and by the writer (which refuses a write that leaves it).
+    pub fn overlay_home(&self) -> PathBuf {
+        match self.decisions_root.as_ref() {
+            Some(root) => root.clone(),
+            None => self.overlays(),
+        }
     }
 
     /// The staging repository handed to the hosts as `--repository`.
@@ -380,6 +408,22 @@ mod tests {
             PathBuf::from("/g/scripts/emit_decision_streams.py")
         );
         assert_eq!(l.pythonpath(), "/g/src:/g");
+    }
+
+    #[test]
+    fn the_decisions_root_is_the_home_of_written_overlays_when_there_is_one() {
+        // With none configured, a written module lives in the staging tree, as
+        // it always did.
+        let plain = Layout::new(PathBuf::from("/g"), PathBuf::from("/b"));
+        assert_eq!(plain.overlay_home(), PathBuf::from("/b/overlays"));
+        assert_eq!(plain.decisions_root, None);
+
+        // With one, that is the home — and the staging tree is unchanged: it is
+        // still where the capture hosts read, now through links.
+        let owned = plain.with_decisions_root(Some(PathBuf::from("/glade-wz/decisions")));
+        assert_eq!(owned.overlay_home(), PathBuf::from("/glade-wz/decisions"));
+        assert_eq!(owned.overlays(), PathBuf::from("/b/overlays"));
+        assert_eq!(owned.stage_examples(), PathBuf::from("/b/stage/examples"));
     }
 
     #[test]

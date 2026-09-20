@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! glade-gyld --node ws://127.0.0.1:PORT --gyld-root DIR --bundle-root DIR
+//!            [--decisions-root DIR]
 //!            [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output]
 //!            [--ask-id gyld.ask]
 //!            [--streams-id gyld.streams] [--stream-id gyld.stream]
@@ -38,6 +39,7 @@ use glade_gyld::{
 };
 
 const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --bundle-root DIR \
+[--decisions-root DIR] \
 [--share ws-razel] [--glade-id gyld.ops] [--output-id gyld.output] [--ask-id gyld.ask] \
 [--streams-id gyld.streams] [--stream-id gyld.stream] [--decisions-id gyld.decisions] \
 [--lens-id gyld.lens] [--file-id gyld.file] [--static-base /gyld] [--principal P] \
@@ -75,12 +77,20 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> std::io::Result<()> {
     let config = args.config;
     eprintln!(
-        "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, principal {})",
+        "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, decisions-root {}, \
+         principal {})",
         config.node_url,
         config.share,
         config.glade_id,
         config.layout.gyld_root.display(),
         config.layout.bundle_root.display(),
+        // Said either way: a desk whose rulings land in its own scratch tree is
+        // a desk whose rulings nobody will find in git, and that is worth
+        // reading in a log before anybody answers a question.
+        match config.layout.decisions_root.as_ref() {
+            Some(root) => root.display().to_string(),
+            None => "none".to_string(),
+        },
         config.principal.as_deref().unwrap_or("<none>"),
     );
     let supplier = serve(config, args.python).await?;
@@ -116,6 +126,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
     let mut node: Option<String> = None;
     let mut gyld_root: Option<PathBuf> = None;
     let mut bundle_root: Option<PathBuf> = None;
+    let mut decisions_root: Option<PathBuf> = None;
     let mut share = DEFAULT_SHARE.to_string();
     let mut glade_id = DEFAULT_GLADE_ID.to_string();
     let mut output_id = DEFAULT_OUTPUT_ID.to_string();
@@ -134,6 +145,9 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
             "--node" => node = Some(take("--node")?),
             "--gyld-root" => gyld_root = Some(PathBuf::from(take("--gyld-root")?)),
             "--bundle-root" => bundle_root = Some(PathBuf::from(take("--bundle-root")?)),
+            "--decisions-root" => {
+                decisions_root = Some(PathBuf::from(take("--decisions-root")?));
+            }
             "--share" => share = take("--share")?,
             "--glade-id" => glade_id = take("--glade-id")?,
             "--output-id" => output_id = take("--output-id")?,
@@ -201,6 +215,9 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
         gyld_root.ok_or("--gyld-root is required")?,
         bundle_root.ok_or("--bundle-root is required")?,
     );
+    // Optional, and unset means the earlier arrangement: a written overlay lives
+    // in the bundle root's own overlays tree.
+    config.layout = config.layout.with_decisions_root(decisions_root);
     config.share = share;
     config.glade_id = glade_id;
     config.output_id = output_id;

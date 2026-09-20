@@ -404,6 +404,9 @@ fn answer(
     if let Err(e) = write_overlay(&config.layout, &plan) {
         return GyldResponse::failed(e, who);
     }
+    if let Err(e) = stage_notebook(&config.layout, &plan) {
+        return GyldResponse::failed(e, who);
+    }
 
     // `explain` runs no host: it consults. A consult plan carries no argv at
     // all, so nothing about it can reach a runner.
@@ -435,6 +438,9 @@ fn answer(
     }
 
     if request.stream {
+        // Named before the plan is handed over: `answer` and `ask` have already
+        // written their notebook, and that is what the accept says.
+        let left = overlay_left(&plan);
         spawn_stream(
             client.clone(),
             config.clone(),
@@ -444,14 +450,16 @@ fn answer(
             plan,
             who.clone(),
         );
-        return GyldResponse::accepted(run_id, who);
+        return GyldResponse::accepted(run_id, who).leaving(left);
     }
 
     match runner.run(&plan, config.limits, &mut |_, _| {}) {
         Ok(out) => {
+            settle(config, &plan, &out);
             let dir = finish(client, config, handle, &plan, &out);
             let named = dir.as_ref().map(|d| d.display().to_string());
             GyldResponse::ran(run_id, out.exit, out.stdout, out.stderr, named, who)
+                .leaving(overlay_left(&plan))
         }
         Err(e) => GyldResponse::failed(e, who),
     }
@@ -555,6 +563,79 @@ fn write_overlay(layout: &Layout, plan: &Plan) -> Result<(), String> {
 /// other refusal on the write path.
 fn canonical(dir: &std::path::Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve {}: {e}", dir.display()))
+}
+
+/// Point the staging tree at the notebook the write just left in the decisions
+/// root, REPLACING whatever held that name — a seed link into the Gyld checkout,
+/// or a real file from before there was a decisions root.
+///
+/// This is the whole of copy-on-write for a shipped sample. An `answer` on
+/// `stream-a` writes the owner's copy into his folder; this points the staging
+/// tree at it; the sample in the checkout is never touched and is shadowed from
+/// here on. With no decisions root the write already landed in the staging tree
+/// and there is nothing to point anywhere.
+fn stage_notebook(layout: &Layout, plan: &Plan) -> Result<(), String> {
+    let decisions = match layout.decisions_root.as_ref() {
+        Some(root) => root,
+        None => {
+            return Ok(());
+        }
+    };
+    let written = match plan.write.as_ref() {
+        Some(w) => &w.path,
+        None => {
+            return Ok(());
+        }
+    };
+    let name = match written.file_name() {
+        Some(n) => n,
+        None => {
+            return Ok(());
+        }
+    };
+    if written.parent() != Some(decisions.as_path()) {
+        return Ok(());
+    }
+    let staged = layout.overlays().join(name);
+    bundle::relink(written, &staged).map_err(|e| {
+        format!(
+            "cannot point {} at {}: {e}",
+            staged.display(),
+            written.display()
+        )
+    })
+}
+
+/// Take what a Gyld host wrote into the staging tree over to the decisions root.
+///
+/// `fork` and `link` write their module themselves, into `<stage>/examples`, and
+/// read it back to check it — none of which changes. Afterwards the file is the
+/// OWNER's, so [`bundle::ensure_stage`] adopts it: moved to his folder, with a
+/// link left in its place. Idempotent, so a verb that had already settled its
+/// own notebook (`answer`, `ask`) costs one wasted directory listing and nothing
+/// else. A failed run settles nothing — there is no file to take.
+///
+/// An adoption failure is a LOG LINE, not a refusal: the run itself succeeded,
+/// the module is in the staging tree, and the stream builds either way.
+fn settle(config: &GyldConfig, plan: &Plan, out: &RunOutput) {
+    if out.exit != 0 || plan.overlay.is_none() || config.layout.decisions_root.is_none() {
+        return;
+    }
+    if let Err(e) = bundle::ensure_stage(&config.layout) {
+        eprintln!("glade-gyld: could not adopt the notebook this run wrote: {e}");
+    }
+}
+
+/// The notebook this verb has left behind, IF it is really there now.
+///
+/// A path that exists, not a path that was planned. `answer` and `ask` write the
+/// file before the answer goes out, so they always name it; a streamed `fork`
+/// answers before its host has run at all, and names nothing rather than promise
+/// a file that may never arrive.
+fn overlay_left(plan: &Plan) -> Option<String> {
+    let path = plan.overlay.as_ref()?;
+    path.symlink_metadata().ok()?;
+    Some(path.display().to_string())
 }
 
 /// Record a successful build as the bundle root's latest, publish its documents
@@ -704,6 +785,7 @@ async fn stream_run(
 
     let exit = match work.await {
         Ok((plan, Ok(out))) => {
+            settle(&config, &plan, &out);
             finish(&client, &config, &inner, &plan, &out);
             out.exit
         }
@@ -1298,6 +1380,74 @@ mod tests {
         assert!(
             !staged.symlink_metadata().unwrap().file_type().is_symlink(),
             "the write replaced the link rather than following it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copy-on-write, end to end: the owner answers a question in a sample that
+    /// ships with Gyld, and gets a file of his own without the sample changing.
+    #[test]
+    fn an_answer_on_a_shipped_sample_leaves_the_owners_copy_and_points_the_stage_at_it() {
+        let dir = root("copy-on-write");
+        let gyld = dir.join("gyld");
+        let name = "glade-decisions-stream-a.gyld.py";
+        std::fs::create_dir_all(gyld.join("examples")).unwrap();
+        let shipped = gyld.join("examples").join(name);
+        std::fs::write(&shipped, "the shipped sample\n").unwrap();
+        let layout =
+            Layout::new(gyld, dir.join("bundle")).with_decisions_root(Some(dir.join("decisions")));
+        bundle::ensure_stage(&layout).unwrap();
+
+        // The staging tree starts out pointing into the checkout — the exact
+        // arrangement a write used to follow.
+        let staged = layout.overlays().join(name);
+        assert_eq!(std::fs::read_link(&staged).unwrap(), shipped);
+
+        let notebook = layout.overlay_home().join(name);
+        let plan = forced_write(&notebook, "the owner's ruling\n");
+        write_overlay(&layout, &plan).expect("the write lands");
+        stage_notebook(&layout, &plan).expect("the stage is pointed at it");
+
+        assert_eq!(
+            std::fs::read_to_string(&shipped).unwrap(),
+            "the shipped sample\n",
+            "the sample that ships with Gyld is never edited"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&notebook).unwrap(),
+            "the owner's ruling\n"
+        );
+        assert_eq!(
+            std::fs::read_link(&staged).unwrap(),
+            notebook,
+            "the staging tree reads the owner's copy from here on"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.stage_examples().join(name)).unwrap(),
+            "the owner's ruling\n"
+        );
+
+        // And the answer names the file, because the file is there.
+        let named = plan.clone();
+        assert_eq!(
+            overlay_left(&Plan {
+                overlay: Some(notebook.clone()),
+                ..named
+            }),
+            Some(notebook.display().to_string())
+        );
+        // A notebook that is not there yet — a streamed fork, before its host has
+        // run — is named by nobody.
+        assert_eq!(
+            overlay_left(&Plan {
+                overlay: Some(
+                    layout
+                        .overlay_home()
+                        .join("glade-decisions-not-yet.gyld.py")
+                ),
+                ..plan
+            }),
+            None
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

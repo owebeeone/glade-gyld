@@ -121,6 +121,15 @@ pub struct GyldResponse {
     /// The principal the run was attributed to (attribution as data).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attributed_to: Option<String>,
+    /// The overlay module FILE this verb left behind — the NOTEBOOK, in the
+    /// decisions root when the app configured one. Absolute.
+    ///
+    /// It sits BESIDE the Gyld host's own JSON in `stdout`, which names the
+    /// staging path the host wrote: the host's answer is not rewritten, and this
+    /// says where the file the owner commits actually is. A verb that left no
+    /// file, and a verb whose file is not there yet, name none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub overlay_file: Option<String>,
 }
 
 impl GyldResponse {
@@ -166,6 +175,14 @@ impl GyldResponse {
             attributed_to: who,
             ..Default::default()
         }
+    }
+
+    /// The same answer, naming the notebook the verb left behind. A builder
+    /// rather than a seventh parameter on [`GyldResponse::ran`]: the four
+    /// writing verbs are the only ones with anything to say here.
+    pub fn leaving(mut self, overlay_file: Option<String>) -> GyldResponse {
+        self.overlay_file = overlay_file;
+        self
     }
 
     /// Serialize for the exchange payload. Never panics: a serialize failure of

@@ -263,6 +263,10 @@ struct Recorder {
     /// line can be appended before there is anybody to see it (the log surface
     /// is `from-cursor`: a late subscriber misses what it did not ask for).
     gate: Option<Arc<Barrier>>,
+    /// `(path, text)` the run WRITES, the way the real `fork` and `link` host
+    /// writes its generated module into `<repository>/examples` — so there is
+    /// something in the staging tree for the adoption to adopt.
+    wrote: Option<(PathBuf, &'static str)>,
 }
 
 impl Recorder {
@@ -296,6 +300,10 @@ impl Runner for Recorder {
         }
         for (stream, line) in self.lines.iter() {
             on_line(stream, line);
+        }
+        if let Some((path, text)) = self.wrote.as_ref() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
         }
         if self.build {
             if let Some(dir) = plan.output_dir.as_ref() {
@@ -606,6 +614,97 @@ async fn each_verb_maps_to_one_recorded_host_invocation() {
         examples.len(),
         1,
         "the Gyld checkout's examples are read only"
+    );
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 1b. a configured decisions root owns every written notebook ----------
+
+/// The owner's ruling: a notebook the desk writes lives in a git-tracked folder
+/// he commits when he chooses. Over the wire, both ways it can arrive — a module
+/// a HOST wrote into the staging tree (`fork`), and one the SUPPLIER wrote
+/// itself (`answer`, here on a sample that ships with the checkout).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decisions_root_holds_the_notebooks_and_the_stage_links_to_them() {
+    let tmp = Tmp::new("decisions");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+    // A sample that ships with the checkout, which the owner is about to answer
+    // a question in.
+    let sample = "glade-decisions-stream-a.gyld.py";
+    let shipped = gyld.join("examples").join(sample);
+    std::fs::write(&shipped, "# the shipped sample\n").unwrap();
+
+    let decisions = tmp.path().join("decisions");
+    let forked = "glade-decisions-keys-a.gyld.py";
+    let runner = Arc::new(Recorder {
+        build: true,
+        wrote: Some((bundle.join("overlays").join(forked), "# forked\n")),
+        ..Default::default()
+    });
+    let mut config = config_for(&url, gyld.clone(), bundle.clone());
+    config.layout = config
+        .layout
+        .clone()
+        .with_decisions_root(Some(decisions.clone()));
+    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel))
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    // A fork: the host writes the module into the staging tree and the supplier
+    // adopts it afterwards, leaving a link where the host put it.
+    let out = request(
+        &requester,
+        r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#,
+    )
+    .await;
+    assert!(out.ok, "{out:?}");
+    assert_eq!(
+        out.overlay_file.as_deref(),
+        Some(decisions.join(forked).display().to_string().as_str()),
+        "the answer names the file the owner commits, not the staging path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(decisions.join(forked)).unwrap(),
+        "# forked\n"
+    );
+    assert_eq!(
+        std::fs::read_link(bundle.join("overlays").join(forked)).unwrap(),
+        decisions.join(forked)
+    );
+
+    // An answer on the SHIPPED sample: the owner's copy lands in his folder and
+    // the seed link into the checkout is re-pointed at it.
+    let out = request(
+        &requester,
+        r##"{"verb":"answer","args":{"stream":"stream-a","overlay":"# ruled"}}"##,
+    )
+    .await;
+    assert!(out.ok, "{out:?}");
+    assert_eq!(
+        out.overlay_file.as_deref(),
+        Some(decisions.join(sample).display().to_string().as_str())
+    );
+    assert_eq!(
+        std::fs::read_to_string(decisions.join(sample)).unwrap(),
+        "# ruled\n"
+    );
+    assert_eq!(
+        std::fs::read_link(bundle.join("overlays").join(sample)).unwrap(),
+        decisions.join(sample)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&shipped).unwrap(),
+        "# the shipped sample\n",
+        "the sample that ships with Gyld is never edited"
     );
 
     requester.close().await;

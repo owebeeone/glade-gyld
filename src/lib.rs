@@ -109,7 +109,7 @@ pub use search::{SearchSources, SEARCH_SOURCES};
 pub use sources::{ResolvedSource, SourceIndex, SOURCES_FORMAT};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
-    DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_ID,
+    DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE, FIRST_BUILD_RUN_PREFIX,
 };
 pub use tools::{
     Tool, ToolAnswer, ToolBudgets, ToolContext, ToolOutput, ToolPolicy, ToolRefusal, ToolRegistry,

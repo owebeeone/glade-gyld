@@ -2855,7 +2855,7 @@ async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
                             .error
                             .as_deref()
                             .unwrap_or("")
-                            .contains("the first build is in progress (run boot-1)")
+                            .contains("the first build is in progress (run boot-")
                 }
                 _ => false,
             }

@@ -209,10 +209,11 @@ bundle root or run a host to make a fresh `--data` directory usable.
 
 The moment it is serving, a supplier that finds no build lays the stage
 (`ensure_stage`) and runs the first one as a streaming run on `gyld.output`
-under the run id `boot-1`:
+under the run id `boot-<session>` — the same session tag its numbered runs carry,
+so a second bootstrap of one node store never reuses the first one's key:
 
 ```text
-[gyld] glade-gyld: first build of /…/files/gyld — the bundle root holds none (run boot-1)
+[gyld] glade-gyld: first build of /…/files/gyld — the bundle root holds none (run boot-muaoaymy)
 [gyld] glade-gyld: the checkout declares fork-a, stream-a, stream-b
 [gyld] glade-gyld: published builds/build-1789363954989 (5 streams)
 ```
@@ -240,11 +241,11 @@ While that run is in flight the supplier **keeps serving**. A verb that needs a
 bundle is refused with the run rather than with a flat denial:
 
 ```text
-the first build is in progress (run boot-1); nothing has landed yet
+the first build is in progress (run boot-muaoaymy); nothing has landed yet
 ```
 
 `fork` and `link` work throughout — they never needed a bundle. A first build
-that fails is failure as **data** on run `boot-1` (its reason on the log, closed
+that fails is failure as **data** on run `boot-<session>` (its reason on the log, closed
 by the usual `{done:true, exit}` marker) plus one log line; the supplier stays
 up, `latest.json` is not written, and the plain `no bundle has been built yet`
 refusal comes back, because at that point one really has not. A checkout that
@@ -271,7 +272,7 @@ argv list**: nothing a requester writes reaches a command line as a flag.
 Response payload:
 
 ```json
-{ "ok": true, "run_id": "run-3", "output_dir": "/…/builds/build-1789247615547",
+{ "ok": true, "run_id": "run-muaoaymy-3", "output_dir": "/…/builds/build-1789247615547",
   "exit": 0, "stdout": "…", "stderr": "…", "attributed_to": "gianni" }
 ```
 
@@ -1024,18 +1025,18 @@ the only thing that ever writes a ruling.
 ## Long-op output (log `gyld.output`)
 
 `stream_output: true` answers immediately with
-`{ "ok": true, "run_id": "run-3", "done": false }`. The run's stdout and stderr
+`{ "ok": true, "run_id": "run-muaoaymy-3", "done": false }`. The run's stdout and stderr
 lines are appended as ops to the log surface **keyed by `run_id`**, in the
 `gwz.output` record shape exactly, so one consumer folds both:
 
 ```json
-{ "run_id": "run-3", "seq": 1, "principal": "gianni", "stream": "stdout", "line": "…" }
+{ "run_id": "run-muaoaymy-3", "seq": 1, "principal": "gianni", "stream": "stdout", "line": "…" }
 ```
 
 closed by a terminal marker:
 
 ```json
-{ "run_id": "run-3", "seq": 7, "principal": "gianni", "stream": "end", "done": true, "exit": 0 }
+{ "run_id": "run-muaoaymy-3", "seq": 7, "principal": "gianni", "stream": "end", "done": true, "exit": 0 }
 ```
 
 A consumer subscribes `(share, gyld.output, run_id)` and folds the log to follow
@@ -1053,7 +1054,7 @@ accept could not — it went out before the host ran. Two ADDITIVE fields, so a
 consumer that has never heard of them reads the record exactly as it did before:
 
 ```json
-{ "run_id": "run-3", "seq": 7, "stream": "end", "done": true, "exit": 0,
+{ "run_id": "run-muaoaymy-3", "seq": 7, "stream": "end", "done": true, "exit": 0,
   "overlay_file": "/glade-wz/decisions/glade-decisions-stream-a.gyld.py" }
 ```
 
@@ -1061,7 +1062,7 @@ on a write that stood — the same value the answer's `overlay_file` reports, an
 the ONE thing that means "saved" — and on a write that was refused:
 
 ```json
-{ "run_id": "run-4", "seq": 9, "stream": "end", "done": true, "exit": 0,
+{ "run_id": "run-muaoaymy-4", "seq": 9, "stream": "end", "done": true, "exit": 0,
   "refusal": { "stream": "stream-a", "code": "SELECTION_NOT_OFFERED",
                "message": "…does not offer…", "details": {…}, "restored": true } }
 ```

@@ -220,13 +220,17 @@ pub async fn serve_with(
         },
     );
 
-    let first = Arc::new(FirstBuild::new());
+    // One run counter AND one session tag for the supplier's lifetime, made here
+    // because the first build's id comes off the same tag: the clock is read once.
+    let runs = Arc::new(Runs::new());
+    let first = Arc::new(FirstBuild::new(runs.boot()));
     let handler = make_handler(
         client.clone(),
         config.clone(),
         runner.clone(),
         model,
         Handle::current(),
+        runs,
         first.clone(),
     );
     supplier
@@ -311,6 +315,20 @@ impl Runs {
     fn mint(&self) -> String {
         mint_run_id(&self.session, self.next.fetch_add(1, Ordering::SeqCst) + 1)
     }
+
+    /// The id of the first build this process may make for itself: the same
+    /// session tag its numbered runs carry, and no number of its own, because
+    /// nobody asked for that run.
+    ///
+    /// It needs the session for the reason every other id does. Its output and
+    /// its terminal record go on the persistent `gyld.output` log too, so a
+    /// constant id makes a second bootstrap of one node store — a bundle root
+    /// purged or replaced while the store is kept — append a second first build
+    /// under the first one's key, and a reader looking up this bootstrap's
+    /// outcome finds the earlier one's terminal record.
+    fn boot(&self) -> String {
+        mint_boot_run_id(&self.session)
+    }
 }
 
 /// One run id, from the session it was minted in and the number it took.
@@ -321,6 +339,15 @@ impl Runs {
 /// that no two runs anywhere ever share one.
 fn mint_run_id(session: &str, n: u64) -> String {
     format!("run-{session}-{n}")
+}
+
+/// The first build's run id, from the session it was minted in.
+///
+/// Opaque on the same terms as [`mint_run_id`]'s: the one thing a reader may know
+/// about it is [`FIRST_BUILD_RUN_PREFIX`], which the desk's `bootRunOf` tests
+/// before displaying the whole string.
+fn mint_boot_run_id(session: &str) -> String {
+    format!("{FIRST_BUILD_RUN_PREFIX}{session}")
 }
 
 /// A tag for this process, read off the clock when the counter is made.
@@ -353,9 +380,12 @@ fn base36(mut n: u128) -> String {
     out.into_iter().collect()
 }
 
-/// The run id the supplier's own first build takes. Deliberately not `run-N`:
-/// nobody asked for this run, so it is not numbered among the ones that were.
-pub const FIRST_BUILD_RUN_ID: &str = "boot-1";
+/// The prefix on the run id of the supplier's own first build — `boot-<session>`.
+/// Deliberately not `run-`: nobody asked for this run, so it is not numbered
+/// among the ones that were. The session tag behind it is what a reader must NOT
+/// assume, so this is all that is public: the id itself is minted per process,
+/// and singling the run out means testing this prefix.
+pub const FIRST_BUILD_RUN_PREFIX: &str = "boot-";
 
 /// The first build the supplier makes for itself, and whether it is still
 /// running.
@@ -370,9 +400,12 @@ struct FirstBuild {
 }
 
 impl FirstBuild {
-    fn new() -> FirstBuild {
+    /// Handed the id rather than minting one, so the session tag behind it is the
+    /// process's single reading of the clock — [`Runs::boot`] is where it comes
+    /// from.
+    fn new(run_id: String) -> FirstBuild {
         FirstBuild {
-            run_id: FIRST_BUILD_RUN_ID.to_string(),
+            run_id,
             running: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -467,11 +500,9 @@ fn make_handler(
     runner: Arc<dyn Runner>,
     model: Arc<dyn ModelClient>,
     handle: Handle,
+    runs: Arc<Runs>,
     first: Arc<FirstBuild>,
 ) -> impl Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static {
-    // One run counter AND one session tag for the supplier's lifetime, so the ids
-    // it mints are distinct from the ones the process before it minted.
-    let runs = Arc::new(Runs::new());
     // One running total per conversation, for the supplier's lifetime
     // (GyldAskAgent.md section 7).
     let ledger = Arc::new(Ledger::default());
@@ -1658,9 +1689,9 @@ async fn append_ask(
 }
 
 /// Lay the bundle root and give it its first build, as a STREAMING run on the
-/// output surface keyed by [`FIRST_BUILD_RUN_ID`] — the same path a `rebuild`
-/// takes, so the build lands, `latest.json` is swapped and the census is
-/// published by the code that already does all three.
+/// output surface keyed by this process's own [`FIRST_BUILD_RUN_PREFIX`] id — the
+/// same path a `rebuild` takes, so the build lands, `latest.json` is swapped and
+/// the census is published by the code that already does all three.
 ///
 /// The supplier keeps serving throughout: this is a task, and the verbs that
 /// need a bundle are refused meanwhile with a message that names the run
@@ -1916,6 +1947,36 @@ mod tests {
         assert_eq!(fragment.parent(), Some(layout.requests().as_path()));
     }
 
+    /// The FIRST build's id carries the session too. Its output and its terminal
+    /// record go on the same persistent `gyld.output` log, so a constant id gives
+    /// a second bootstrap of one node store — a bundle root purged or replaced
+    /// while the store is kept — the FIRST bootstrap's terminal record.
+    #[test]
+    fn two_sessions_mint_different_first_build_ids() {
+        assert_ne!(mint_boot_run_id("mfk3x9p"), mint_boot_run_id("mfk3xa2"));
+    }
+
+    /// The first build's id is a key on the same terms as a numbered run's, and
+    /// the one thing a reader may know about it is its PREFIX: the desk's
+    /// `bootRunOf` tests that and then displays the whole string.
+    #[test]
+    fn a_minted_first_build_id_is_a_prefixed_path_key() {
+        let id = Runs::new().boot();
+        assert!(
+            id.starts_with(FIRST_BUILD_RUN_PREFIX),
+            "the desk singles the first build out by this prefix: {id:?}"
+        );
+        assert!(
+            !id.chars().any(char::is_whitespace),
+            "no whitespace in a run id: {id:?}"
+        );
+        assert_eq!(
+            std::path::Path::new(&id).components().count(),
+            1,
+            "a run id is one path component: {id:?}"
+        );
+    }
+
     /// base36, because the session tag has to be SHORT and still sort as text
     /// the way it sorts in time: at one width its digits ascend in ASCII too, so
     /// a reader that orders ids as strings puts an older session's runs first.
@@ -1935,7 +1996,8 @@ mod tests {
 
     #[test]
     fn the_no_bundle_refusal_names_the_first_build_while_it_is_running() {
-        let first = FirstBuild::new();
+        let runs = Runs::new();
+        let first = FirstBuild::new(runs.boot());
         // Before it starts, and after it ends, the plain refusal stands: there
         // really is no bundle and nothing is coming.
         assert_eq!(first.explain(verbs::NO_BUNDLE.into()), verbs::NO_BUNDLE);
@@ -1943,7 +2005,8 @@ mod tests {
         first.begin();
         let said = first.explain(verbs::NO_BUNDLE.into());
         assert!(
-            said.contains("the first build is in progress") && said.contains("run boot-1"),
+            said.contains("the first build is in progress")
+                && said.contains(&format!("run {}", runs.boot())),
             "{said}"
         );
         assert_ne!(said, verbs::NO_BUNDLE);

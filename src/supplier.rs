@@ -508,6 +508,8 @@ fn make_handler(
     let ledger = Arc::new(Ledger::default());
     // One gate, for the supplier's lifetime: writing verbs run one at a time.
     let writes = Arc::new(WriteGate::default());
+    // One record of the chains this session has picked up, for its lifetime.
+    let resumed = Arc::new(Resumed::default());
     move |req: &ExchangeReq| -> Result<Vec<u8>, String> {
         let response = answer(
             &client,
@@ -519,6 +521,7 @@ fn make_handler(
             &runs,
             &first,
             &writes,
+            &resumed,
             &req.payload,
         );
         Ok(response.to_bytes())
@@ -538,6 +541,7 @@ fn answer(
     runs: &Arc<Runs>,
     first: &Arc<FirstBuild>,
     writes: &Arc<WriteGate>,
+    resumed: &Arc<Resumed>,
     payload: &[u8],
 ) -> GyldResponse {
     let request = match GyldRequest::parse(payload) {
@@ -626,6 +630,7 @@ fn answer(
             config.clone(),
             model.clone(),
             ledger.clone(),
+            resumed.clone(),
             handle.clone(),
             run_id.clone(),
             consult,
@@ -1284,6 +1289,35 @@ async fn resume(client: &GladeClient, share: &str, surfaces: &[(String, Option<V
     }
 }
 
+/// The chains this process has already picked up, so it picks each one up ONCE.
+///
+/// A log surface is written a record at a time — a streaming turn appends
+/// hundreds — and only the FIRST of them is the one that has to land on a chain
+/// this session has never seen. After that the session holds the chain and
+/// `append` continues it on its own, so a resume per record would be a replay
+/// per record for nothing.
+///
+/// Keyed by `(glade_id, key)` because that is what a chain is keyed by
+/// (`node/src/store.rs`, `ChainId`): a conversation and a run are separate
+/// chains on one surface, and picking one up says nothing about the others. The
+/// lock is held across the resume so a second writer to the same chain waits for
+/// the first one's replay instead of racing past it.
+#[derive(Default)]
+struct Resumed {
+    seen: tokio::sync::Mutex<std::collections::HashSet<(String, Vec<u8>)>>,
+}
+
+impl Resumed {
+    /// Resume `(glade_id, key)` the first time this process writes to it.
+    async fn once(&self, client: &GladeClient, share: &str, glade_id: &str, key: &[u8]) {
+        let mut seen = self.seen.lock().await;
+        if !seen.insert((glade_id.to_string(), key.to_vec())) {
+            return;
+        }
+        resume(client, share, &[(glade_id.to_string(), Some(key.to_vec()))]).await;
+    }
+}
+
 /// Publish the build's documents onto the value surfaces (step 4.2), off the
 /// exchange's own thread: the answer already carried the build directory, and a
 /// mount converges when the ops land.
@@ -1552,13 +1586,14 @@ fn spawn_consult(
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
     ledger: Arc<Ledger>,
+    resumed: Arc<Resumed>,
     handle: Handle,
     run_id: String,
     consult: Consultation,
     who: Option<String>,
 ) {
     handle.spawn(consult_run(
-        client, config, model, ledger, run_id, consult, who,
+        client, config, model, ledger, resumed, run_id, consult, who,
     ));
 }
 
@@ -1573,17 +1608,34 @@ fn spawn_consult(
 /// The partial text of a turn the output budget stopped is KEPT and said to be
 /// partial: half an answer that says it is half an answer is data; half an
 /// answer presented as a whole one is not.
+#[allow(clippy::too_many_arguments)]
 async fn consult_run(
     client: GladeClient,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
     ledger: Arc<Ledger>,
+    resumed: Arc<Resumed>,
     run_id: String,
     consult: Consultation,
     who: Option<String>,
 ) {
     let conversation = consult.conversation.clone();
     let question = consult.context.question.trim().to_string();
+
+    // Pick the conversation's chain up first. A conversation id is the desk's
+    // and outlives a supplier restart, so this session may be re-entering a
+    // chain an earlier one wrote — and until it has seen it, the fold below
+    // reads back nothing and every record this turn appends lands on a taken
+    // slot. Once per conversation per process: the turn appends many records
+    // and only the first of them meets an unseen chain.
+    resumed
+        .once(
+            &client,
+            &config.share,
+            &config.ask_id,
+            conversation.as_bytes(),
+        )
+        .await;
 
     // The transcript IS the log share (section 6): the supplier reads back its
     // own records for this conversation and replays them as prior turns. This

@@ -3914,7 +3914,11 @@ async fn a_restarted_supplier_keeps_writing_an_open_conversation() {
     let req = GladeClient::new("requester-1");
     req.connect(&url).await.unwrap();
     attached(&req).await;
-    assert!(request(&req, &explain("base", "who holds the key?")).await.ok);
+    assert!(
+        request(&req, &explain("base", "who holds the key?"))
+            .await
+            .ok
+    );
     ask_turns(&sub, CONVERSATION, 1).await;
     req.close().await;
     first.shutdown().await;

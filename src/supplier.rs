@@ -36,9 +36,10 @@ use crate::agent::{self, AgentOverrides, Resolved};
 use crate::ask::{self, AgentState, AskDraft, Consultation};
 use crate::bundle::{self, Layout};
 use crate::conversation::{self, Ledger};
-use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse};
+use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, Refusal};
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
 use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
+use crate::outcome::{self, Put, Snapshot};
 use crate::prompt::{self, Prompt};
 use crate::publish::{self, Surfaces};
 use crate::sources::{self, ResolvedSource};
@@ -327,6 +328,58 @@ impl FirstBuild {
     }
 }
 
+/// Writing verbs run ONE AT A TIME, held from before the write until the run has
+/// settled or been put back.
+///
+/// The kit already serialises the exchange handler — one `ExchangeReq` at a time
+/// — so two writes can never interleave. What it does not serialise is a STREAMED
+/// run, which is accepted at once and settles later on its own task. Without this
+/// gate a second `answer` arriving mid-run would write its notebook, and the first
+/// run's refusal would then put the FIRST notebook back over it: the second write
+/// lost, and the bundle agreeing with neither.
+///
+/// One gate and nothing else — no queue, no lock manager, nothing to configure.
+/// It serialises WRITING verbs only, so `list`, `diff` and `explain` are
+/// unaffected, and a writing verb that arrives while one is in flight WAITS,
+/// exactly as a synchronous mutating verb already makes the exchange wait for its
+/// run. A `std::sync` pair rather than a `tokio::sync::Mutex` because the hold
+/// begins in the kit's SYNCHRONOUS handler and ends on a spawned task, and a
+/// guard that crosses that seam must be `Send` and must not need a runtime
+/// flavour to be blocked on.
+#[derive(Debug, Default)]
+pub struct WriteGate {
+    held: std::sync::Mutex<bool>,
+    freed: std::sync::Condvar,
+}
+
+/// The gate, HELD. Dropping it frees the gate, so a run that panics cannot wedge
+/// the desk shut against every write after it.
+pub struct Writing(Arc<WriteGate>);
+
+impl WriteGate {
+    /// Wait until no writing verb is in flight, then take the gate.
+    ///
+    /// A poisoned lock is taken anyway: the state behind it is one `bool`, a
+    /// panic cannot have left it torn, and refusing every write for the rest of
+    /// the process is a worse answer than carrying on.
+    pub fn hold(gate: &Arc<WriteGate>) -> Writing {
+        let mut held = gate.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            held = gate.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        *held = true;
+        Writing(gate.clone())
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        let mut held = self.0.held.lock().unwrap_or_else(|e| e.into_inner());
+        *held = false;
+        self.0.freed.notify_one();
+    }
+}
+
 /// Build the exchange handler. It is a synchronous `Fn` (the kit's contract) and
 /// never returns `Err`, so the WIRE `ExchangeRes.ok` stays `true` and the PAYLOAD
 /// carries success or failure.
@@ -342,6 +395,8 @@ fn make_handler(
     // One running total per conversation, for the supplier's lifetime
     // (GyldAskAgent.md section 7).
     let ledger = Arc::new(Ledger::default());
+    // One gate, for the supplier's lifetime: writing verbs run one at a time.
+    let writes = Arc::new(WriteGate::default());
     move |req: &ExchangeReq| -> Result<Vec<u8>, String> {
         let response = answer(
             &client,
@@ -352,6 +407,7 @@ fn make_handler(
             &handle,
             &runs,
             &first,
+            &writes,
             &req.payload,
         );
         Ok(response.to_bytes())
@@ -370,6 +426,7 @@ fn answer(
     handle: &Handle,
     runs: &Arc<AtomicU64>,
     first: &Arc<FirstBuild>,
+    writes: &Arc<WriteGate>,
     payload: &[u8],
 ) -> GyldResponse {
     let request = match GyldRequest::parse(payload) {
@@ -401,6 +458,19 @@ fn answer(
     };
     let run_id = format!("run-{}", runs.fetch_add(1, Ordering::SeqCst) + 1);
 
+    // BEFORE anything is written: what the notebook's name held, so a write Gyld
+    // then rejects can be put back exactly. A snapshot that cannot be taken
+    // refuses the verb here, because the alternative is a restore that would
+    // delete a notebook it could not read.
+    let snapshot = match Snapshot::take(&config.layout, &plan) {
+        Ok(s) => s,
+        Err(e) => {
+            return GyldResponse::failed(e, who);
+        }
+    };
+    // One writing verb at a time, from before the write until the run has
+    // settled or been put back. Held only for a verb that leaves a notebook.
+    let gate = snapshot.as_ref().map(|_| WriteGate::hold(writes));
     if let Err(e) = write_overlay(&config.layout, &plan) {
         return GyldResponse::failed(e, who);
     }
@@ -440,6 +510,13 @@ fn answer(
     if request.stream {
         // Named before the plan is handed over: `answer` and `ask` have already
         // written their notebook, and that is what the accept says.
+        //
+        // It is not yet a notebook that is SAVED, and a desk must not present it
+        // as one. Gyld has not seen the text — the host runs after this answer
+        // goes out — so the file may be about to be put back. The run's TERMINAL
+        // record is where the outcome lives: it carries `overlay_file` when the
+        // write stood and a `refusal` when it did not (README, "A refused
+        // write"). The field stays here for the readers that have it.
         let left = overlay_left(&plan);
         spawn_stream(
             client.clone(),
@@ -449,19 +526,51 @@ fn answer(
             run_id.clone(),
             plan,
             who.clone(),
+            snapshot,
+            latest,
+            gate,
         );
         return GyldResponse::accepted(run_id, who).leaving(left);
     }
 
-    match runner.run(&plan, config.limits, &mut |_, _| {}) {
-        Ok(out) => {
+    let ran = runner.run(&plan, config.limits, &mut |_, _| {});
+    let judged = match ran.as_ref() {
+        Ok(out) => land(
+            &config.layout,
+            &plan,
+            Ok(out),
+            snapshot.as_ref(),
+            latest.as_deref(),
+        ),
+        Err(e) => land(
+            &config.layout,
+            &plan,
+            Err(e),
+            snapshot.as_ref(),
+            latest.as_deref(),
+        ),
+    };
+    match (ran, judged) {
+        // Refused: failure as data, with the message as `error` and Gyld's own
+        // document as `validation` (GyldGrythPlugins.md 4.7). The notebook is
+        // back, the build is gone and nothing was published.
+        (Ok(out), Some((refusal, document))) => GyldResponse::refused(
+            run_id, out.exit, out.stdout, out.stderr, &refusal, document, who,
+        ),
+        (Ok(out), None) => {
             settle(config, &plan, &out);
             let dir = finish(client, config, handle, &plan, &out);
             let named = dir.as_ref().map(|d| d.display().to_string());
             GyldResponse::ran(run_id, out.exit, out.stdout, out.stderr, named, who)
                 .leaving(overlay_left(&plan))
         }
-        Err(e) => GyldResponse::failed(e, who),
+        // A run that never landed at all — a spawn failure, a timeout. The
+        // refusal says the same thing the plain failure used to, and the notebook
+        // is put back before it is said.
+        (Err(e), Some((refusal, document))) => {
+            GyldResponse::refused(run_id, -1, String::new(), e, &refusal, document, who)
+        }
+        (Err(e), None) => GyldResponse::failed(e, who),
     }
 }
 
@@ -633,6 +742,80 @@ fn overlay_left(plan: &Plan) -> Option<String> {
     Some(path.display().to_string())
 }
 
+/// Decide what a writing run DID, and make the bundle root agree with it.
+///
+/// A writing verb that makes things worse is refused and leaves no trace: the
+/// notebook goes back exactly as it was ([`Snapshot::restore`]), the build this
+/// run made is removed, nothing is recorded as the latest and nothing is
+/// published. Answers the refusal and Gyld's own validation document, or `None`
+/// when the write stands and the caller may go on to [`settle`] and [`finish`].
+///
+/// The build directory must GO and not merely be left unpublished:
+/// [`bundle::latest_build`] falls back to the newest `builds/` directory holding a
+/// `streams.json`, so a refused-but-COMPLETE build left behind would become the
+/// current one by itself the next time the pointer was missing or stale.
+///
+/// One line on stderr, always. The defect this answers was silent: a rejected
+/// answer left a broken file, abandoned the rebuild, and said nothing anywhere.
+fn land(
+    layout: &Layout,
+    plan: &Plan,
+    ran: Result<&RunOutput, &str>,
+    snapshot: Option<&Snapshot>,
+    previous: Option<&std::path::Path>,
+) -> Option<(Refusal, Option<serde_json::Value>)> {
+    let (mut refusal, document) = match outcome::classify(plan, ran, previous) {
+        outcome::Outcome::Accepted => {
+            return None;
+        }
+        outcome::Outcome::Refused { refusal, document } => (refusal, document),
+    };
+    let put = match snapshot {
+        Some(snapshot) => match snapshot.restore() {
+            Ok(()) => {
+                refusal.restored = true;
+                Put::Restored
+            }
+            Err(e) => {
+                eprintln!("glade-gyld: the notebook could NOT be put back: {e}");
+                Put::Failed
+            }
+        },
+        None => Put::Nothing,
+    };
+    discard(layout, plan);
+    eprintln!("{}", outcome::said(&plan.verb, &refusal, put));
+    Some((refusal, document))
+}
+
+/// Remove the build this run made, if it made one. Only ever a directory under
+/// the root's own `builds/`: the recursive removal is checked against the layout
+/// rather than trusted to the plan, cheap insurance on the one call here that
+/// deletes a tree.
+fn discard(layout: &Layout, plan: &Plan) {
+    let dir = match plan.output_dir.as_ref() {
+        Some(dir) => dir,
+        None => {
+            return;
+        }
+    };
+    if !bundle::contained(&layout.builds(), dir) {
+        eprintln!(
+            "glade-gyld: not removing {}: it is not under {}",
+            dir.display(),
+            layout.builds().display()
+        );
+        return;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("glade-gyld: could not remove {}: {e}", dir.display());
+        }
+    }
+}
+
 /// Record a successful build as the bundle root's latest, publish its documents
 /// onto the value surfaces, and answer with the directory it built. A failed run
 /// advertises nothing: the previous bundle stands untouched and nothing is
@@ -729,6 +912,7 @@ fn read_bounded(path: &std::path::Path, max: usize) -> Result<String, String> {
 }
 
 /// Accept a streaming run and answer at once: [`stream_run`] on its own task.
+#[allow(clippy::too_many_arguments)]
 fn spawn_stream(
     client: GladeClient,
     config: Arc<GyldConfig>,
@@ -737,9 +921,14 @@ fn spawn_stream(
     run_id: String,
     plan: Plan,
     who: Option<String>,
+    snapshot: Option<Snapshot>,
+    previous: Option<PathBuf>,
+    gate: Option<Writing>,
 ) {
     let inner = handle.clone();
-    handle.spawn(stream_run(client, config, runner, inner, run_id, plan, who));
+    handle.spawn(stream_run(
+        client, config, runner, inner, run_id, plan, who, snapshot, previous, gate,
+    ));
 }
 
 /// Run the plan on a blocking task, appending every output line to the log
@@ -749,6 +938,12 @@ fn spawn_stream(
 ///
 /// Resolves when the run has landed and its terminal record is on the log, so a
 /// caller that must know when a build finished — the first build — can await it.
+///
+/// The TERMINAL record carries the outcome of a writing verb, because the accept
+/// answer could not: it went out before the host ran. A refused write appends the
+/// `refusal` there and an accepted one the notebook it really left, so a desk says
+/// "saved" once the run says so and not before.
+#[allow(clippy::too_many_arguments)]
 async fn stream_run(
     client: GladeClient,
     config: Arc<GyldConfig>,
@@ -757,17 +952,23 @@ async fn stream_run(
     run_id: String,
     plan: Plan,
     who: Option<String>,
+    snapshot: Option<Snapshot>,
+    previous: Option<PathBuf>,
+    gate: Option<Writing>,
 ) {
     let inner = handle;
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, String)>();
     let limits = config.limits;
+    // The plan is judged HERE and run over there: a copy stays behind so a run
+    // whose task died outright is still put back, which a plan handed to the task
+    // and lost with it could not be.
+    let judged = plan.clone();
     let work = {
         let runner = runner.clone();
         tokio::task::spawn_blocking(move || {
-            let result = runner.run(&plan, limits, &mut |stream, line| {
+            runner.run(&plan, limits, &mut |stream, line| {
                 let _ = tx.send((stream.to_string(), line.to_string()));
-            });
-            (plan, result)
+            })
         })
     };
 
@@ -778,37 +979,65 @@ async fn stream_run(
         append(&client, &config, &run_id, &record).await;
     }
 
-    let exit = match work.await {
-        Ok((plan, Ok(out))) => {
-            settle(&config, &plan, &out);
-            finish(&client, &config, &inner, &plan, &out);
-            out.exit
+    let (exit, refused) = match work.await {
+        Ok(Ok(out)) => {
+            let refused = land(
+                &config.layout,
+                &judged,
+                Ok(&out),
+                snapshot.as_ref(),
+                previous.as_deref(),
+            );
+            if refused.is_none() {
+                settle(&config, &judged, &out);
+                finish(&client, &config, &inner, &judged, &out);
+            }
+            (out.exit, refused)
         }
-        Ok((_, Err(e))) => {
+        Ok(Err(e)) => {
             seq += 1;
-            let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", e);
+            let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", e.clone());
             append(&client, &config, &run_id, &record).await;
-            -1
+            let refused = land(
+                &config.layout,
+                &judged,
+                Err(&e),
+                snapshot.as_ref(),
+                previous.as_deref(),
+            );
+            (-1, refused)
         }
         Err(e) => {
+            let said = format!("run task failed: {e}");
             seq += 1;
-            let record = GyldOutputRecord::line(
-                &run_id,
-                seq,
-                &who,
-                "stderr",
-                format!("run task failed: {e}"),
-            );
+            let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", said.clone());
             append(&client, &config, &run_id, &record).await;
-            -1
+            let refused = land(
+                &config.layout,
+                &judged,
+                Err(&said),
+                snapshot.as_ref(),
+                previous.as_deref(),
+            );
+            (-1, refused)
         }
+    };
+    // The write has settled or been put back: the next writing verb may go.
+    drop(gate);
+
+    // The notebook this run really left, and only on a run that was not refused.
+    let saved = match refused.is_some() {
+        true => None,
+        false => overlay_left(&judged),
     };
     seq += 1;
     append(
         &client,
         &config,
         &run_id,
-        &GyldOutputRecord::end(&run_id, seq, &who, exit),
+        &GyldOutputRecord::end(&run_id, seq, &who, exit)
+            .refusing(refused.map(|(refusal, _)| refusal))
+            .leaving(saved),
     )
     .await;
 }
@@ -1084,6 +1313,10 @@ fn spawn_first_build(
         };
         match prepared {
             Ok(Ok(plan)) => {
+                // Nothing to put back and nothing to wait for: the first build
+                // writes no notebook, and there is no previous build for its
+                // streams to have been valid in. A failed one still has its
+                // half-written directory removed, which is `land`'s business.
                 stream_run(
                     client.clone(),
                     config.clone(),
@@ -1092,6 +1325,9 @@ fn spawn_first_build(
                     run_id.clone(),
                     plan,
                     who.clone(),
+                    None,
+                    None,
+                    None,
                 )
                 .await;
             }
@@ -1501,6 +1737,255 @@ mod tests {
         );
         assert_eq!(prompt.user, "why is this blocked?");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build stand-in: the directory and the `streams.json` that makes it one,
+    /// plus one stream's validation document.
+    fn built(dir: &std::path::Path, stream: &str, ok: bool) -> PathBuf {
+        let streams = dir.join("streams").join(stream);
+        std::fs::create_dir_all(&streams).unwrap();
+        std::fs::write(dir.join("streams.json"), r#"{"format":"gyld.streams.v1"}"#).unwrap();
+        let body = serde_json::json!({
+            "format": "gyld.validation.v1", "stream": stream, "built": "b", "ok": ok,
+            "code": "SELECTION_NOT_OFFERED", "message": "VersionPin does not offer SdaxRs",
+            "details": {}, "findings": [],
+        });
+        std::fs::write(streams.join("validation.json"), format!("{body}\n")).unwrap();
+        dir.to_path_buf()
+    }
+
+    /// An `answer` plan on `stream`, building into `stamp`.
+    fn answering(layout: &Layout, stream: &str, stamp: &str) -> Plan {
+        let notebook = layout.overlay_home().join(verbs::overlay_file(stream));
+        Plan {
+            overlay: Some(notebook.clone()),
+            stream: Some(stream.to_string()),
+            output_dir: Some(layout.new_build_dir(stamp)),
+            verb: "answer".into(),
+            ..forced_write(&notebook, "the ruling\n")
+        }
+    }
+
+    fn ok_run(exit: i32) -> RunOutput {
+        RunOutput {
+            exit,
+            stdout: String::new(),
+            stderr: "ValueError: Selects[NoSuchAlternative]\n".into(),
+            truncated: false,
+        }
+    }
+
+    /// The defect, as one test: a write Gyld rejects is put back and the
+    /// half-written build it made is gone.
+    #[test]
+    fn a_refused_write_is_put_back_and_its_half_written_build_removed() {
+        let dir = root("refused");
+        let layout = Layout::new(dir.join("gyld"), dir.join("bundle"));
+        bundle::ensure_stage(&layout).unwrap();
+        let plan = answering(&layout, "stream-a", "build-0000000000002");
+        let notebook = plan.overlay.clone().unwrap();
+        std::fs::write(&notebook, "the ruling as it was\n").unwrap();
+
+        let snapshot = outcome::Snapshot::take(&layout, &plan).unwrap().unwrap();
+        write_overlay(&layout, &plan).unwrap();
+        // The abandoned directory a structural failure leaves: a `streams/` with
+        // a diagnostic in it and no `streams.json` at all.
+        let half = plan.output_dir.clone().unwrap();
+        std::fs::create_dir_all(half.join("streams/stream-a")).unwrap();
+
+        let refused = land(&layout, &plan, Ok(&ok_run(1)), Some(&snapshot), None)
+            .expect("a failed run is refused");
+        assert_eq!(refused.0.stream, "stream-a");
+        assert_eq!(refused.0.code, outcome::RUN_FAILED);
+        assert!(refused.0.restored, "the notebook is back");
+        assert_eq!(
+            std::fs::read_to_string(&notebook).unwrap(),
+            "the ruling as it was\n"
+        );
+        assert!(!half.exists(), "the half-written build is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reason the directory must GO and not merely be left unpublished:
+    /// [`bundle::latest_build`] falls back to the newest `builds/` directory
+    /// holding a `streams.json`, so a refused-but-COMPLETE build left behind
+    /// would become the current one by itself.
+    #[test]
+    fn a_refused_but_complete_build_is_removed_and_the_previous_one_still_answers() {
+        let dir = root("refused-complete");
+        let layout = Layout::new(dir.join("gyld"), dir.join("bundle"));
+        bundle::ensure_stage(&layout).unwrap();
+        let before = built(
+            &layout.new_build_dir("build-0000000000001"),
+            "stream-a",
+            true,
+        );
+        bundle::write_latest(&layout, &before).unwrap();
+
+        let plan = answering(&layout, "stream-a", "build-0000000000002");
+        let notebook = plan.overlay.clone().unwrap();
+        let snapshot = outcome::Snapshot::take(&layout, &plan).unwrap().unwrap();
+        write_overlay(&layout, &plan).unwrap();
+        // Exit 0, a complete bundle, and the written stream invalid in it: the
+        // findings class.
+        let after = built(&plan.output_dir.clone().unwrap(), "stream-a", false);
+
+        let refused = land(
+            &layout,
+            &plan,
+            Ok(&ok_run(0)),
+            Some(&snapshot),
+            Some(&before),
+        )
+        .expect("the findings class is refused");
+        assert_eq!(refused.0.code, "SELECTION_NOT_OFFERED");
+        assert_eq!(
+            refused.1.as_ref().and_then(|d| d.get("format")),
+            Some(&serde_json::json!("gyld.validation.v1")),
+            "Gyld's own document travels verbatim"
+        );
+        assert!(!after.exists(), "the refused build is gone");
+        assert_eq!(
+            bundle::latest_build(&layout).as_deref(),
+            Some(before.as_path()),
+            "the build that stood before the refused write is still the current one"
+        );
+        assert!(
+            notebook.symlink_metadata().is_err(),
+            "a first ruling that is refused leaves no notebook at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stream already `ok:false` before the write is NOT refused: the owner may
+    /// be part-way through repairing a notebook.
+    #[test]
+    fn a_write_onto_an_already_invalid_stream_is_not_refused() {
+        let dir = root("repairing");
+        let layout = Layout::new(dir.join("gyld"), dir.join("bundle"));
+        bundle::ensure_stage(&layout).unwrap();
+        let before = built(
+            &layout.new_build_dir("build-0000000000001"),
+            "stream-a",
+            false,
+        );
+        let plan = answering(&layout, "stream-a", "build-0000000000002");
+        let snapshot = outcome::Snapshot::take(&layout, &plan).unwrap().unwrap();
+        write_overlay(&layout, &plan).unwrap();
+        let after = built(&plan.output_dir.clone().unwrap(), "stream-a", false);
+
+        assert!(land(
+            &layout,
+            &plan,
+            Ok(&ok_run(0)),
+            Some(&snapshot),
+            Some(&before)
+        )
+        .is_none());
+        assert!(
+            after.exists(),
+            "an accepted build is left where it was built"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan.overlay.as_ref().unwrap()).unwrap(),
+            "the ruling\n",
+            "the repair the owner is making stands"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plain `rebuild` has no notebook to put back, and its failed directory
+    /// goes all the same.
+    #[test]
+    fn a_failed_rebuild_leaves_no_directory_and_nothing_to_restore() {
+        let dir = root("rebuild");
+        let layout = Layout::new(dir.join("gyld"), dir.join("bundle"));
+        bundle::ensure_stage(&layout).unwrap();
+        let mut plan = answering(&layout, "stream-a", "build-0000000000002");
+        plan.verb = "rebuild".into();
+        plan.write = None;
+        plan.overlay = None;
+        plan.stream = None;
+        let half = plan.output_dir.clone().unwrap();
+        std::fs::create_dir_all(half.join("streams")).unwrap();
+
+        let refused =
+            land(&layout, &plan, Err("timed out after 30s"), None, None).expect("refused");
+        assert_eq!(refused.0.stream, "");
+        assert_eq!(refused.0.message, "timed out after 30s");
+        assert!(!refused.0.restored);
+        assert!(!half.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The terminal record is extended ADDITIVELY: every field an old-shape
+    /// reader knows is exactly what it was, and the two new ones are absent
+    /// unless there is something to say.
+    #[test]
+    fn the_terminal_record_carries_the_outcome_without_disturbing_an_old_reader() {
+        let plain = GyldOutputRecord::end("run-1", 4, &Some("gianni".into()), 0);
+        let accepted = plain.clone().leaving(Some("/decisions/a.gyld.py".into()));
+        let refused = plain.clone().refusing(Some(Refusal {
+            stream: "stream-a".into(),
+            code: "SELECTION_NOT_OFFERED".into(),
+            message: "VersionPin does not offer SdaxRs".into(),
+            details: Some(serde_json::json!({ "ruling": "R" })),
+            restored: true,
+        }));
+
+        // An old-shape reader: the record's fields as they were, on all three.
+        for record in [&plain, &accepted, &refused] {
+            let seen: serde_json::Value = serde_json::from_slice(&record.to_bytes()).unwrap();
+            assert_eq!(seen["run_id"], "run-1");
+            assert_eq!(seen["seq"], 4);
+            assert_eq!(seen["principal"], "gianni");
+            assert_eq!(seen["stream"], "end");
+            assert_eq!(seen["done"], true);
+            assert_eq!(seen["exit"], 0);
+        }
+        let bare: serde_json::Value = serde_json::from_slice(&plain.to_bytes()).unwrap();
+        assert!(bare.get("refusal").is_none() && bare.get("overlay_file").is_none());
+
+        let seen: serde_json::Value = serde_json::from_slice(&accepted.to_bytes()).unwrap();
+        assert_eq!(seen["overlay_file"], "/decisions/a.gyld.py");
+        assert!(seen.get("refusal").is_none());
+
+        let seen: serde_json::Value = serde_json::from_slice(&refused.to_bytes()).unwrap();
+        assert_eq!(seen["refusal"]["code"], "SELECTION_NOT_OFFERED");
+        assert_eq!(seen["refusal"]["stream"], "stream-a");
+        assert_eq!(seen["refusal"]["restored"], true);
+        assert_eq!(seen["refusal"]["details"]["ruling"], "R");
+        assert!(seen.get("overlay_file").is_none());
+    }
+
+    /// Writing verbs run ONE AT A TIME. Without this a second `answer` arriving
+    /// mid-run would write its notebook and the first run's refusal would put the
+    /// FIRST notebook back over it.
+    #[test]
+    fn writing_verbs_run_one_at_a_time() {
+        let gate = Arc::new(WriteGate::default());
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+        let held = WriteGate::hold(&gate);
+        order.lock().unwrap().push("first in");
+        let second = {
+            let gate = gate.clone();
+            let order = order.clone();
+            std::thread::spawn(move || {
+                let _held = WriteGate::hold(&gate);
+                order.lock().unwrap().push("second in");
+            })
+        };
+        // The second writer is waiting, not writing: it cannot have logged yet.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(*order.lock().unwrap(), vec!["first in"]);
+        order.lock().unwrap().push("first out");
+        drop(held);
+        second.join().unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["first in", "first out", "second in"]
+        );
     }
 
     #[test]

@@ -3841,13 +3841,9 @@ async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
     first.shutdown().await;
 
     // ---- session two: the restart, same origin, empty chain state ----------
-    let second = serve_with(
-        config_for(&url, gyld, bundle),
-        runner,
-        Arc::new(NoModel),
-    )
-    .await
-    .unwrap();
+    let second = serve_with(config_for(&url, gyld, bundle), runner, Arc::new(NoModel))
+        .await
+        .unwrap();
     let req = GladeClient::new("requester-2");
     req.connect(&url).await.unwrap();
     attached(&req).await;

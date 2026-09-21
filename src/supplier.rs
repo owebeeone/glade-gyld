@@ -24,7 +24,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -1222,6 +1222,68 @@ fn finish(
     Some(dir.clone())
 }
 
+/// A quiet op receiver means the replay is in: the node ships a subscribed
+/// chain's whole gap in ONE `Ops` frame, and an op only reaches `on_ops` after
+/// the session has already folded it, so nothing further arriving is nothing
+/// further to fold.
+const RESUME_SETTLE: Duration = Duration::from_millis(150);
+
+/// The ceiling on a resume. A chain with no history is shipped no frame at all,
+/// so this is the case the deadline exists for: seq 0 is the right place to
+/// start on a chain that does not exist yet, and waiting longer learns nothing.
+const RESUME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Pick this session's own chains back up before writing to them.
+///
+/// The origin is derived from the configured `(share, glade_id)` and nothing
+/// else, so every session of a data directory writes under the SAME origin. The
+/// chain behind a `(glade_id, key)` therefore already holds whatever earlier
+/// sessions published, and a session that appends without having seen it starts
+/// at seq 0 on a slot that is already filled — which the node refuses as an
+/// equivocation (`node/src/store.rs`, `Verdict::Equivocation`) — and stamps a
+/// lamport of 1, which loses the value fold to the very record it meant to
+/// replace. Neither refusal is visible from here: `append` ships
+/// fire-and-forget, and the node's error frame correlates to nothing.
+///
+/// Subscribing is what makes the history visible. The node replays the chain,
+/// the client's session folds it, and the next `append` continues it properly:
+/// seq after the stored head, `prev` linked to it, lamport above every lamport
+/// in it. These are value surfaces, never the declared exchange one, so a
+/// subscribe here streams ops back and never re-attaches a provider.
+///
+/// Cheap to repeat: the node remembers what this session has sent it, so every
+/// resume after the first has an empty gap to ship.
+async fn resume(client: &GladeClient, share: &str, surfaces: &[(String, Option<Vec<u8>>)]) {
+    if surfaces.is_empty() {
+        return;
+    }
+    // Taken BEFORE the subscribes, so no replayed frame can land unobserved.
+    let mut ops = client.on_ops().await;
+    for (glade_id, key) in surfaces.iter() {
+        if let Err(e) = client.subscribe(share, glade_id, key.as_deref()).await {
+            // Say it and publish anyway: a refused resume is a stale value, a
+            // skipped publish is no value at all.
+            eprintln!("glade-gyld: could not resume {glade_id}: {e}");
+            return;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + RESUME_DEADLINE;
+    loop {
+        let settled =
+            tokio::time::timeout_at(deadline, tokio::time::timeout(RESUME_SETTLE, ops.recv()));
+        match settled.await {
+            // An op arrived, and the session has already folded it — keep going.
+            Ok(Ok(Some(_))) => {
+                continue;
+            }
+            // Quiet, closed, or out of time: as caught up as this gets.
+            _ => {
+                break;
+            }
+        }
+    }
+}
+
 /// Publish the build's documents onto the value surfaces (step 4.2), off the
 /// exchange's own thread: the answer already carried the build directory, and a
 /// mount converges when the ops land.
@@ -1239,6 +1301,38 @@ fn spawn_publish(
         let plan = publish::publications(&config.layout, &output_dir, &config.surfaces);
         for note in plan.notes.iter() {
             eprintln!("glade-gyld: not published: {note}");
+        }
+        // Pick the chains up before writing to them: this session's origin is
+        // one an earlier session already wrote under, and appending without its
+        // history is a write that goes nowhere.
+        let surfaces: Vec<(String, Option<Vec<u8>>)> = plan
+            .publications
+            .iter()
+            .map(|p| {
+                (
+                    p.glade_id.clone(),
+                    p.key.as_deref().map(|k| k.as_bytes().to_vec()),
+                )
+            })
+            .collect();
+        resume(&client, &config.share, &surfaces).await;
+        // A publication that has been overtaken must not land. Two of them can be
+        // in flight at once — the build found at attach, and a Rebuild that
+        // arrived while that one was still resuming — and the value fold takes
+        // the HIGHEST lamport, not the newest build, so whichever appends last
+        // wins however old it is. The bundle root's pointer arbitrates: `finish`
+        // records a build as the latest BEFORE it spawns its publish, so an
+        // output directory that is no longer the latest is a stale republish.
+        let overtaken = match (output_dir.file_name(), bundle::latest_build(&config.layout)) {
+            (Some(mine), Some(latest)) => latest.file_name().is_some_and(|newest| newest != mine),
+            _ => false,
+        };
+        if overtaken {
+            eprintln!(
+                "glade-gyld: not published: {} — overtaken by a newer build",
+                named(&config.layout, &output_dir)
+            );
+            return;
         }
         for publication in plan.publications.iter() {
             let key = publication.key.as_deref().map(str::as_bytes);

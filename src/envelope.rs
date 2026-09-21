@@ -51,6 +51,19 @@ pub struct GyldArgs {
     /// `ask`: the added question's module fragment, appended to `overlay`.
     #[serde(default)]
     pub question: Option<String>,
+    /// `answer` / `ask`: the records to FOLD into the notebook that is already
+    /// there — `{imports, classes, members}` (GyldGrythPlugins.md 4.8).
+    ///
+    /// The alternative to `overlay`, and never its companion: `overlay` replaces
+    /// the whole module, a fragment is merged into it by a Gyld host, so one
+    /// notebook can hold as many answers as the owner makes.
+    ///
+    /// Held as raw JSON and carried to that host UNTOUCHED, for the same reason
+    /// `context` is: what a fragment means is Gyld's to say. The supplier checks
+    /// that it is an object and that it fits the overlay byte limit, and reads no
+    /// field of it.
+    #[serde(default)]
+    pub fragment: Option<serde_json::Value>,
     /// One line of provenance recorded on a generated stream record.
     #[serde(default)]
     pub note: Option<String>,

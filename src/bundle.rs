@@ -118,6 +118,17 @@ impl Layout {
         self.bundle_root.join("builds")
     }
 
+    /// Where a REQUEST document a Gyld host has to read off disk is laid down: the
+    /// fragment a `merge` is handed, and nothing else so far.
+    ///
+    /// The bundle root's own directory, never the decisions root: a fragment is a
+    /// request on its way to a host, not a file the owner keeps. It is written
+    /// immediately before the host runs and removed immediately after, whatever
+    /// the host answered.
+    pub fn requests(&self) -> PathBuf {
+        self.bundle_root.join("requests")
+    }
+
     pub fn latest_pointer(&self) -> PathBuf {
         self.bundle_root.join("latest.json")
     }

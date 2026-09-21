@@ -390,6 +390,7 @@ mod tests {
                 text: "the ruling\n".into(),
                 force: true,
             }),
+            merge: None,
             argv: Vec::new(),
             cwd: layout.gyld_root.clone(),
             pythonpath: layout.pythonpath(),

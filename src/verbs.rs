@@ -135,13 +135,38 @@ pub struct PlannedWrite {
     pub force: bool,
 }
 
+/// The Gyld host that folds a FRAGMENT into the notebook that is already there,
+/// and the file it is handed (GyldGrythPlugins.md 4.8).
+///
+/// It runs BEFORE the notebook is written and its stdout IS the merged module, so
+/// the write it precedes is planned with no text and filled from what it printed.
+/// The supplier reads no field of the fragment: what a fragment means is the Gyld
+/// host's to say, and the supplier is a courier for it exactly as it is for the
+/// whole-module text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Merge {
+    /// The fragment document, written where the host can read it and taken away
+    /// again whatever the host answers.
+    pub fragment: PlannedWrite,
+    /// `manage_decision_streams.py --repository <stage> merge <stream> --fragment
+    /// <file>` — one host invocation, built from typed fields like every other.
+    pub argv: Vec<String>,
+}
+
 /// What one request resolves to. Exactly one of `read` (the `list` verb),
 /// `consult` (the `explain` verb) or `argv` (everything else) is set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub verb: String,
     /// The overlay module to write first, for `answer` and `ask`.
+    ///
+    /// Its text is the request's own on the whole-module path, and EMPTY on the
+    /// fragment path, where [`Plan::merge`] runs first and the executor fills it
+    /// in from the merged module that host printed.
     pub write: Option<PlannedWrite>,
+    /// The merge step this verb runs before its write, when the request carried a
+    /// fragment rather than a whole module. `None` is today's path, unchanged.
+    pub merge: Option<Merge>,
     /// The host argv, INCLUDING the script path as argv[0] for the interpreter.
     pub argv: Vec<String>,
     /// The working directory for the host: always the Gyld root.
@@ -182,11 +207,17 @@ pub struct Plan {
 /// the build emitted an index, these are the streams it lists — handed in as
 /// DATA so `explain`'s refusals are produced here too, with no environment
 /// read and no file stat anywhere in this function.
+///
+/// `run` is the run id this request was given, which names the one file a
+/// fragment `answer` lays down: `<bundle-root>/requests/<run-id>.json`. It is
+/// handed in rather than minted here for the same reason `stamp` is — the plan
+/// stays pure, and a test reads the path it planned.
 pub fn plan(
     layout: &Layout,
     request: &GyldRequest,
     latest: Option<&std::path::Path>,
     stamp: &str,
+    run: &str,
     agent: &AgentState,
 ) -> Result<Plan, String> {
     if request.verb.is_empty() {
@@ -214,6 +245,7 @@ pub fn plan(
     let mut plan = Plan {
         verb: request.verb.clone(),
         write: None,
+        merge: None,
         argv: Vec::new(),
         cwd: layout.gyld_root.clone(),
         pythonpath: layout.pythonpath(),
@@ -241,13 +273,36 @@ pub fn plan(
         }
         "answer" | "ask" => {
             let stream = require_stream(args.stream.as_deref(), "stream")?;
-            let text = overlay_text(&request.verb, args)?;
+            let source = source(&request.verb, args)?;
             let bundle = latest.ok_or(NO_BUNDLE)?;
             let output = layout.new_build_dir(stamp);
             // The notebook's home, which is the decisions root when the app
             // configured one: a ruling is the owner's file, and it is written
             // where he keeps his files. The staging tree LINKS to it.
             let notebook = layout.overlay_home().join(overlay_file(stream));
+            let text = match source {
+                Source::Overlay(text) => text,
+                // The fragment path writes nothing yet: the notebook's text is
+                // the merge host's answer, so the write is planned empty and
+                // filled in when that host has spoken.
+                Source::Fragment(document) => {
+                    let file = layout.requests().join(format!("{run}.json"));
+                    plan.merge = Some(Merge {
+                        fragment: PlannedWrite {
+                            path: file.clone(),
+                            text: document,
+                            force: true,
+                        },
+                        argv: base(vec![
+                            "merge".into(),
+                            stream.to_string(),
+                            "--fragment".into(),
+                            file.display().to_string(),
+                        ]),
+                    });
+                    String::new()
+                }
+            };
             plan.write = Some(PlannedWrite {
                 path: notebook.clone(),
                 text,
@@ -320,11 +375,15 @@ pub fn plan(
     // decisions root, which is the one other tree the app gave the supplier.
     // The bundle a verb was handed is checked too, so a stale pointer cannot aim
     // a build elsewhere.
+    // The fragment file is the bundle root's and only the bundle root's: it is a
+    // request document on its way to a host, not a notebook, so the decisions root
+    // is not one of its homes.
     let root = &layout.bundle_root;
     for path in plan
         .output_dir
         .iter()
         .chain(plan.read.iter())
+        .chain(plan.merge.iter().map(|merge| &merge.fragment.path))
         .chain(plan.consult.iter().map(|c| &c.sources))
     {
         if !contained(root, path) {
@@ -382,6 +441,7 @@ pub fn discover_plan(layout: &Layout) -> Plan {
     Plan {
         verb: "discover".into(),
         write: None,
+        merge: None,
         argv: vec![
             "-c".into(),
             DISCOVER.into(),
@@ -446,6 +506,7 @@ pub fn first_build_plan(layout: &Layout, stamp: &str, declared: &[String]) -> Pl
     Plan {
         verb: "rebuild".into(),
         write: None,
+        merge: None,
         argv,
         cwd: layout.gyld_root.clone(),
         pythonpath: layout.pythonpath(),
@@ -476,6 +537,88 @@ fn rebuild_argv(
         argv.push(one_line(built));
     }
     argv
+}
+
+/// What an `answer` or an `ask` is written FROM.
+///
+/// Two ways in, and a request carries exactly one of them. The whole-module path
+/// is the one this supplier has always had; the fragment path leaves the
+/// authoring where it already was — in Gyld and in the desk — and asks a Gyld
+/// host to fold the new records into the notebook that is already there, so a
+/// notebook can hold as many answers as the owner makes.
+enum Source {
+    /// The exported module text, written whole over whatever the name held.
+    Overlay(String),
+    /// The fragment document, serialised and carried to the merge host UNTOUCHED.
+    Fragment(String),
+}
+
+/// Which of the two a request carried, or a refusal. Both or neither is a
+/// refusal as data: the two mean different things about the notebook that is
+/// there, and guessing which was meant would be the supplier authoring.
+fn source(verb: &str, args: &GyldArgs) -> Result<Source, String> {
+    match (args.overlay.is_some(), args.fragment.as_ref()) {
+        (true, Some(_)) => Err(
+            "`overlay` writes the whole module and `fragment` is folded \
+                                into the one that is there; a request carries one or the \
+                                other, never both"
+                .into(),
+        ),
+        (false, None) => Err(format!(
+            "`{verb}` needs either `overlay` (the exported module text) or `fragment` (the \
+             records to fold into the notebook)"
+        )),
+        (true, None) => Ok(Source::Overlay(overlay_text(verb, args)?)),
+        (false, Some(document)) => Ok(Source::Fragment(fragment_text(args, document)?)),
+    }
+}
+
+/// The fragment as the bytes that reach the merge host: a JSON OBJECT, bounded,
+/// and otherwise byte for byte what the requester sent.
+///
+/// The supplier validates the SHAPE and nothing else. Which imports, which
+/// classes and which members a fragment declares is the Gyld host's to read and
+/// to refuse (`NOTEBOOK_ALREADY_HAS` and the rest), so nothing here has to learn
+/// what a ruling is.
+fn fragment_text(args: &GyldArgs, document: &serde_json::Value) -> Result<String, String> {
+    if args.question.is_some() {
+        return Err(
+            "`question` belongs to an `ask` written from `overlay`; a fragment \
+                    carries its own classes"
+                .into(),
+        );
+    }
+    if !document.is_object() {
+        return Err("`fragment` is a JSON object of imports, classes and members".into());
+    }
+    let text = serde_json::to_string(document)
+        .map_err(|e| format!("`fragment` did not serialise: {e}"))?;
+    if text.len() > MAX_OVERLAY_BYTES {
+        return Err(format!(
+            "fragment is {} bytes; the limit is {MAX_OVERLAY_BYTES}",
+            text.len()
+        ));
+    }
+    Ok(text)
+}
+
+/// What the merge host ANSWERED: the last line of its stdout that is a JSON
+/// object, so a host that said something on the way still answers.
+///
+/// The same discipline as [`declared_streams`], and for the same reason: the
+/// checkout is trusted to be honest, not to be quiet.
+pub fn merge_answer(stdout: &str) -> Option<serde_json::Value> {
+    for line in stdout.lines().rev() {
+        match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(value) if value.is_object() => {
+                return Some(value);
+            }
+            _ => {
+                continue;
+            }
+        }
+    }
+    None
 }
 
 /// The overlay module text an `answer` or an `ask` writes. `answer` takes the
@@ -589,6 +732,7 @@ mod tests {
             &request(json),
             Some(Path::new("/b/builds/build-0")),
             "build-1",
+            "run-7",
             &agent(),
         )
         .expect("plan")
@@ -600,6 +744,7 @@ mod tests {
             &request(json),
             Some(Path::new("/b/builds/build-0")),
             "build-1",
+            "run-7",
             &agent(),
         )
         .expect_err("refusal")
@@ -737,6 +882,7 @@ mod tests {
             &request(json),
             Some(Path::new("/b/builds/build-0")),
             "build-1",
+            "run-7",
             &agent(),
         )
         .expect("plan")
@@ -816,6 +962,138 @@ mod tests {
         );
     }
 
+    /// One fragment, as the decide desk composes it (GyldGrythPlugins.md 4.8).
+    fn fragment() -> serde_json::Value {
+        serde_json::json!({
+            "imports": { "decision_stream_concepts": ["Decides", "Ruling"], "gyld": ["use"] },
+            "classes": "class ScopeModelRuling(Ruling):\n    \"\"\"x.\"\"\"\n",
+            "members": ["scope_model_ruling = use(ScopeModelRuling)"],
+        })
+    }
+
+    fn with_fragment(verb: &str) -> Plan {
+        let body = serde_json::json!({
+            "verb": verb,
+            "args": { "stream": "keys-a", "fragment": fragment() },
+        });
+        planned(&body.to_string())
+    }
+
+    #[test]
+    fn a_fragment_answer_plans_a_merge_host_and_a_write_it_fills() {
+        let p = with_fragment("answer");
+        let merge = p.merge.as_ref().expect("a planned merge step");
+        assert_eq!(
+            merge.argv,
+            vec![
+                "/g/scripts/manage_decision_streams.py",
+                "--repository",
+                "/b/stage",
+                "merge",
+                "keys-a",
+                "--fragment",
+                "/b/requests/run-7.json",
+            ]
+        );
+        // The fragment is carried UNTOUCHED: the supplier reads no field of it.
+        assert_eq!(merge.fragment.path, PathBuf::from("/b/requests/run-7.json"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&merge.fragment.text).unwrap(),
+            fragment()
+        );
+        // The notebook's write is planned with no text at all: the merged module is
+        // the host's answer, and the executor fills it in from what the host printed.
+        let write = p.write.as_ref().expect("a planned write");
+        assert_eq!(
+            write.path,
+            PathBuf::from("/b/overlays/glade-decisions-keys-a.gyld.py")
+        );
+        assert_eq!(write.text, "");
+        assert!(write.force);
+        // And the verb still rebuilds afterwards, into a directory of its own.
+        assert_eq!(p.argv[3], "rebuild");
+        assert_eq!(p.output_dir, Some(PathBuf::from("/b/builds/build-1")));
+        assert_eq!(
+            p.overlay,
+            Some(PathBuf::from("/b/overlays/glade-decisions-keys-a.gyld.py"))
+        );
+        assert_eq!(p.stream.as_deref(), Some("keys-a"));
+
+        // An `ask` takes one too, and needs no `question`: a fragment carries its
+        // own classes, which is what a question is.
+        let a = with_fragment("ask");
+        assert!(a.merge.is_some() && a.write.as_ref().unwrap().text.is_empty());
+        assert_eq!(a.merge.unwrap().argv[3], "merge");
+    }
+
+    #[test]
+    fn the_whole_module_path_plans_no_merge_at_all() {
+        for json in [
+            r#"{"verb":"answer","args":{"stream":"keys-a","overlay":"module text"}}"#,
+            r#"{"verb":"ask","args":{"stream":"keys-a","overlay":"m","question":"class Q: pass"}}"#,
+            r#"{"verb":"rebuild"}"#,
+            r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#,
+        ] {
+            assert!(planned(json).merge.is_none(), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_request_carries_the_whole_module_or_a_fragment_and_never_both() {
+        let both = serde_json::json!({
+            "verb": "answer",
+            "args": { "stream": "keys-a", "overlay": "text", "fragment": fragment() },
+        });
+        let e = refused(&both.to_string());
+        assert!(e.contains("one or the other"), "{e}");
+
+        for verb in ["answer", "ask"] {
+            let neither = format!("{{\"verb\":\"{verb}\",\"args\":{{\"stream\":\"keys-a\"}}}}");
+            let e = refused(&neither);
+            assert!(
+                e.contains("`overlay`") && e.contains("`fragment`"),
+                "{verb}: {e}"
+            );
+        }
+
+        // A fragment that is not an object is not a fragment.
+        for value in [
+            serde_json::json!("text"),
+            serde_json::json!([1]),
+            serde_json::json!(7),
+        ] {
+            let body = serde_json::json!({ "verb": "answer", "args": { "stream": "a", "fragment": value } });
+            let e = refused(&body.to_string());
+            assert!(e.contains("JSON object"), "{value}: {e}");
+        }
+
+        // `question` belongs to the module path; a fragment declares its own.
+        let body = serde_json::json!({
+            "verb": "ask",
+            "args": { "stream": "a", "fragment": fragment(), "question": "class Q: pass" },
+        });
+        let e = refused(&body.to_string());
+        assert!(e.contains("carries its own"), "{e}");
+    }
+
+    #[test]
+    fn an_oversize_fragment_is_refused_as_data_like_an_oversize_overlay() {
+        let big = serde_json::json!({ "classes": "x".repeat(MAX_OVERLAY_BYTES + 1) });
+        let body =
+            serde_json::json!({ "verb": "answer", "args": { "stream": "a", "fragment": big } });
+        let e = refused(&body.to_string());
+        assert!(e.contains("the limit is"), "{e}");
+    }
+
+    #[test]
+    fn the_fragment_file_is_checked_against_the_bundle_root_like_every_other_path() {
+        // The request directory is the bundle root's own, so a layout whose bundle
+        // root is elsewhere puts the fragment out of reach of this plan.
+        let layout = Layout::new(PathBuf::from("/g"), PathBuf::from("/b"));
+        assert!(contained(&layout.bundle_root, &layout.requests()));
+        assert_eq!(layout.requests(), PathBuf::from("/b/requests"));
+    }
+
     #[test]
     fn ask_appends_the_question_to_the_exported_module() {
         let p = planned(
@@ -889,6 +1167,7 @@ mod tests {
             &request(&body.to_string()),
             Some(Path::new("/b/builds/b0")),
             "b1",
+            "run-7",
             &agent(),
         )
         .expect_err("refusal");
@@ -902,6 +1181,7 @@ mod tests {
             &request(r#"{"verb":"list"}"#),
             Some(Path::new("/elsewhere")),
             "b1",
+            "run-7",
             &agent(),
         )
         .expect_err("refusal");
@@ -912,7 +1192,8 @@ mod tests {
     fn verbs_that_need_a_bundle_refuse_before_one_exists() {
         for verb in ["list", "rebuild"] {
             let body = format!("{{\"verb\":\"{verb}\"}}");
-            let e = plan(&layout(), &request(&body), None, "b1", &agent()).expect_err("refusal");
+            let e = plan(&layout(), &request(&body), None, "b1", "run-7", &agent())
+                .expect_err("refusal");
             assert!(e.contains("no bundle"), "{verb}: {e}");
         }
         // fork and link do not need one: they generate an overlay module.
@@ -921,6 +1202,7 @@ mod tests {
             &request(r#"{"verb":"fork","args":{"parent":"base","stream":"keys-a"}}"#),
             None,
             "b1",
+            "run-7",
             &agent(),
         );
         assert!(p.is_ok(), "{p:?}");
@@ -997,7 +1279,8 @@ mod tests {
     fn verbs_that_need_a_bundle_all_name_the_same_refusal() {
         for verb in ["list", "rebuild"] {
             let body = format!("{{\"verb\":\"{verb}\"}}");
-            let e = plan(&layout(), &request(&body), None, "b1", &agent()).expect_err("refusal");
+            let e = plan(&layout(), &request(&body), None, "b1", "run-7", &agent())
+                .expect_err("refusal");
             assert_eq!(e, NO_BUNDLE, "{verb}");
         }
     }
@@ -1009,6 +1292,7 @@ mod tests {
             &explain_request(),
             Some(Path::new("/b/builds/build-0")),
             "build-1",
+            "run-7",
             &agent(),
         )
         .expect("a consult plan");
@@ -1040,7 +1324,7 @@ mod tests {
         let bundle = Path::new("/b/builds/build-0");
         let explain = explain_request();
         let refuse = |agent: &AgentState| -> String {
-            plan(&layout(), &explain, Some(bundle), "build-1", agent).expect_err("refusal")
+            plan(&layout(), &explain, Some(bundle), "build-1", "run-7", agent).expect_err("refusal")
         };
 
         // No model key — the whole world is otherwise ready.
@@ -1070,11 +1354,12 @@ mod tests {
 
         // An envelope that did not decode.
         let bad = request(r#"{"verb":"explain","args":{"stream":"base"}}"#);
-        let e = plan(&layout(), &bad, Some(bundle), "build-1", &agent()).expect_err("refusal");
+        let e =
+            plan(&layout(), &bad, Some(bundle), "build-1", "run-7", &agent()).expect_err("refusal");
         assert!(e.contains("`context`"), "{e}");
 
         // And before any of them: a bundle root with no build at all.
-        let e = plan(&layout(), &explain, None, "build-1", &agent()).expect_err("refusal");
+        let e = plan(&layout(), &explain, None, "build-1", "run-7", &agent()).expect_err("refusal");
         assert_eq!(e, NO_BUNDLE);
 
         // Nothing above touched the filesystem: `/b` is not a directory here.
@@ -1088,6 +1373,7 @@ mod tests {
             &explain_request(),
             Some(Path::new("/elsewhere/builds/build-0")),
             "build-1",
+            "run-7",
             &agent(),
         )
         .expect_err("refusal");

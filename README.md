@@ -57,6 +57,9 @@ Python 3.13 and the system `python3` is 3.10, on which they fail.
                       checkout's sample of the same name.
   stage/examples  ->  ../overlays      (the hosts' `--repository <bundle-root>/stage`)
   builds/<stamp>/     one emitted bundle per build; never overwritten.
+  requests/<run>.json a request document a host has to read off disk: so far only
+                      the `fragment` a `merge` is handed. Written immediately
+                      before that host runs and removed immediately after.
   latest.json         {"output_dir": "builds/<stamp>"} — swapped after a
                       successful build.
 ```
@@ -155,6 +158,12 @@ ways and the supplier reads both:
 
 `fork` and `link` build nothing of their own — the host captures what it wrote and
 exits non-zero on an error finding — so rule 1 is the whole rule for them.
+
+A `fragment` answer reaches all three rules unchanged: the merge host runs before
+the write, so by the time the rebuild starts there is one notebook on disk and
+nothing downstream can tell a fragment answer from a whole-module one. A merge the
+merge host itself refused never gets that far — nothing was written, so there is
+nothing to put back and `restored` stays `false`.
 
 **On a refusal**: the snapshot goes back with the same no-follow atomic write the
 write itself used ([`bundle::replace`], [`bundle::relink`], or a removal for a
@@ -280,8 +289,8 @@ was built, and the previous bundle stands untouched.
 | --- | --- | --- |
 | `list` | none | none: reads `streams.json` of the latest build |
 | `explain` | `context` | none: resolves an ask envelope and consults a model |
-| `answer` | `stream`, `overlay` | writes the overlay module, then `rebuild` |
-| `ask` | `stream`, `overlay`, `question` | the same, with the question appended |
+| `answer` | `stream`, and one of `overlay` / `fragment` | writes the overlay module, then `rebuild` |
+| `ask` | `stream`, and one of `overlay` + `question` / `fragment` | the same, with the question appended |
 | `fork` | `parent`, `stream`, `note?`, `force?` | `manage_decision_streams.py fork PARENT NEW` |
 | `link` | `parent`, `stream`, `note?`, `force?` | `manage_decision_streams.py link PARENT NEW` |
 | `rebuild` | `built?` | `manage_decision_streams.py rebuild --bundle LATEST --output NEW` |
@@ -290,6 +299,56 @@ was built, and the previous bundle stands untouched.
 Everything else is refused as data. Excluded and why: `occurred`, `lens` and
 `inspect` are named by section 4.7 but no Gyld host verb exists for them yet,
 and the supplier only ever runs the hosts it can name.
+
+### Two ways into a notebook: `overlay` and `fragment`
+
+`answer` and `ask` each take **exactly one** of them. Both, or neither, is a
+refusal as data: the two mean different things about the notebook that is already
+there, and guessing which was meant would be the supplier authoring.
+
+- **`overlay`** — the whole module text, written over whatever the notebook's
+  name held. One module, one record: a second answer in the same notebook would
+  drop the first.
+- **`fragment`** — the records to **fold into** the module that is there, as
+  `{"imports": {"<module>": ["Name", …], …}, "classes": "<python text of one or
+  more top-level classes>", "members": ["version_pin_ruling = use(VersionPinRuling)", …]}`.
+  One notebook then holds as many answers as the owner makes
+  (`gyld-wz/dev-docs/ui/GyldGrythPlugins.md` section 4.8).
+
+A fragment adds **one extra host invocation before the write**:
+
+```
+manage_decision_streams.py --repository <bundle-root>/stage merge <stream> \
+    --fragment <bundle-root>/requests/<run-id>.json
+```
+
+That host reads the stream's own module with `ast`, folds the fragment into it by
+line span — every other byte carried over, comments included — and **prints** the
+merged module on stdout. It writes no file: the supplier holds the notebook and
+writes back what it read, so the whole write path (snapshot, no-follow atomic
+write into the home, staging link, rebuild, outcome, restore on refusal) is
+exactly the one an `overlay` answer takes.
+
+The fragment travels to that host **untouched**. The supplier checks that it is a
+JSON object within the 1 MiB overlay budget and reads no field of it: what a
+fragment means is Gyld's to say. The fragment file is written immediately before
+the host runs and removed immediately after, whatever it answered.
+
+The merge host's stdout is a whole Gyld module, and `gyld.output` is a place a
+person reads, so those lines are **not** forwarded to the log. One summary line
+goes out in their place: `merged VersionPinRuling into
+glade-decisions-rulings.gyld.py`.
+
+A merge Gyld refuses is a refused run carrying that host's own code and message
+on the terminal record, with nothing written and nothing to put back. Its codes
+are `NOTEBOOK_MISSING`, `NOTEBOOK_ROOT_MISSING`, `NOTEBOOK_ALREADY_HAS`,
+`FRAGMENT_INVALID` and `MERGE_UNPARSEABLE`; answering one question twice in one
+notebook is `NOTEBOOK_ALREADY_HAS`, because changing an answer is an edit of the
+owner's file and not a second copy of the record.
+
+On the fragment path the write therefore happens **inside the run**, after the
+accept — which is why a desk says "saved" from the terminal record and never from
+the accept ("A refused write" above).
 
 `explain` is `ask`'s neighbour on the list and its opposite in effect. `ask`
 appends a QUESTION to a stream's overlay module and rebuilds — it writes Gyld

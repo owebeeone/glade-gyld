@@ -2365,6 +2365,7 @@ fn the_emit_host_answers_help_as_a_real_subprocess() {
     let plan = Plan {
         verb: "help".into(),
         write: None,
+        merge: None,
         argv: vec![
             layout
                 .script("emit_decision_streams.py")
@@ -3224,6 +3225,358 @@ async fn a_write_gyld_rejects_is_refused_and_the_notebook_is_put_back() {
     );
     assert_eq!(std::fs::read(&notebook).unwrap(), was, "byte for byte");
     assert_eq!(build_names(&bundle), builds_were);
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 8. a notebook that holds SEVERAL answers, over the real Gyld hosts ----
+
+/// One fragment, as the decide window composes it (GyldGrythPlugins.md 4.8): the
+/// imports the added classes need, the class text and the members that place it.
+///
+/// Nothing here is the SUPPLIER's spelling — it is the desk's, written out in a
+/// test because the desk is the other side of this contract and the Gyld host is
+/// the only thing that reads it.
+fn ruling_fragment(question: &str, alternative: &str) -> serde_json::Value {
+    let symbol = format!("{question}Ruling");
+    let member = match question {
+        "VersionPin" => "version_pin_ruling",
+        "ScopeModel" => "scope_model_ruling",
+        other => panic!("no member name written down for {other}"),
+    };
+    serde_json::json!({
+        "imports": {
+            "decision_stream_concepts": ["Decides", "Ruling", "Selects"],
+            "glade_decisions": [question, alternative],
+            "gyld": ["use"],
+        },
+        "classes": format!(
+            "class {symbol}(Ruling):\n    \"\"\"2026-09-21, owner: ruled from the desk.\"\"\"\n\
+             \x20   principal = \"gianni\"\n    stamp = \"2026-09-21T00:00:00Z\"\n\
+             \x20   decides = Decides[{question}]\n    selects = Selects[{alternative}]\n"
+        ),
+        "members": [format!("{member} = use({symbol})")],
+    })
+}
+
+/// A fragment `answer` envelope, streamed like every other build.
+fn fragment_envelope(stream: &str, fragment: serde_json::Value) -> String {
+    serde_json::json!({
+        "verb": "answer",
+        "stream_output": true,
+        "args": { "stream": stream, "fragment": fragment },
+    })
+    .to_string()
+}
+
+/// Send one streamed request and fold the run's records once the terminal one is
+/// on the log. [`answered`]'s body, over any envelope rather than an `answer` on
+/// `stream-a`.
+async fn streamed(
+    requester: &GladeClient,
+    sub: &GladeClient,
+    envelope: &str,
+) -> (GyldResponse, Vec<GyldOutputRecord>) {
+    let accept = request(requester, envelope).await;
+    assert!(accept.ok, "the accept is always ok: {accept:?}");
+    let run_id = accept.run_id.clone().expect("run_id on the accept");
+    sub.subscribe("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+        .await
+        .unwrap();
+    let folded = |sub: GladeClient, key: String| async move {
+        sub.fold_log("ws-razel", "gyld.output", Some(key.as_bytes()))
+            .await
+            .iter()
+            .filter_map(|e| serde_json::from_slice::<GyldOutputRecord>(e).ok())
+            .collect::<Vec<GyldOutputRecord>>()
+    };
+    let converged = poll_slowly(|| {
+        let (sub, key) = (sub.clone(), run_id.clone());
+        async move { folded(sub, key).await.iter().any(|r| r.done == Some(true)) }
+    })
+    .await;
+    assert!(converged, "the run {run_id} closed with a terminal record");
+    (accept, folded(sub.clone(), run_id).await)
+}
+
+/// The terminal record of a folded run.
+fn terminal(records: &[GyldOutputRecord]) -> GyldOutputRecord {
+    records
+        .iter()
+        .find(|r| r.done == Some(true))
+        .cloned()
+        .expect("a terminal record")
+}
+
+/// The `decide-now.json` the latest build emitted for one stream.
+fn decide_now(bundle: &Path, stream: &str) -> serde_json::Value {
+    let pointer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(bundle.join("latest.json")).unwrap())
+            .unwrap();
+    let build = bundle.join(pointer["output_dir"].as_str().expect("an output_dir"));
+    let path = build.join("streams").join(stream).join("decide-now.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("cannot read {}: {e}", path.display());
+    }))
+    .expect("the decide-now document")
+}
+
+/// The whole point of the fragment path, over the hosts the owner really runs: ONE
+/// notebook holds as many answers as he makes.
+///
+/// Four facts, in the order a desk meets them:
+///
+/// 1. two fragment answers into one fresh notebook both stand — both classes, both
+///    members, and the build's decide-now list carrying both rulings;
+/// 2. answering the same question twice is refused `NOTEBOOK_ALREADY_HAS`, with the
+///    notebook byte for byte what it was;
+/// 3. a merge that Gyld then REJECTS is refused by the existing outcome rule and
+///    the notebook is put back — the merge itself is not a second way in past it;
+/// 4. a fragment answer on a shipped SAMPLE is copy-on-write: the merge reads the
+///    sample through the staging link, the write lands in the decisions root, and
+///    the checkout is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_notebook_holds_as_many_fragment_answers_as_the_owner_makes() {
+    let gyld = match gyld_checkout() {
+        Some(r) => r,
+        None => {
+            eprintln!("SKIP: no Gyld checkout (set GLADE_GYLD_TEST_GYLD_ROOT)");
+            return;
+        }
+    };
+    let python = PathBuf::from(glade_gyld::DEFAULT_PYTHON);
+    if !python.exists() {
+        eprintln!("SKIP: {} is absent", python.display());
+        return;
+    }
+
+    let tmp = Tmp::new("fragment-real");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let bundle = tmp.path().join("bundle");
+    let decisions = tmp.path().join("decisions");
+    std::fs::create_dir_all(&bundle).unwrap();
+
+    let mut config = config_for(&url, gyld.clone(), bundle.clone());
+    config.layout = config
+        .layout
+        .clone()
+        .with_decisions_root(Some(decisions.clone()));
+    config.limits = Limits {
+        timeout: Duration::from_secs(180),
+        max_output_bytes: 1 << 20,
+    };
+    let _sup = serve_with(
+        config,
+        Arc::new(glade_gyld::PythonRunner::new(python)),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    let landed = poll_slowly(|| {
+        let bundle = bundle.clone();
+        async move { bundle.join("latest.json").is_file() }
+    })
+    .await;
+    assert!(landed, "the supplier's own first build landed");
+    attached(&requester).await;
+
+    // A fresh notebook of the owner's own: a link over the base declaration, which
+    // is what the desk's landing flow presses first.
+    let linked = serde_json::json!({
+        "verb": "link",
+        "stream_output": true,
+        "args": { "parent": "base", "stream": "notes-a", "note": "the owner's notes" },
+    })
+    .to_string();
+    let (_, records) = streamed(&requester, &sub, &linked).await;
+    let end = terminal(&records);
+    assert_eq!(end.exit, Some(0), "the link landed: {end:?}");
+    let notebook = decisions.join("glade-decisions-notes-a.gyld.py");
+    assert!(notebook.is_file(), "the link left the owner a notebook");
+
+    // 1. TWO answers, into that one notebook.
+    let (_, records) = streamed(
+        &requester,
+        &sub,
+        &fragment_envelope("notes-a", ruling_fragment("VersionPin", "BumpToCurrent")),
+    )
+    .await;
+    let end = terminal(&records);
+    assert_eq!(
+        end.refusal, None,
+        "the first fragment answer stands: {end:?}"
+    );
+    assert_eq!(end.exit, Some(0), "{end:?}");
+    assert_eq!(
+        end.overlay_file.as_deref(),
+        Some(notebook.display().to_string().as_str())
+    );
+    // The merged module is the merge host's stdout and never reaches the log: one
+    // summary line goes out in its place.
+    let lines: Vec<String> = records.iter().filter_map(|r| r.line.clone()).collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("merged VersionPinRuling into")),
+        "one summary line, not the module: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("gyld-stream-record")),
+        "the module's own text is not forwarded to the log: {lines:?}"
+    );
+
+    let (_, records) = streamed(
+        &requester,
+        &sub,
+        &fragment_envelope("notes-a", ruling_fragment("ScopeModel", "NodeTrust")),
+    )
+    .await;
+    let end = terminal(&records);
+    assert_eq!(
+        end.refusal, None,
+        "the SECOND answer into the same notebook stands: {end:?}"
+    );
+    assert_eq!(end.exit, Some(0), "{end:?}");
+
+    let text = std::fs::read_to_string(&notebook).expect("the notebook");
+    for held in [
+        "class VersionPinRuling(Ruling):",
+        "class ScopeModelRuling(Ruling):",
+        "    version_pin_ruling = use(VersionPinRuling)",
+        "    scope_model_ruling = use(ScopeModelRuling)",
+    ] {
+        assert!(
+            text.contains(held),
+            "the notebook is missing {held}:\n{text}"
+        );
+    }
+    let listed = decide_now(&bundle, "notes-a");
+    let rulings = listed["rulings"].as_array().expect("the rulings list");
+    assert_eq!(
+        rulings.len(),
+        2,
+        "the build lists both rulings: {rulings:#?}"
+    );
+    let was = std::fs::read(&notebook).unwrap();
+    let builds_were = build_names(&bundle);
+    let latest_was = std::fs::read_to_string(bundle.join("latest.json")).unwrap();
+
+    // 2. The same question twice: refused by name, and nothing moved.
+    let (_, records) = streamed(
+        &requester,
+        &sub,
+        &fragment_envelope("notes-a", ruling_fragment("VersionPin", "StayOnLock")),
+    )
+    .await;
+    let end = terminal(&records);
+    let refusal = end.refusal.clone().expect("a refused merge");
+    assert_eq!(refusal.code, "NOTEBOOK_ALREADY_HAS", "{refusal:?}");
+    assert!(
+        refusal.message.contains("already has VersionPinRuling")
+            && refusal.message.contains("Rebuild"),
+        "the owner is told what to do about it: {}",
+        refusal.message
+    );
+    assert_eq!(end.overlay_file, None, "a refused merge saved nothing");
+    assert_eq!(
+        std::fs::read(&notebook).unwrap(),
+        was,
+        "the notebook is byte for byte what it was"
+    );
+    assert_eq!(build_names(&bundle), builds_were, "and nothing was built");
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("latest.json")).unwrap(),
+        latest_was
+    );
+
+    // 3. A merge Gyld accepts and then REJECTS: `LifecycleComposition` does not
+    //    offer `BumpToCurrent`, so the merged module builds clean and that stream's
+    //    own document is `ok:false`. The existing outcome rule refuses it and puts
+    //    the notebook back, which the merge path did not get to bypass.
+    let rejected = serde_json::json!({
+        "imports": {
+            "decision_stream_concepts": ["Decides", "Ruling", "Selects"],
+            "glade_decisions": ["BumpToCurrent", "LifecycleComposition"],
+            "gyld": ["use"],
+        },
+        "classes": "class LifecycleRuling(Ruling):\n    \"\"\"an answer nobody offered.\"\"\"\n\
+                    \x20   principal = \"gianni\"\n    stamp = \"2026-09-21T00:00:00Z\"\n\
+                    \x20   decides = Decides[LifecycleComposition]\n\
+                    \x20   selects = Selects[BumpToCurrent]\n",
+        "members": ["lifecycle_ruling = use(LifecycleRuling)"],
+    });
+    let (_, records) = streamed(&requester, &sub, &fragment_envelope("notes-a", rejected)).await;
+    let end = terminal(&records);
+    let refusal = end.refusal.clone().expect("a refused write");
+    assert_eq!(refusal.code, "SELECTION_NOT_OFFERED", "{refusal:?}");
+    assert_eq!(refusal.stream, "notes-a");
+    assert!(
+        refusal.restored,
+        "the merged notebook was put back: {refusal:?}"
+    );
+    assert_eq!(
+        std::fs::read(&notebook).unwrap(),
+        was,
+        "byte for byte what it was before the merge"
+    );
+    assert_eq!(build_names(&bundle), builds_were);
+
+    // 4. Copy-on-write on a SHIPPED sample: the merge reads the checkout's own
+    //    module through the staging link and the write lands in the owner's folder.
+    let sample = gyld.join("examples/glade-decisions-stream-a.gyld.py");
+    let shipped = std::fs::read(&sample).expect("the shipped sample");
+    let (_, records) = streamed(
+        &requester,
+        &sub,
+        &fragment_envelope("stream-a", ruling_fragment("ScopeModel", "NodeTrust")),
+    )
+    .await;
+    let end = terminal(&records);
+    assert_eq!(
+        end.refusal, None,
+        "an answer on a shipped sample stands: {end:?}"
+    );
+    let owned = decisions.join("glade-decisions-stream-a.gyld.py");
+    assert_eq!(
+        end.overlay_file.as_deref(),
+        Some(owned.display().to_string().as_str()),
+        "the notebook is the owner's copy, in his folder"
+    );
+    let copy = std::fs::read_to_string(&owned).expect("the owner's copy");
+    assert!(
+        copy.contains("class ScopeModelRuling(Ruling):")
+            && copy.contains("class VersionPinRuling(Ruling):"),
+        "the merge read the sample and added to it:\n{copy}"
+    );
+    assert_eq!(
+        std::fs::read(&sample).unwrap(),
+        shipped,
+        "the sample that ships with Gyld is never touched"
+    );
+    assert_eq!(
+        std::fs::read_link(bundle.join("overlays/glade-decisions-stream-a.gyld.py")).unwrap(),
+        owned,
+        "the staging tree reads the owner's copy from here on"
+    );
+
+    // No fragment document is left behind anywhere: each one is written
+    // immediately before its host and removed immediately after.
+    let left: Vec<String> = std::fs::read_dir(bundle.join("requests"))
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(left.is_empty(), "fragments left on disk: {left:?}");
 
     sub.close().await;
     requester.close().await;

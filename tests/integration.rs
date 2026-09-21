@@ -263,6 +263,14 @@ struct Recorder {
     /// line can be appended before there is anybody to see it (the log surface
     /// is `from-cursor`: a late subscriber misses what it did not ask for).
     gate: Option<Arc<Barrier>>,
+    /// How long the FIRST run dawdles inside the host; the runs behind it go
+    /// straight through. Two overlapping writing verbs need exactly that — the
+    /// first still in flight while the second arrives.
+    hold_first: Option<Duration>,
+    ran: AtomicU64,
+    /// One exit code per run, in order. `exit` serves every run past the end, so
+    /// a test that does not script them is unaffected.
+    exits: Mutex<Vec<i32>>,
     /// `(path, text)` the run WRITES, the way the real `fork` and `link` host
     /// writes its generated module into `<repository>/examples` — so there is
     /// something in the staging tree for the adoption to adopt.
@@ -292,8 +300,12 @@ impl Runner for Recorder {
         on_line: &mut dyn FnMut(&str, &str),
     ) -> Result<RunOutput, String> {
         self.plans.lock().unwrap().push(plan.clone());
+        let first = self.ran.fetch_add(1, Ordering::SeqCst) == 0;
         if let Some(gate) = self.gate.as_ref() {
             gate.wait();
+        }
+        if let (true, Some(held)) = (first, self.hold_first) {
+            std::thread::sleep(held);
         }
         if let Some(e) = self.fail.as_deref() {
             return Err(e.to_string());
@@ -312,8 +324,13 @@ impl Runner for Recorder {
                     .unwrap();
             }
         }
+        let mut exits = self.exits.lock().unwrap();
+        let exit = match exits.is_empty() {
+            true => self.exit,
+            false => exits.remove(0),
+        };
         Ok(RunOutput {
-            exit: self.exit,
+            exit,
             stdout: "out\n".into(),
             stderr: String::new(),
             truncated: false,
@@ -2956,6 +2973,399 @@ async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
     assert!(listed, "`list` is accepted the first time it is pressed");
 
     sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 7. a refused write, over the real wire with the REAL Gyld hosts -------
+
+/// Gyld's two ways of rejecting a notebook, each provoked by one substitution in
+/// the shipped `stream-a` sample, and each verified here against the real hosts
+/// rather than assumed:
+///
+/// * `Selects[VersionPin]` puts a QUESTION where an alternative is accepted. The
+///   capture raises, `emit_decision_streams.py` writes
+///   `streams/stream-a/validation.json` (`ROLE_TYPE_MISMATCH`) and exits 1, and no
+///   `streams.json` is written at all — the STRUCTURAL class.
+/// * `Selects[SdaxRs]` selects an alternative that exists and that the question
+///   does not offer. The build SUCCEEDS, exit 0 and complete, and that stream's
+///   own document is `ok:false` with `SELECTION_NOT_OFFERED` — the FINDINGS
+///   class, the owner's-mistake class as data.
+///
+/// Both are read off the SAMPLE TEXT, in memory. Nothing here writes anywhere
+/// near the read-only checkout.
+const STRUCTURAL: (&str, &str) = ("Selects[BumpToCurrent]", "Selects[VersionPin]");
+const FINDINGS: (&str, &str) = ("Selects[BumpToCurrent]", "Selects[SdaxRs]");
+
+/// The shipped `stream-a` module, with one substitution — or none, for the valid
+/// answer that has to land first so there is a notebook to leave unchanged.
+fn sample_answer(gyld: &Path, swap: Option<(&str, &str)>) -> String {
+    let text = std::fs::read_to_string(gyld.join("examples/glade-decisions-stream-a.gyld.py"))
+        .expect("the shipped stream-a sample");
+    match swap {
+        Some((from, to)) => {
+            assert!(text.contains(from), "the sample still says {from}");
+            text.replace(from, to)
+        }
+        None => text,
+    }
+}
+
+/// An `answer` envelope carrying that module text.
+fn answer_envelope(overlay: &str) -> String {
+    serde_json::json!({
+        "verb": "answer",
+        "stream_output": true,
+        "args": { "stream": "stream-a", "overlay": overlay }
+    })
+    .to_string()
+}
+
+/// A real Gyld build is seconds, not milliseconds: wait longer than [`poll`] does.
+async fn poll_slowly<F, Fut>(mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..600 {
+        if f().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Send one streamed `answer` and fold the run's records once its terminal
+/// record is on the log. Answers `(accept, terminal record)`.
+async fn answered(
+    requester: &GladeClient,
+    sub: &GladeClient,
+    overlay: &str,
+) -> (GyldResponse, GyldOutputRecord) {
+    let accept = request(requester, &answer_envelope(overlay)).await;
+    assert!(accept.ok, "the accept is always ok: {accept:?}");
+    let run_id = accept.run_id.clone().expect("run_id on the accept");
+    sub.subscribe("ws-razel", "gyld.output", Some(run_id.as_bytes()))
+        .await
+        .unwrap();
+
+    let ended = |sub: GladeClient, key: String| async move {
+        sub.fold_log("ws-razel", "gyld.output", Some(key.as_bytes()))
+            .await
+            .iter()
+            .filter_map(|e| serde_json::from_slice::<GyldOutputRecord>(e).ok())
+            .find(|r| r.done == Some(true))
+    };
+    let converged = poll_slowly(|| {
+        let (sub, key) = (sub.clone(), run_id.clone());
+        async move { ended(sub, key).await.is_some() }
+    })
+    .await;
+    assert!(converged, "the run {run_id} closed with a terminal record");
+    let end = ended(sub.clone(), run_id.clone())
+        .await
+        .expect("the terminal record");
+    (accept, end)
+}
+
+/// The whole rule, end to end, against the hosts the owner really runs: a write
+/// that makes things WORSE is refused and leaves no trace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_gyld_rejects_is_refused_and_the_notebook_is_put_back() {
+    let gyld = match gyld_checkout() {
+        Some(r) => r,
+        None => {
+            eprintln!("SKIP: no Gyld checkout (set GLADE_GYLD_TEST_GYLD_ROOT)");
+            return;
+        }
+    };
+    let python = PathBuf::from(glade_gyld::DEFAULT_PYTHON);
+    if !python.exists() {
+        eprintln!("SKIP: {} is absent", python.display());
+        return;
+    }
+
+    let tmp = Tmp::new("refused-real");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let bundle = tmp.path().join("bundle");
+    let decisions = tmp.path().join("decisions");
+    std::fs::create_dir_all(&bundle).unwrap();
+
+    let mut config = config_for(&url, gyld.clone(), bundle.clone());
+    config.layout = config
+        .layout
+        .clone()
+        .with_decisions_root(Some(decisions.clone()));
+    // A real host prints a summary of some size and takes seconds.
+    config.limits = Limits {
+        timeout: Duration::from_secs(180),
+        max_output_bytes: 1 << 20,
+    };
+    let _sup = serve_with(
+        config,
+        Arc::new(glade_gyld::PythonRunner::new(python)),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+
+    // The supplier makes its own first build on a bundle root that has none. Wait
+    // for it: everything below is measured against the bundle it leaves.
+    let landed = poll_slowly(|| {
+        let bundle = bundle.clone();
+        async move { bundle.join("latest.json").is_file() }
+    })
+    .await;
+    assert!(landed, "the supplier's own first build landed");
+    attached(&requester).await;
+    let notebook = decisions.join("glade-decisions-stream-a.gyld.py");
+
+    // 1. A VALID answer, so there is a notebook on disk whose bytes a refusal has
+    //    to leave alone. The terminal record names the file, which is what lets a
+    //    desk say "saved" only once it is true.
+    let (accept, end) = answered(&requester, &sub, &sample_answer(&gyld, None)).await;
+    assert_eq!(end.exit, Some(0), "a valid answer builds: {end:?}");
+    assert_eq!(end.refusal, None, "nothing to refuse: {end:?}");
+    assert_eq!(
+        end.overlay_file.as_deref(),
+        Some(notebook.display().to_string().as_str()),
+        "the terminal record names the notebook the run really left"
+    );
+    assert!(accept.ok && accept.done == Some(false));
+    let was = std::fs::read(&notebook).expect("the notebook the valid answer left");
+    let latest_was = std::fs::read_to_string(bundle.join("latest.json")).unwrap();
+    let builds_were = build_names(&bundle);
+
+    // 2. The STRUCTURAL class: the capture raises, the build is abandoned.
+    let (_, end) = answered(&requester, &sub, &sample_answer(&gyld, Some(STRUCTURAL))).await;
+    let refusal = end.refusal.clone().expect("a refusal: {end:?}");
+    assert_eq!(refusal.code, "ROLE_TYPE_MISMATCH", "{refusal:?}");
+    assert_eq!(refusal.stream, "stream-a");
+    assert!(refusal.restored, "the notebook was put back: {refusal:?}");
+    assert!(!refusal.message.is_empty());
+    assert_eq!(end.overlay_file, None, "a refused run saved nothing");
+    assert_eq!(
+        std::fs::read(&notebook).unwrap(),
+        was,
+        "the notebook is byte for byte what it was before the refused write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("latest.json")).unwrap(),
+        latest_was,
+        "no new latest"
+    );
+    assert_eq!(
+        build_names(&bundle),
+        builds_were,
+        "the abandoned build directory is gone"
+    );
+
+    // 3. The FINDINGS class: exit 0, a COMPLETE bundle, and the written stream
+    //    invalid in it. This is the one a `latest_build` fallback would otherwise
+    //    adopt all by itself.
+    let (_, end) = answered(&requester, &sub, &sample_answer(&gyld, Some(FINDINGS))).await;
+    assert_eq!(
+        end.exit,
+        Some(0),
+        "the findings class builds clean: {end:?}"
+    );
+    let refusal = end.refusal.clone().expect("a refusal on a clean exit");
+    assert_eq!(refusal.code, "SELECTION_NOT_OFFERED", "{refusal:?}");
+    assert_eq!(refusal.stream, "stream-a");
+    assert!(refusal.restored);
+    assert!(
+        refusal.message.contains("does not offer"),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(end.overlay_file, None);
+    assert_eq!(std::fs::read(&notebook).unwrap(), was, "byte for byte");
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("latest.json")).unwrap(),
+        latest_was
+    );
+    assert_eq!(
+        build_names(&bundle),
+        builds_were,
+        "a refused-but-COMPLETE build is removed, so the fallback cannot adopt it"
+    );
+
+    // And the sample that ships with Gyld was never touched by any of it.
+    assert!(
+        sample_answer(&gyld, None).contains(STRUCTURAL.0),
+        "the read-only checkout still holds its committed sample"
+    );
+
+    // 4. A SYNCHRONOUS refusal answers the same thing as data: `ok:false`, the
+    //    message as `error`, and Gyld's own document as `validation` (4.7).
+    let envelope = serde_json::json!({
+        "verb": "answer",
+        "args": { "stream": "stream-a", "overlay": sample_answer(&gyld, Some(FINDINGS)) }
+    })
+    .to_string();
+    let out = request(&requester, &envelope).await;
+    assert!(!out.ok, "a refused write is not ok: {out:?}");
+    assert!(out.output_dir.is_none(), "it advertises no build");
+    let document = out.validation.clone().expect("the validation document");
+    assert_eq!(document["format"], "gyld.validation.v1");
+    assert_eq!(document["code"], "SELECTION_NOT_OFFERED");
+    assert_eq!(document["ok"], false);
+    assert_eq!(
+        out.error.as_deref(),
+        document["message"].as_str(),
+        "the message the desk shows is Gyld's own"
+    );
+    assert_eq!(std::fs::read(&notebook).unwrap(), was, "byte for byte");
+    assert_eq!(build_names(&bundle), builds_were);
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+/// Every directory under `builds/`, sorted — the listing a refusal must not add
+/// to.
+fn build_names(bundle: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(bundle.join("builds"))
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Two overlapping writing verbs both end in a CONSISTENT state.
+///
+/// The exchange handler is already serialised by the kit, but a STREAMED run is
+/// accepted at once and settles later on its own task. Without the write gate a
+/// second `answer` arriving mid-run would write its notebook and the first run's
+/// refusal would put the FIRST notebook back over it — the second answer silently
+/// lost, and the bundle agreeing with neither.
+///
+/// The second one is refused as DATA and writes nothing, and the desk goes on
+/// answering everything else while the first run finishes. The first run here
+/// FAILS, which is the case that would have done the damage.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_overlapping_answers_both_end_in_a_consistent_state() {
+    let tmp = Tmp::new("overlap");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+    let decisions = tmp.path().join("decisions");
+
+    let runner = Arc::new(Recorder {
+        build: true,
+        // The first run dawdles, so the second answer arrives while it is in
+        // flight — and it is the one that fails.
+        hold_first: Some(Duration::from_millis(1200)),
+        exits: Mutex::new(vec![1, 0]),
+        ..Default::default()
+    });
+    let mut config = config_for(&url, gyld, bundle.clone());
+    config.layout = config
+        .layout
+        .clone()
+        .with_decisions_root(Some(decisions.clone()));
+    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel))
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let envelope = |text: &str| {
+        serde_json::json!({
+            "verb": "answer",
+            "stream_output": true,
+            "args": { "stream": "stream-a", "overlay": text }
+        })
+        .to_string()
+    };
+    let notebook = decisions.join("glade-decisions-stream-a.gyld.py");
+
+    // The first answer is accepted and its run is now inside the host.
+    let first = request(&requester, &envelope("# the first ruling")).await;
+    assert!(first.ok, "{first:?}");
+    let run_id = first.run_id.clone().expect("a run id");
+    assert!(
+        poll(|| async { runner.count() >= 1 }).await,
+        "the first run reached the host"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&notebook).unwrap(),
+        "# the first ruling\n"
+    );
+
+    // The second answer arrives WHILE that run is in flight: refused as data,
+    // naming the run to wait for, and it wrote nothing.
+    let second = request(&requester, &envelope("# the second ruling")).await;
+    assert!(!second.ok, "a second write mid-run is refused: {second:?}");
+    let said = second.error.clone().unwrap_or_default();
+    assert!(
+        said.contains("already in flight") && said.contains(&run_id),
+        "the refusal names the run to wait for: {said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&notebook).unwrap(),
+        "# the first ruling\n",
+        "the refused write never touched the notebook"
+    );
+    assert_eq!(runner.count(), 1, "and never reached a host");
+
+    // The desk is still answering everything else while the run finishes — the
+    // reason the second write is refused rather than left to block the exchange.
+    let listed = request(&requester, r#"{"verb":"list"}"#).await;
+    assert!(listed.ok, "a read verb is unaffected: {listed:?}");
+
+    // The first run lands: it FAILED, so its notebook is put back — and back is
+    // ABSENT, because there was none before it.
+    let settled = poll(|| {
+        let notebook = notebook.clone();
+        async move { notebook.symlink_metadata().is_err() }
+    })
+    .await;
+    assert!(
+        settled,
+        "the failed write was put back: {:?}",
+        std::fs::read_to_string(&notebook)
+    );
+    assert!(
+        !bundle
+            .join("overlays/glade-decisions-stream-a.gyld.py")
+            .exists(),
+        "and the staging tree holds no link to a notebook that is gone"
+    );
+
+    // The gate is free again: the next answer goes through and stands.
+    let third = request(&requester, &envelope("# the third ruling")).await;
+    assert!(third.ok, "{third:?}");
+    let stands =
+        poll(|| {
+            let notebook = notebook.clone();
+            async move {
+                std::fs::read_to_string(&notebook).ok().as_deref() == Some("# the third ruling\n")
+            }
+        })
+        .await;
+    assert!(stands, "the write after the refusal is the one that stands");
+    assert_eq!(
+        std::fs::read_link(bundle.join("overlays/glade-decisions-stream-a.gyld.py")).unwrap(),
+        notebook,
+        "and the staging tree reads it"
+    );
+
     requester.close().await;
     node.kill().await.ok();
 }

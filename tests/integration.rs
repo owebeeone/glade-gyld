@@ -3485,6 +3485,11 @@ async fn one_notebook_holds_as_many_fragment_answers_as_the_owner_makes() {
         "the owner is told what to do about it: {}",
         refusal.message
     );
+    assert!(
+        refusal.restored,
+        "the notebook is as it was: a desk reads false as `could NOT be put back \
+         - check it`, which is an alarm and not a fact here"
+    );
     assert_eq!(end.overlay_file, None, "a refused merge saved nothing");
     assert_eq!(
         std::fs::read(&notebook).unwrap(),

@@ -782,8 +782,13 @@ fn stage_notebook(layout: &Layout, plan: &Plan) -> Result<(), String> {
 /// place a person reads: the lines are not forwarded and one summary line goes out
 /// in their place, which is the second half of the answer.
 ///
-/// A refusal is the host's own `code` and `message`. Nothing was written, so there
-/// is nothing to put back and `restored` stays false.
+/// A refusal is the host's own `code` and `message`.
+///
+/// `restored` on that refusal answers the question the field asks — IS THE NOTEBOOK
+/// AS IT WAS — and every refusal up to and including the host's answer leaves it
+/// untouched, so it is. Only a refusal from the write itself says otherwise; a desk
+/// reads `false` as "could NOT be put back, check it", which is a thing to say to
+/// an owner when it is true and an alarm when it is not (found live, 2026-09-21).
 fn fold(
     config: &GyldConfig,
     runner: &dyn Runner,
@@ -795,13 +800,13 @@ fn fold(
             return Ok((plan.clone(), None));
         }
     };
-    let refused = |code: &str, message: String| -> Refusal {
+    let refused = |code: &str, message: String, untouched: bool| -> Refusal {
         Refusal {
             stream: plan.stream.clone().unwrap_or_default(),
             code: code.to_string(),
             message: verbs::one_line(&message),
             details: None,
-            restored: false,
+            restored: untouched,
         }
     };
     let directory = config.layout.requests();
@@ -809,12 +814,14 @@ fn fold(
         return Err(refused(
             outcome::RUN_FAILED,
             format!("cannot create {}: {e}", directory.display()),
+            true,
         ));
     }
     if let Err(e) = bundle::replace(&merge.fragment.path, merge.fragment.text.as_bytes()) {
         return Err(refused(
             outcome::RUN_FAILED,
             format!("cannot write {}: {e}", merge.fragment.path.display()),
+            true,
         ));
     }
     let host = Plan {
@@ -838,7 +845,7 @@ fn fold(
     let out = match ran {
         Ok(out) => out,
         Err(e) => {
-            return Err(refused(outcome::RUN_FAILED, e));
+            return Err(refused(outcome::RUN_FAILED, e, true));
         }
     };
     let answered = verbs::merge_answer(&out.stdout);
@@ -859,7 +866,7 @@ fn fold(
         // word, which is what every other failed run here is reported by.
         let code = said("code").unwrap_or_else(|| outcome::RUN_FAILED.to_string());
         let message = said("message").unwrap_or_else(|| last_line(&out));
-        return Err(refused(&code, message));
+        return Err(refused(&code, message, true));
     }
     let text = match said("text") {
         Some(text) => text,
@@ -867,6 +874,7 @@ fn fold(
             return Err(refused(
                 outcome::RUN_FAILED,
                 "the merge host answered ok and printed no merged module".into(),
+                true,
             ));
         }
     };
@@ -878,17 +886,21 @@ fn fold(
                 text.len(),
                 verbs::MAX_OVERLAY_BYTES
             ),
+            true,
         ));
     }
     let mut written = plan.clone();
     if let Some(write) = written.write.as_mut() {
         write.text = text;
     }
+    // The two that may have TOUCHED the notebook: an atomic replace that failed
+    // wrote nothing, but a staging link that failed after it did not, and the owner
+    // is the one who has to look.
     if let Err(e) = write_overlay(&config.layout, &written) {
-        return Err(refused(outcome::RUN_FAILED, e));
+        return Err(refused(outcome::RUN_FAILED, e, false));
     }
     if let Err(e) = stage_notebook(&config.layout, &written) {
-        return Err(refused(outcome::RUN_FAILED, e));
+        return Err(refused(outcome::RUN_FAILED, e, false));
     }
     Ok((written, Some(merged_line(&answered, plan))))
 }
@@ -2445,8 +2457,9 @@ mod tests {
         );
         assert_eq!(refusal.stream, "stream-a");
         assert!(
-            !refusal.restored,
-            "nothing was written, so nothing was put back"
+            refusal.restored,
+            "nothing was written, so the notebook IS as it was; a desk reads false as \
+             `could NOT be put back - check it`, which is an alarm and not a fact here"
         );
         assert!(
             plan.overlay.as_ref().unwrap().symlink_metadata().is_err(),

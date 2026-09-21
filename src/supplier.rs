@@ -550,13 +550,8 @@ fn write_overlay(layout: &Layout, plan: &Plan) -> Result<(), String> {
         ));
     }
 
-    let temp = bundle::sibling_temp(&write.path);
-    std::fs::write(&temp, &write.text)
-        .map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
-    std::fs::rename(&temp, &write.path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        format!("cannot write {}: {e}", write.path.display())
-    })
+    bundle::replace(&write.path, write.text.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", write.path.display()))
 }
 
 /// Where a directory really is, links resolved. A failure is data, like every

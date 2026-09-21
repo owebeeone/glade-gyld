@@ -38,6 +38,9 @@
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
 //!   invocation, or a refusal, with no filesystem effect.
+//! * [`outcome`] — what a WRITING verb did to the stream it wrote: the snapshot a
+//!   refused write is put back to, and the reading of Gyld's own
+//!   `validation.json` that says whether it made things worse.
 //! * [`exec`] — the bounded runner (wall clock and output bytes).
 //! * [`publish`] — what a successful build puts on the value surfaces.
 //! * [`tools`] — the [`tools::Tool`] trait, the allow-list registry and the
@@ -65,6 +68,7 @@ pub mod exec;
 pub mod fetch;
 pub mod github;
 pub mod model;
+pub mod outcome;
 pub mod prompt;
 pub mod publish;
 pub mod search;
@@ -85,8 +89,8 @@ pub use ask::{
 pub use bundle::{FilePointer, Layout};
 pub use conversation::{Ledger, Turn, TurnPart};
 pub use envelope::{
-    GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, ASK_ANSWER, ASK_CITATION,
-    ASK_DRAFT, ASK_END, ASK_NOTE, ASK_QUESTION, ASK_TOOL_CALL, ASK_TOOL_RESULT,
+    GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, Refusal, ASK_ANSWER,
+    ASK_CITATION, ASK_DRAFT, ASK_END, ASK_NOTE, ASK_QUESTION, ASK_TOOL_CALL, ASK_TOOL_RESULT,
 };
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
@@ -98,6 +102,7 @@ pub use model::{
     DRAFT_TOOL, END_TURN, ESTIMATED_CHARS_PER_TOKEN, MAX_DEGRADATIONS, MAX_TOKENS, REFUSAL,
     TOOL_USE,
 };
+pub use outcome::{classify, said, Held, Outcome, Put, Snapshot, RUN_FAILED};
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
 pub use search::{SearchSources, SEARCH_SOURCES};

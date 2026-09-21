@@ -130,6 +130,38 @@ pub struct GyldResponse {
     /// file, and a verb whose file is not there yet, name none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub overlay_file: Option<String>,
+    /// Gyld's own `validation.json` for a write it REJECTED, verbatim
+    /// (GyldGrythPlugins.md 4.7, "Response": a `GyldError` is passed through as
+    /// `validation`). Absent when the run failed without leaving one, in which
+    /// case `error` is the host's own last word on stderr.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub validation: Option<serde_json::Value>,
+}
+
+/// Why a writing verb was REFUSED, as data.
+///
+/// It rides the terminal output record of a streamed run (`refusal`) so a desk
+/// that was told "accepted" before the host ran learns what really happened, and
+/// it is what the supplier's one stderr line is composed from. `code` and
+/// `message` are Gyld's own when Gyld wrote a `validation.json`; when it did not,
+/// `code` is [`crate::outcome::RUN_FAILED`] and `message` is the host's last
+/// non-empty stderr line.
+///
+/// `stream` is the stream the refusal is ABOUT, which is not always the stream
+/// that was written: a rebuild fails on the first stream it cannot capture, and
+/// that may be a child of the one the owner answered. It is reported as it is.
+/// Empty for a verb that wrote no stream of its own (`rebuild`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Refusal {
+    pub stream: String,
+    pub code: String,
+    pub message: String,
+    /// The `details` of Gyld's own finding, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub details: Option<serde_json::Value>,
+    /// The notebook is back as it was. `false` means there was nothing to put
+    /// back, or that putting it back failed — the log line says which.
+    pub restored: bool,
 }
 
 impl GyldResponse {
@@ -185,6 +217,35 @@ impl GyldResponse {
         self
     }
 
+    /// A synchronous writing verb Gyld REJECTED: failure as data, with the
+    /// message as `error` and Gyld's own document as `validation` (4.7). The run
+    /// itself is still reported — its exit, its output and its id — because what
+    /// the host said is the audit trail whether or not the write stood.
+    ///
+    /// `output_dir` names nothing: the build this run made has been removed, and
+    /// the previous one stands.
+    pub fn refused(
+        run_id: String,
+        exit: i32,
+        stdout: String,
+        stderr: String,
+        refusal: &Refusal,
+        validation: Option<serde_json::Value>,
+        who: Option<String>,
+    ) -> GyldResponse {
+        GyldResponse {
+            ok: false,
+            run_id: Some(run_id),
+            exit: Some(exit),
+            stdout,
+            stderr,
+            error: Some(refusal.message.clone()),
+            validation,
+            attributed_to: who,
+            ..Default::default()
+        }
+    }
+
     /// Serialize for the exchange payload. Never panics: a serialize failure of
     /// these plain structs is not reachable, and the fallback stays data.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -209,6 +270,19 @@ pub struct GyldOutputRecord {
     pub done: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exit: Option<i32>,
+    /// TERMINAL record only: why the writing verb this run served was REFUSED.
+    ///
+    /// The accept answer of a streamed `answer` goes out before the host has run,
+    /// so the accept cannot know the outcome and this is where the outcome lives.
+    /// ADDITIVE: a consumer that has never heard of it reads the record exactly
+    /// as it did before, which is the rule this surface already follows.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refusal: Option<Refusal>,
+    /// TERMINAL record only: the notebook a writing verb really left behind, on a
+    /// run that was NOT refused — the same value the answer's `overlay_file`
+    /// reports. A desk says "saved" once this says so, and not before.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub overlay_file: Option<String>,
 }
 
 impl GyldOutputRecord {
@@ -239,6 +313,20 @@ impl GyldOutputRecord {
             exit: Some(exit),
             ..Default::default()
         }
+    }
+
+    /// The same terminal record, carrying why the write was refused.
+    pub fn refusing(mut self, refusal: Option<Refusal>) -> GyldOutputRecord {
+        self.refusal = refusal;
+        self
+    }
+
+    /// The same terminal record, naming the notebook the run really left behind.
+    /// The name is [`GyldResponse::leaving`]'s deliberately: it is the same fact,
+    /// said in the one place that knows it.
+    pub fn leaving(mut self, overlay_file: Option<String>) -> GyldOutputRecord {
+        self.overlay_file = overlay_file;
+        self
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

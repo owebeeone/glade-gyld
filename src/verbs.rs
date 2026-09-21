@@ -166,6 +166,11 @@ pub struct Plan {
     /// adopted). It is what the answer tells the requester, so a ruling is never
     /// a file nobody named.
     pub overlay: Option<PathBuf>,
+    /// The stream this verb WROTE, for the same four verbs that leave an
+    /// `overlay` — the one whose validation document says whether the write made
+    /// things worse ([`crate::outcome::classify`]). `rebuild` and `diff` write no
+    /// stream of their own and name none.
+    pub stream: Option<String>,
 }
 
 /// Resolve a request into a [`Plan`], or a refusal. PURE: it touches no file,
@@ -216,6 +221,7 @@ pub fn plan(
         read: None,
         consult: None,
         overlay: None,
+        stream: None,
     };
 
     match request.verb.as_str() {
@@ -250,6 +256,7 @@ pub fn plan(
                 force: true,
             });
             plan.overlay = Some(notebook);
+            plan.stream = Some(stream.to_string());
             plan.argv = base(rebuild_argv(bundle, &output, args.built.as_deref()));
             plan.output_dir = Some(output);
         }
@@ -274,6 +281,7 @@ pub fn plan(
             // The host writes the module into the staging tree itself; the
             // notebook it becomes is the one the adoption leaves in the home.
             plan.overlay = Some(layout.overlay_home().join(overlay_file(stream)));
+            plan.stream = Some(stream.to_string());
         }
         "rebuild" => {
             let bundle = latest.ok_or(NO_BUNDLE)?;
@@ -385,6 +393,7 @@ pub fn discover_plan(layout: &Layout) -> Plan {
         read: None,
         consult: None,
         overlay: None,
+        stream: None,
     }
 }
 
@@ -444,6 +453,7 @@ pub fn first_build_plan(layout: &Layout, stamp: &str, declared: &[String]) -> Pl
         read: None,
         consult: None,
         overlay: None,
+        stream: None,
     }
 }
 
@@ -546,7 +556,7 @@ fn require_stream<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, St
 /// Collapse a free-text argument to a single bounded line. A note and a build
 /// stamp are the only free text that reaches an argv, and a newline in one of
 /// them would confuse a log far more than it would help anybody.
-fn one_line(value: &str) -> String {
+pub fn one_line(value: &str) -> String {
     let mut out: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

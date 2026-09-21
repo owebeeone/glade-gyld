@@ -477,6 +477,28 @@ pub fn relink(source: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// Put `bytes` at `path`, REPLACING whatever holds that name and never writing
+/// THROUGH it.
+///
+/// The one write every overlay module goes through: the supplier's own
+/// [`crate::supplier`] write path and the restore of a
+/// [`crate::outcome::Snapshot`] are the same sequence, because a refused write
+/// must be undone exactly as carefully as it was made. `std::fs::write` opens
+/// the target by name and FOLLOWS a symlink, and `overlays/` is full of links
+/// into the read-only Gyld checkout; a sibling temporary file renamed over the
+/// target replaces the link itself, and makes the write atomic into the bargain.
+pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp = sibling_temp(path);
+    std::fs::write(&temp, bytes)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e)
+        }
+    }
+}
+
 /// A sibling temporary name for an atomic replace: `<dir>/.<name>.tmp-<pid>-<n>`.
 ///
 /// A SIBLING, not a name in the system temporary directory: `rename` is only

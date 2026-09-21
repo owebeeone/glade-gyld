@@ -1041,6 +1041,13 @@ closed by a terminal marker:
 A consumer subscribes `(share, gyld.output, run_id)` and folds the log to follow
 the run.
 
+A run id is `run-<session>-<n>`, where `<session>` is the supplier process's
+start time in base36 and `<n>` its run counter — the log lives in the node's
+PERSISTENT store, so an id that restarted at `run-1` with the process would key
+a fresh run onto the previous session's records and report that run's outcome for
+this one. It is OPAQUE: a consumer keys on the whole string and reads nothing out
+of it.
+
 The TERMINAL record of a WRITING verb carries the run's outcome, because the
 accept could not — it went out before the host ran. Two ADDITIVE fields, so a
 consumer that has never heard of them reads the record exactly as it did before:

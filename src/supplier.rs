@@ -24,6 +24,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -281,6 +282,77 @@ fn at_attach(layout: &Layout) -> AtAttach {
     }
 }
 
+/// The run ids one supplier process mints, and the counter numbering them.
+///
+/// The counter alone is not enough. A run's output and its terminal record are
+/// appended to the `gyld.output` log keyed by run id, and that log lives in the
+/// node's PERSISTENT store — so a counter that restarts with the process gives a
+/// fresh run an id the previous session already spent, and a reader that looks up
+/// this run's outcome finds the OLD run's terminal record instead. The session
+/// tag is what makes the id unique across restarts; the counter still orders the
+/// runs within one.
+struct Runs {
+    /// Fixed for the life of this process, and different in the next one.
+    session: String,
+    next: AtomicU64,
+}
+
+impl Runs {
+    /// Take the session tag ONCE, here: every id this process mints shares it.
+    fn new() -> Runs {
+        Runs {
+            session: session_tag(),
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// The next run's id — distinct from every other id this process mints, and
+    /// from the ids of every other process.
+    fn mint(&self) -> String {
+        mint_run_id(&self.session, self.next.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+}
+
+/// One run id, from the session it was minted in and the number it took.
+///
+/// OPAQUE to every reader: the log is keyed by the whole string and
+/// `requests/<run-id>.json` uses it as a path component, so the only properties
+/// that matter are that it holds no whitespace, stays one path component, and
+/// that no two runs anywhere ever share one.
+fn mint_run_id(session: &str, n: u64) -> String {
+    format!("run-{session}-{n}")
+}
+
+/// A tag for this process, read off the clock when the counter is made.
+///
+/// Milliseconds since the epoch in base36: short (eight characters until 2059)
+/// and, at one width, ordered as text the way it is ordered in time, so a reader
+/// that sorts ids as strings still puts an older session's runs first. A clock
+/// before the epoch degrades to `0` rather than panicking, as
+/// [`bundle::build_stamp`] does with the same reading.
+fn session_tag() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    base36(millis)
+}
+
+/// `n` in lowercase base36, most significant digit first.
+fn base36(mut n: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize] as char);
+        n /= 36;
+    }
+    out.reverse();
+    out.into_iter().collect()
+}
+
 /// The run id the supplier's own first build takes. Deliberately not `run-N`:
 /// nobody asked for this run, so it is not numbered among the ones that were.
 pub const FIRST_BUILD_RUN_ID: &str = "boot-1";
@@ -397,7 +469,9 @@ fn make_handler(
     handle: Handle,
     first: Arc<FirstBuild>,
 ) -> impl Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static {
-    let runs = Arc::new(AtomicU64::new(0));
+    // One run counter AND one session tag for the supplier's lifetime, so the ids
+    // it mints are distinct from the ones the process before it minted.
+    let runs = Arc::new(Runs::new());
     // One running total per conversation, for the supplier's lifetime
     // (GyldAskAgent.md section 7).
     let ledger = Arc::new(Ledger::default());
@@ -430,7 +504,7 @@ fn answer(
     model: &Arc<dyn ModelClient>,
     ledger: &Arc<Ledger>,
     handle: &Handle,
-    runs: &Arc<AtomicU64>,
+    runs: &Arc<Runs>,
     first: &Arc<FirstBuild>,
     writes: &Arc<WriteGate>,
     payload: &[u8],
@@ -456,7 +530,7 @@ fn answer(
     // The run id is minted BEFORE the plan, because the plan names a file after it:
     // a fragment `answer` lays its fragment down at `requests/<run-id>.json`, and
     // the planner stays pure by being handed the id rather than inventing one.
-    let run_id = format!("run-{}", runs.fetch_add(1, Ordering::SeqCst) + 1);
+    let run_id = runs.mint();
     let plan = match verbs::plan(
         &config.layout,
         &request,
@@ -1783,6 +1857,80 @@ mod tests {
         bundle::write_latest(&layout, &empty).unwrap();
         assert_eq!(at_attach(&layout), AtAttach::Bootstrap);
         let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    /// A minted run id has to be unique across supplier RESTARTS, not just
+    /// within one process. The `gyld.output` log it keys lives in the node's
+    /// persistent store, so a second session that reused `run-1` would hand a
+    /// fresh run the FIRST session's terminal record — and report that run's
+    /// outcome for this one.
+    #[test]
+    fn two_sessions_mint_different_ids_for_the_same_counter() {
+        assert_ne!(mint_run_id("mfk3x9p", 1), mint_run_id("mfk3xa2", 1));
+        assert_ne!(mint_run_id("mfk3x9p", 7), mint_run_id("mfk3xa2", 7));
+    }
+
+    /// Within one session the counter still does its job: every id distinct,
+    /// numbered from one, in the order the runs were taken.
+    #[test]
+    fn one_session_mints_distinct_ids_numbered_from_one() {
+        let runs = Runs::new();
+        let minted: Vec<String> = (0..3).map(|_| runs.mint()).collect();
+        let session = runs.session.clone();
+        assert_eq!(
+            minted,
+            vec![
+                mint_run_id(&session, 1),
+                mint_run_id(&session, 2),
+                mint_run_id(&session, 3)
+            ],
+            "the counter numbers the runs from one, within the session"
+        );
+    }
+
+    /// The id is a KEY before it is anything else: it names the one file a
+    /// fragment `answer` lays down, and `gyld-ui.py` reads a run id back off a
+    /// log line by whitespace. So it holds no whitespace, it is ONE path
+    /// component, and the fragment path it names still passes the planner's
+    /// containment check.
+    #[test]
+    fn a_minted_id_is_a_valid_fragment_path_key() {
+        let layout = Layout::new(PathBuf::from("/g"), PathBuf::from("/b"));
+        let id = Runs::new().mint();
+        assert!(
+            !id.chars().any(char::is_whitespace),
+            "no whitespace in a run id: {id:?}"
+        );
+        assert_eq!(
+            std::path::Path::new(&id).components().count(),
+            1,
+            "a run id is one path component: {id:?}"
+        );
+
+        let fragment = layout.requests().join(format!("{id}.json"));
+        assert!(
+            bundle::contained(&layout.bundle_root, &fragment),
+            "{} leaves the bundle root",
+            fragment.display()
+        );
+        assert_eq!(fragment.parent(), Some(layout.requests().as_path()));
+    }
+
+    /// base36, because the session tag has to be SHORT and still sort as text
+    /// the way it sorts in time: at one width its digits ascend in ASCII too, so
+    /// a reader that orders ids as strings puts an older session's runs first.
+    #[test]
+    fn base36_is_short_and_sorts_as_it_counts() {
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
+
+        // A millisecond timestamp of today's size is eight characters, and the
+        // next millisecond still sorts after it as plain text.
+        let now = base36(1_789_247_615_547);
+        let later = base36(1_789_247_615_548);
+        assert_eq!(now.len(), 8, "{now}");
+        assert!(now < later, "{now} < {later}");
     }
 
     #[test]

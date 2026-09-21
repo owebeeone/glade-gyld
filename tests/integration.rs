@@ -3868,3 +3868,100 @@ async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
     sub.close().await;
     node.kill().await.ok();
 }
+
+// ---- 13. a restarted supplier keeps writing an open conversation -----------
+
+/// A conversation id is the DESK's, not the supplier's, so it outlives a
+/// supplier restart — unlike a run id, which `mint_run_id` tags with the
+/// process that minted it and which is therefore a fresh chain every session.
+/// The ask chain for an open conversation is one a new session RE-ENTERS, on
+/// slots the previous session already filled.
+///
+/// Two things break there, and the first hides the second. `consult_run`
+/// replays the prior turns by folding its OWN session store, which a fresh
+/// session has nothing in, so the model is told the conversation is new; and
+/// every record the turn then appends lands on a taken slot and is refused as
+/// an equivocation. Neither is visible at the supplier — `append` ships
+/// fire-and-forget — so the only way to see it is from a mount.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_supplier_keeps_writing_an_open_conversation() {
+    let tmp = Tmp::new("reask");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let build = seed_bundle(&bundle);
+    seed_agent(&bundle, &build);
+
+    // One mount on the conversation for the whole test, across both sessions.
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.ask", Some(CONVERSATION.as_bytes()))
+        .await
+        .unwrap();
+
+    // ---- session one: one turn on the conversation -------------------------
+    let told = Arc::new(ScriptedModel {
+        chunks: vec!["custody is held by the node"],
+        ..Default::default()
+    });
+    let first = serve_with(
+        config_for(&url, gyld.clone(), bundle.clone()),
+        Arc::new(Recorder::default()),
+        told.clone(),
+    )
+    .await
+    .unwrap();
+    let req = GladeClient::new("requester-1");
+    req.connect(&url).await.unwrap();
+    attached(&req).await;
+    assert!(request(&req, &explain("base", "who holds the key?")).await.ok);
+    ask_turns(&sub, CONVERSATION, 1).await;
+    req.close().await;
+    first.shutdown().await;
+
+    // ---- session two: the restart, same origin, same conversation ----------
+    let again = Arc::new(ScriptedModel {
+        chunks: vec!["and recovery is the owner's"],
+        ..Default::default()
+    });
+    let second = serve_with(
+        config_for(&url, gyld, bundle),
+        Arc::new(Recorder::default()),
+        again.clone(),
+    )
+    .await
+    .unwrap();
+    let req = GladeClient::new("requester-2");
+    req.connect(&url).await.unwrap();
+    attached(&req).await;
+    assert!(request(&req, &explain("base", "and recovery?")).await.ok);
+
+    // THE REGRESSION. Before the resume the mount never sees a second turn
+    // close: every record session two appended was refused.
+    let records = ask_turns(&sub, CONVERSATION, 2).await;
+    let said: String = records
+        .iter()
+        .filter_map(|r| r.line.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        said.contains("and recovery is the owner's"),
+        "the restarted session's reply is on the conversation: {said}"
+    );
+
+    // And the turn was composed against the conversation, not against nothing:
+    // a fresh session that cannot read its own chain back tells the model the
+    // conversation is new (`ModelRequest::turns` is empty on a first turn).
+    let asked = again.seen();
+    let prior = asked.first().expect("session two called the model");
+    assert!(
+        !prior.turns.is_empty(),
+        "session two replayed the prior turn to the model, rather than \
+         treating an open conversation as a new one"
+    );
+
+    req.close().await;
+    second.shutdown().await;
+    sub.close().await;
+    node.kill().await.ok();
+}

@@ -118,6 +118,77 @@ path, and the first build on its own task).
 With no `--decisions-root`, none of this happens: a written module lives in
 `overlays/` under the running instance's data directory, as it did before.
 
+### A refused write
+
+**A writing verb that makes things WORSE is refused and leaves no trace.** The
+defect this answers: an `answer` whose notebook text Gyld then rejected left the
+broken file on disk and abandoned the whole rebuild (`{"rebuilt": null, "ok":
+false}`, exit 1), so NO stream advanced again until the owner repaired the file by
+hand; a half-written build directory was left under `builds/` per attempt; and
+nothing at all was logged, while the desk went on saying "accepted … Saved to
+<path>" because that answer goes out before the host has run.
+
+**Before the write.** `answer`, `ask`, `fork` and `link` take a
+[`outcome::Snapshot`] first: what the notebook's name held in its home (the
+decisions root when set, else `overlays/`) — bytes, a link and where it led, or
+nothing — and what `overlays/<file>` held, so the staging tree can be put back
+exactly. A snapshot that cannot be taken refuses the verb before a byte is
+written: the alternative is a restore that deletes a notebook it could not read.
+
+**After the run**, for the stream S the verb wrote. Gyld reports a rejection two
+ways and the supplier reads both:
+
+1. **A run error, or exit ≠ 0** — REFUSED. The reason is the first
+   `streams/*/validation.json` with `ok:false` in the failed output directory, if
+   there is one; it may name a CHILD stream rather than S, and is reported as it
+   is. Otherwise it is the host's last non-empty stderr line, bounded to one line.
+   This is the STRUCTURAL class: the capture raises, `emit_decision_streams.py`
+   writes that document and exits 1, and no `streams.json` is written at all.
+2. **Exit 0, and S's `validation.json` in the NEW build is `ok:false`** — REFUSED
+   when S was `ok:true` in the previous latest build or was not in it at all. This
+   is the FINDINGS class, the owner's-mistake class as data: the build succeeds
+   and is complete, and that one stream carries a code, a message and details. A
+   stream that was ALREADY `ok:false` before the write is **not** refused — the
+   owner may be part-way through repairing a notebook, and putting his text back
+   would undo the repair he is making.
+3. Otherwise the write stands, exactly as before.
+
+`fork` and `link` build nothing of their own — the host captures what it wrote and
+exits non-zero on an error finding — so rule 1 is the whole rule for them.
+
+**On a refusal**: the snapshot goes back with the same no-follow atomic write the
+write itself used ([`bundle::replace`], [`bundle::relink`], or a removal for a
+notebook that was absent); `overlays/<file>` is put back as it was;
+`latest.json` is NOT swapped; nothing is published; and the build this run made is
+**removed**. The directory has to go rather than merely stay unpublished, because
+[`bundle::latest_build`] falls back to the newest `builds/` directory holding a
+`streams.json` — a refused-but-complete build left behind would become the current
+one by itself. A failed plain `rebuild` loses its half-written directory too, with
+nothing to restore.
+
+**And it says so.** One line on stderr for every failed or refused build, bounded
+to one line:
+
+```text
+glade-gyld: refused answer on stream-a: SELECTION_NOT_OFFERED: glade_decisions:GladeDecisions.version_pin does not offer glade_decisions:GladeDecisions.sdax_rs — notebook restored
+```
+
+`— nothing to restore` for a `rebuild`, and `— the notebook could NOT be put back`
+when the restore itself failed, with the reason on its own line. A **streamed**
+run carries the outcome on its TERMINAL record (see below): the accept could not,
+having gone out before the host ran. A **synchronous** one answers `ok:false` with
+the message as `error` and Gyld's own document as `validation`
+(GyldGrythPlugins.md 4.7, "failure as data"); a refusal Gyld left no document for
+carries the host's own last word as `error` instead.
+
+**One writing verb at a time.** The kit serialises the exchange handler, but a
+streamed run is accepted at once and settles later on its own task; without a gate
+a second `answer` arriving mid-run would write its notebook and the first run's
+refusal would put the FIRST one back over it. A second writing verb is REFUSED as
+data, naming the run to wait for — not made to wait, because waiting would have to
+happen in the one loop every request passes through and would freeze `list`, the
+verb a UI polls, for as long as a build takes. Read verbs are untouched.
+
 ### The first build is the supplier's own
 
 A bundle root with no build in it is a deadlock: `list`, `rebuild`, `answer`,
@@ -910,6 +981,26 @@ closed by a terminal marker:
 
 A consumer subscribes `(share, gyld.output, run_id)` and folds the log to follow
 the run.
+
+The TERMINAL record of a WRITING verb carries the run's outcome, because the
+accept could not — it went out before the host ran. Two ADDITIVE fields, so a
+consumer that has never heard of them reads the record exactly as it did before:
+
+```json
+{ "run_id": "run-3", "seq": 7, "stream": "end", "done": true, "exit": 0,
+  "overlay_file": "/glade-wz/decisions/glade-decisions-stream-a.gyld.py" }
+```
+
+on a write that stood — the same value the answer's `overlay_file` reports, and
+the ONE thing that means "saved" — and on a write that was refused:
+
+```json
+{ "run_id": "run-4", "seq": 9, "stream": "end", "done": true, "exit": 0,
+  "refusal": { "stream": "stream-a", "code": "SELECTION_NOT_OFFERED",
+               "message": "…does not offer…", "details": {…}, "restored": true } }
+```
+
+Never both. A refused run names no file, because it left none.
 
 ## Results (value surfaces `gyld.streams`, `gyld.stream`, `gyld.decisions`, `gyld.lens`, `gyld.file`)
 

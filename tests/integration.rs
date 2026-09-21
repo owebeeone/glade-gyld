@@ -30,6 +30,9 @@
 //!  11. the DRAFT: a well-formed offer with its model id, a malformed one that
 //!      offers nothing and says why, and one naming an alternative the envelope
 //!      does not offer, emitted unresolved rather than corrected.
+//!  12. a RESTARTED supplier republishes over the value it left behind in an
+//!      earlier session: same origin, a chain it has to pick up again rather
+//!      than start over, so the newest census is what a mount folds.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -3725,5 +3728,147 @@ async fn two_overlapping_answers_both_end_in_a_consistent_state() {
     );
 
     requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 12. a restarted supplier republishes over its own earlier value --------
+
+/// A bundle builder that writes a DISTINCT census per run. The payload is what
+/// decides whether a reused chain slot is a harmless duplicate or an
+/// equivocation, so a republish test needs each build to differ — exactly as a
+/// real build does, whose census carries its own stamp.
+struct StampedBundleBuilder(AtomicU64);
+
+impl Runner for StampedBundleBuilder {
+    fn run(
+        &self,
+        plan: &Plan,
+        _limits: Limits,
+        _on_line: &mut dyn FnMut(&str, &str),
+    ) -> Result<RunOutput, String> {
+        let dir = plan.output_dir.clone().ok_or("this verb builds nothing")?;
+        let n = self.0.fetch_add(1, Ordering::SeqCst);
+        let lenses = dir.join("streams/base/lenses");
+        std::fs::create_dir_all(&lenses).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("streams.json"),
+            format!(
+                r#"{{"format":"gyld.streams.v1","revision":"r{n}","streams":[{{"id":"base"}}]}}"#
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("streams/base/stream.json"), br#"{"id":"base"}"#)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("streams/base/decide-now.json"),
+            br#"{"format":"gyld.decide-now.v1","questions":[]}"#,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(lenses.join("decisions.lens.json"), b"abc").map_err(|e| e.to_string())?;
+        Ok(RunOutput {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+        })
+    }
+}
+
+/// Wait until the census a subscriber folds on `gyld.streams` contains `want`.
+async fn census_says(sub: &GladeClient, want: &str) -> bool {
+    let s = sub.clone();
+    let want = want.to_string();
+    poll(|| {
+        let s = s.clone();
+        let want = want.clone();
+        async move {
+            match s.fold_value("ws-razel", "gyld.streams", None).await {
+                Some(bytes) => String::from_utf8_lossy(&bytes).contains(&want),
+                None => false,
+            }
+        }
+    })
+    .await
+}
+
+/// A supplier restart is a NEW session on the SAME origin — the origin is
+/// derived from the configured `(share, glade_id)` and nothing else, so it is
+/// the same string for the life of the data directory. The session that comes
+/// back has to pick its own chain up where it left it: a chain restarted at seq
+/// 0 collides with the slots the earlier session already filled, and a lamport
+/// restarted at 0 loses the value fold to the record it is trying to replace.
+///
+/// Both failures are SILENT at the supplier — `append` ships fire-and-forget and
+/// the node's rejection comes back on a frame nothing correlates — so the only
+/// way to see it is from the outside: what does a mount fold after the restart?
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
+    let tmp = Tmp::new("republish");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+
+    // A mount that is watching the census the whole way through, so the live
+    // path is under test as well as the replay one.
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.streams", None)
+        .await
+        .unwrap();
+
+    // One runner across both sessions: the run counter is what makes each
+    // census differ, whichever session ran it.
+    let runner = Arc::new(StampedBundleBuilder(AtomicU64::new(1)));
+
+    // ---- session one: publish the seeded build, then build r1 --------------
+    let first = serve_with(
+        config_for(&url, gyld.clone(), bundle.clone()),
+        runner.clone(),
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+    let req = GladeClient::new("requester-1");
+    req.connect(&url).await.unwrap();
+    attached(&req).await;
+    assert!(request(&req, r#"{"verb":"rebuild"}"#).await.ok);
+    assert!(
+        census_says(&sub, r#""revision":"r1""#).await,
+        "session one's own build reaches the mount"
+    );
+    req.close().await;
+    first.shutdown().await;
+
+    // ---- session two: the restart, same origin, empty chain state ----------
+    let second = serve_with(
+        config_for(&url, gyld, bundle),
+        runner,
+        Arc::new(NoModel),
+    )
+    .await
+    .unwrap();
+    let req = GladeClient::new("requester-2");
+    req.connect(&url).await.unwrap();
+    attached(&req).await;
+    assert!(request(&req, r#"{"verb":"rebuild"}"#).await.ok);
+
+    // THE REGRESSION. Before the resume this fails: r1 is still the folded
+    // census, because every op session two appended landed on a slot session
+    // one already held and the node refused it as an equivocation.
+    let folded = sub
+        .fold_value("ws-razel", "gyld.streams", None)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    assert!(
+        census_says(&sub, r#""revision":"r2""#).await,
+        "a restarted supplier's build must win the value fold; the mount is \
+         still folding an earlier session's census: {folded}"
+    );
+
+    req.close().await;
+    second.shutdown().await;
+    sub.close().await;
     node.kill().await.ok();
 }

@@ -5,7 +5,7 @@
 #
 # This mirrors the `service … gyld.ops` + `workspace ws-razel razel` legs of
 # grazel's gyld-app.glade; it is a fixture, not that file.
-glade-app v0
+glade-app v1
 app gyld-test
 
 # the verb surface: a directed exchange, answered by the attached provider.

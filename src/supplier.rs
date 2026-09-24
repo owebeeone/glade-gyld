@@ -24,13 +24,13 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
-use glade_client::GladeClient;
+use glade_client::{GladeClient, OpOutcome, SubscribeOutcome};
 use glade_wire::generated::ExchangeReq;
 
 use crate::agent::{self, AgentOverrides, Resolved};
@@ -220,12 +220,15 @@ pub async fn serve_with(
         },
     );
 
+    // One writer for the supplier's lifetime: every op this session appends goes
+    // through it, and so does its record of the chains it has picked up.
+    let writer = Writer::new(client.clone(), config.share.clone());
     // One run counter AND one session tag for the supplier's lifetime, made here
     // because the first build's id comes off the same tag: the clock is read once.
     let runs = Arc::new(Runs::new());
     let first = Arc::new(FirstBuild::new(runs.boot()));
     let handler = make_handler(
-        client.clone(),
+        writer.clone(),
         config.clone(),
         runner.clone(),
         model,
@@ -248,11 +251,11 @@ pub async fn serve_with(
             // A build made by a previous session of this data directory, or
             // seeded by hand, is a build a mount should see: without this it sat
             // there unpublished until somebody pressed Rebuild.
-            spawn_publish(client.clone(), config.clone(), Handle::current(), dir);
+            spawn_publish(writer.clone(), config.clone(), Handle::current(), dir);
         }
         AtAttach::Bootstrap => {
             spawn_first_build(
-                client.clone(),
+                writer.clone(),
                 config.clone(),
                 runner,
                 Handle::current(),
@@ -495,7 +498,7 @@ impl Drop for Writing {
 /// never returns `Err`, so the WIRE `ExchangeRes.ok` stays `true` and the PAYLOAD
 /// carries success or failure.
 fn make_handler(
-    client: GladeClient,
+    writer: Writer,
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
     model: Arc<dyn ModelClient>,
@@ -508,11 +511,9 @@ fn make_handler(
     let ledger = Arc::new(Ledger::default());
     // One gate, for the supplier's lifetime: writing verbs run one at a time.
     let writes = Arc::new(WriteGate::default());
-    // One record of the chains this session has picked up, for its lifetime.
-    let resumed = Arc::new(Resumed::default());
     move |req: &ExchangeReq| -> Result<Vec<u8>, String> {
         let response = answer(
-            &client,
+            &writer,
             &config,
             &runner,
             &model,
@@ -521,7 +522,6 @@ fn make_handler(
             &runs,
             &first,
             &writes,
-            &resumed,
             &req.payload,
         );
         Ok(response.to_bytes())
@@ -532,7 +532,7 @@ fn make_handler(
 /// [`GyldResponse`].
 #[allow(clippy::too_many_arguments)]
 fn answer(
-    client: &GladeClient,
+    writer: &Writer,
     config: &Arc<GyldConfig>,
     runner: &Arc<dyn Runner>,
     model: &Arc<dyn ModelClient>,
@@ -541,7 +541,6 @@ fn answer(
     runs: &Arc<Runs>,
     first: &Arc<FirstBuild>,
     writes: &Arc<WriteGate>,
-    resumed: &Arc<Resumed>,
     payload: &[u8],
 ) -> GyldResponse {
     let request = match GyldRequest::parse(payload) {
@@ -626,11 +625,10 @@ fn answer(
     // accept answer carries the run id, and the reply lands on the log surface.
     if let Some(consult) = plan.consult.clone() {
         spawn_consult(
-            client.clone(),
+            writer.clone(),
             config.clone(),
             model.clone(),
             ledger.clone(),
-            resumed.clone(),
             handle.clone(),
             run_id.clone(),
             consult,
@@ -660,7 +658,7 @@ fn answer(
         // write"). The field stays here for the readers that have it.
         let left = overlay_left(&plan);
         spawn_stream(
-            client.clone(),
+            writer.clone(),
             config.clone(),
             runner.clone(),
             handle.clone(),
@@ -718,7 +716,7 @@ fn answer(
         ),
         (Ok(out), None) => {
             settle(config, &plan, &out);
-            let dir = finish(client, config, handle, &plan, &out);
+            let dir = finish(writer, config, handle, &plan, &out);
             let named = dir.as_ref().map(|d| d.display().to_string());
             // The merge's one summary line stands above the rebuild's own output, so
             // the synchronous answer says what a streamed one appends to the log.
@@ -1210,7 +1208,7 @@ fn discard(layout: &Layout, plan: &Plan) {
 /// advertises nothing: the previous bundle stands untouched and nothing is
 /// published over it.
 fn finish(
-    client: &GladeClient,
+    writer: &Writer,
     config: &Arc<GyldConfig>,
     handle: &Handle,
     plan: &Plan,
@@ -1223,22 +1221,11 @@ fn finish(
     if let Err(e) = bundle::write_latest(&config.layout, dir) {
         eprintln!("glade-gyld: could not record the latest build: {e}");
     }
-    spawn_publish(client.clone(), config.clone(), handle.clone(), dir.clone());
+    spawn_publish(writer.clone(), config.clone(), handle.clone(), dir.clone());
     Some(dir.clone())
 }
 
-/// A quiet op receiver means the replay is in: the node ships a subscribed
-/// chain's whole gap in ONE `Ops` frame, and an op only reaches `on_ops` after
-/// the session has already folded it, so nothing further arriving is nothing
-/// further to fold.
-const RESUME_SETTLE: Duration = Duration::from_millis(150);
-
-/// The ceiling on a resume. A chain with no history is shipped no frame at all,
-/// so this is the case the deadline exists for: seq 0 is the right place to
-/// start on a chain that does not exist yet, and waiting longer learns nothing.
-const RESUME_DEADLINE: Duration = Duration::from_secs(5);
-
-/// Pick this session's own chains back up before writing to them.
+/// Pick one of this session's own chains back up before writing to it.
 ///
 /// The origin is derived from the configured `(share, glade_id)` and nothing
 /// else, so every session of a data directory writes under the SAME origin. The
@@ -1247,44 +1234,34 @@ const RESUME_DEADLINE: Duration = Duration::from_secs(5);
 /// at seq 0 on a slot that is already filled — which the node refuses as an
 /// equivocation (`node/src/store.rs`, `Verdict::Equivocation`) — and stamps a
 /// lamport of 1, which loses the value fold to the very record it meant to
-/// replace. Neither refusal is visible from here: `append` ships
-/// fire-and-forget, and the node's error frame correlates to nothing.
+/// replace.
 ///
-/// Subscribing is what makes the history visible. The node replays the chain,
-/// the client's session folds it, and the next `append` continues it properly:
+/// Subscribing is what makes the history visible. The node's ack names each
+/// origin's head in the zone, and the subscribe returns once the replay has
+/// reached every one of them (GladeSubstrateV1 §6, R5 and R7): the client's
+/// session has folded the chain, and the next `append` continues it properly —
 /// seq after the stored head, `prev` linked to it, lamport above every lamport
-/// in it. These are value surfaces, never the declared exchange one, so a
-/// subscribe here streams ops back and never re-attaches a provider.
-///
-/// Cheap to repeat: the node remembers what this session has sent it, so every
-/// resume after the first has an empty gap to ship.
-async fn resume(client: &GladeClient, share: &str, surfaces: &[(String, Option<Vec<u8>>)]) {
-    if surfaces.is_empty() {
-        return;
-    }
-    // Taken BEFORE the subscribes, so no replayed frame can land unobserved.
-    let mut ops = client.on_ops().await;
-    for (glade_id, key) in surfaces.iter() {
-        if let Err(e) = client.subscribe(share, glade_id, key.as_deref()).await {
-            // Say it and publish anyway: a refused resume is a stale value, a
-            // skipped publish is no value at all.
-            eprintln!("glade-gyld: could not resume {glade_id}: {e}");
-            return;
+/// in it. Nothing is waited for past that, so a zone elsewhere in the session
+/// that never falls quiet costs a resume nothing. These are value and log
+/// surfaces, never the declared exchange one, so a subscribe here streams ops
+/// back and never re-attaches a provider.
+async fn resume(client: &GladeClient, share: &str, glade_id: &str, key: &[u8]) {
+    let chain = chain_name(share, glade_id, key);
+    // Said, and the write goes ahead anyway: a refused resume is a stale value,
+    // a skipped write is no value at all, and a write the node then refuses is
+    // said in its turn ([`Writer::write`]).
+    match client.subscribe_outcome(share, glade_id, Some(key)).await {
+        Ok(SubscribeOutcome::Accepted { .. }) => {}
+        // R6: the reason's code, unless the connection ended before it came.
+        Ok(SubscribeOutcome::Refused { code, message }) => {
+            let code = code.map_or_else(|| "no code".to_string(), |code| format!("{code:?}"));
+            eprintln!(
+                "glade-gyld: could not resume {chain}: the node refused the subscribe: {code}, \
+                 {message}"
+            );
         }
-    }
-    let deadline = tokio::time::Instant::now() + RESUME_DEADLINE;
-    loop {
-        let settled =
-            tokio::time::timeout_at(deadline, tokio::time::timeout(RESUME_SETTLE, ops.recv()));
-        match settled.await {
-            // An op arrived, and the session has already folded it — keep going.
-            Ok(Ok(Some(_))) => {
-                continue;
-            }
-            // Quiet, closed, or out of time: as caught up as this gets.
-            _ => {
-                break;
-            }
+        Err(e) => {
+            eprintln!("glade-gyld: could not resume {chain}: {e}");
         }
     }
 }
@@ -1295,7 +1272,8 @@ async fn resume(client: &GladeClient, share: &str, surfaces: &[(String, Option<V
 /// hundreds — and only the FIRST of them is the one that has to land on a chain
 /// this session has never seen. After that the session holds the chain and
 /// `append` continues it on its own, so a resume per record would be a replay
-/// per record for nothing.
+/// per record for nothing. Until the node refuses a write to it: then the chain
+/// is forgotten ([`Resumed::forget`]), and the next write picks it up again.
 ///
 /// Keyed by `(glade_id, key)` because that is what a chain is keyed by
 /// (`node/src/store.rs`, `ChainId`): a conversation and a run are separate
@@ -1308,13 +1286,122 @@ struct Resumed {
 }
 
 impl Resumed {
-    /// Resume `(glade_id, key)` the first time this process writes to it.
+    /// Resume `(glade_id, key)` the first time this process writes to it, and
+    /// the first time after it was forgotten.
     async fn once(&self, client: &GladeClient, share: &str, glade_id: &str, key: &[u8]) {
         let mut seen = self.seen.lock().await;
         if !seen.insert((glade_id.to_string(), key.to_vec())) {
             return;
         }
-        resume(client, share, &[(glade_id.to_string(), Some(key.to_vec()))]).await;
+        resume(client, share, glade_id, key).await;
+    }
+
+    /// Forget `(glade_id, key)`, whose write the node refused. The client has
+    /// dropped the refused op with the rest of its chain, and writes no more
+    /// to that chain until a subscribe of its zone resumes it.
+    async fn forget(&self, glade_id: &str, key: &[u8]) {
+        self.seen
+            .lock()
+            .await
+            .remove(&(glade_id.to_string(), key.to_vec()));
+    }
+}
+
+/// Every write this session makes goes through one door, [`Writer::write`]: the
+/// documents a build publishes, a consultation's records and a run's output. So
+/// no op this supplier appends is refused unseen (client-writes plan, Step 4.1).
+#[derive(Clone)]
+struct Writer {
+    client: GladeClient,
+    /// The share every write goes to: the configured one.
+    share: String,
+    /// The chains this session has picked up, for its lifetime.
+    resumed: Arc<Resumed>,
+}
+
+impl Writer {
+    fn new(client: GladeClient, share: String) -> Writer {
+        Writer {
+            client,
+            share,
+            resumed: Arc::new(Resumed::default()),
+        }
+    }
+
+    /// Pick `(glade_id, key)` up, unless this process already has.
+    async fn resume(&self, glade_id: &str, key: &[u8]) {
+        self.resumed
+            .once(&self.client, &self.share, glade_id, key)
+            .await;
+    }
+
+    /// Append one op to a chain of this session's own, and answer what the node
+    /// said to it (GladeSubstrateV1 §6, R1):
+    ///
+    /// 1. the chain is picked up first, once per process;
+    /// 2. the op goes out, and the node's answer to it is awaited;
+    /// 3. a refusal is said on stderr, with the chain, the seq and the code, and
+    ///    the write goes once more, on the chain picked up again;
+    /// 4. a second refusal is said too, and the write is dropped.
+    ///
+    /// Every other answer stands: `Ok` and `Retention` settled the op, one not
+    /// placed is the client's to send again (W5), and one whose connection
+    /// ended first has no answer to give. `Err` is the client's own: no
+    /// connection, or a chain it writes no more until a subscribe resumes it.
+    async fn write(
+        &self,
+        glade_id: &str,
+        shape: &str,
+        payload: Vec<u8>,
+        key: &[u8],
+    ) -> io::Result<OpOutcome> {
+        let chain = chain_name(&self.share, glade_id, key);
+        let (seq, outcome) = self.attempt(glade_id, shape, payload.clone(), key).await?;
+        let OpOutcome::Refused { code, message } = &outcome else {
+            return Ok(outcome);
+        };
+        eprintln!(
+            "glade-gyld: the node refused seq {seq} of {chain}: {code:?}, {message}; picking the \
+             chain up again to write it once more"
+        );
+        let (seq, outcome) = self.attempt(glade_id, shape, payload, key).await?;
+        if let OpOutcome::Refused { code, message } = &outcome {
+            eprintln!(
+                "glade-gyld: the node refused seq {seq} of {chain} again: {code:?}, {message}; \
+                 the write is dropped"
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// One attempt: the chain picked up unless it is, one append, and the
+    /// node's answer, with the op's seq. A refused chain is forgotten, so the
+    /// next attempt on it, this write's or a later one's, picks it up again.
+    async fn attempt(
+        &self,
+        glade_id: &str,
+        shape: &str,
+        payload: Vec<u8>,
+        key: &[u8],
+    ) -> io::Result<(i64, OpOutcome)> {
+        self.resume(glade_id, key).await;
+        let (op, outcome) = self
+            .client
+            .append_outcome(&self.share, glade_id, shape, payload, Some(key))
+            .await?;
+        if matches!(outcome, OpOutcome::Refused { .. }) {
+            self.resumed.forget(glade_id, key).await;
+        }
+        Ok((op.seq, outcome))
+    }
+}
+
+/// A chain as a log line names it: `share/glade_id`, and `[key]` when it has
+/// one — a stream, a lens, a run or a conversation.
+fn chain_name(share: &str, glade_id: &str, key: &[u8]) -> String {
+    match key.is_empty() {
+        true => format!("{share}/{glade_id}"),
+        false => format!("{share}/{glade_id}[{}]", String::from_utf8_lossy(key)),
     }
 }
 
@@ -1325,12 +1412,7 @@ impl Resumed {
 /// The ONE publication path. A build the supplier just ran, a build it found in
 /// the bundle root when it attached and the first build it made for itself all
 /// arrive here, so all three land the same documents and log the same line.
-fn spawn_publish(
-    client: GladeClient,
-    config: Arc<GyldConfig>,
-    handle: Handle,
-    output_dir: PathBuf,
-) {
+fn spawn_publish(writer: Writer, config: Arc<GyldConfig>, handle: Handle, output_dir: PathBuf) {
     handle.spawn(async move {
         let plan = publish::publications(&config.layout, &output_dir, &config.surfaces);
         for note in plan.notes.iter() {
@@ -1338,18 +1420,12 @@ fn spawn_publish(
         }
         // Pick the chains up before writing to them: this session's origin is
         // one an earlier session already wrote under, and appending without its
-        // history is a write that goes nowhere.
-        let surfaces: Vec<(String, Option<Vec<u8>>)> = plan
-            .publications
-            .iter()
-            .map(|p| {
-                (
-                    p.glade_id.clone(),
-                    p.key.as_deref().map(|k| k.as_bytes().to_vec()),
-                )
-            })
-            .collect();
-        resume(&client, &config.share, &surfaces).await;
+        // history is a write that goes nowhere. Every one of them first, so the
+        // check below comes after the last replay.
+        for publication in plan.publications.iter() {
+            let key = publication.key.as_deref().unwrap_or_default().as_bytes();
+            writer.resume(&publication.glade_id, key).await;
+        }
         // A publication that has been overtaken must not land. Two of them can be
         // in flight at once — the build found at attach, and a Rebuild that
         // arrived while that one was still resuming — and the value fold takes
@@ -1369,17 +1445,16 @@ fn spawn_publish(
             return;
         }
         for publication in plan.publications.iter() {
-            let key = publication.key.as_deref().map(str::as_bytes);
-            let appended = client
-                .append(
-                    &config.share,
+            let key = publication.key.as_deref().unwrap_or_default().as_bytes();
+            let written = writer
+                .write(
                     &publication.glade_id,
                     "value",
                     publication.payload.clone(),
                     key,
                 )
                 .await;
-            if let Err(e) = appended {
+            if let Err(e) = written {
                 eprintln!(
                     "glade-gyld: could not publish {} {:?}: {e}",
                     publication.glade_id, publication.key
@@ -1426,7 +1501,7 @@ fn read_bounded(path: &std::path::Path, max: usize) -> Result<String, String> {
 /// Accept a streaming run and answer at once: [`stream_run`] on its own task.
 #[allow(clippy::too_many_arguments)]
 fn spawn_stream(
-    client: GladeClient,
+    writer: Writer,
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
     handle: Handle,
@@ -1439,7 +1514,7 @@ fn spawn_stream(
 ) {
     let inner = handle.clone();
     handle.spawn(stream_run(
-        client, config, runner, inner, run_id, plan, who, snapshot, previous, gate,
+        writer, config, runner, inner, run_id, plan, who, snapshot, previous, gate,
     ));
 }
 
@@ -1457,7 +1532,7 @@ fn spawn_stream(
 /// "saved" once the run says so and not before.
 #[allow(clippy::too_many_arguments)]
 async fn stream_run(
-    client: GladeClient,
+    writer: Writer,
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
     handle: Handle,
@@ -1480,7 +1555,7 @@ async fn stream_run(
             drop(gate);
             seq += 1;
             append(
-                &client,
+                &writer,
                 &config,
                 &run_id,
                 &GyldOutputRecord::end(&run_id, seq, &who, 1).refusing(Some(refusal)),
@@ -1492,7 +1567,7 @@ async fn stream_run(
     if let Some(line) = merged {
         seq += 1;
         let record = GyldOutputRecord::line(&run_id, seq, &who, "stdout", line);
-        append(&client, &config, &run_id, &record).await;
+        append(&writer, &config, &run_id, &record).await;
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, String)>();
@@ -1513,7 +1588,7 @@ async fn stream_run(
     while let Some((stream, line)) = rx.recv().await {
         seq += 1;
         let record = GyldOutputRecord::line(&run_id, seq, &who, &stream, line);
-        append(&client, &config, &run_id, &record).await;
+        append(&writer, &config, &run_id, &record).await;
     }
 
     let (exit, refused) = match work.await {
@@ -1527,14 +1602,14 @@ async fn stream_run(
             );
             if refused.is_none() {
                 settle(&config, &judged, &out);
-                finish(&client, &config, &inner, &judged, &out);
+                finish(&writer, &config, &inner, &judged, &out);
             }
             (out.exit, refused)
         }
         Ok(Err(e)) => {
             seq += 1;
             let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", e.clone());
-            append(&client, &config, &run_id, &record).await;
+            append(&writer, &config, &run_id, &record).await;
             let refused = land(
                 &config.layout,
                 &judged,
@@ -1548,7 +1623,7 @@ async fn stream_run(
             let said = format!("run task failed: {e}");
             seq += 1;
             let record = GyldOutputRecord::line(&run_id, seq, &who, "stderr", said.clone());
-            append(&client, &config, &run_id, &record).await;
+            append(&writer, &config, &run_id, &record).await;
             let refused = land(
                 &config.layout,
                 &judged,
@@ -1569,7 +1644,7 @@ async fn stream_run(
     };
     seq += 1;
     append(
-        &client,
+        &writer,
         &config,
         &run_id,
         &GyldOutputRecord::end(&run_id, seq, &who, exit)
@@ -1582,18 +1657,17 @@ async fn stream_run(
 /// Accept a consultation and answer at once: [`consult_run`] on its own task.
 #[allow(clippy::too_many_arguments)]
 fn spawn_consult(
-    client: GladeClient,
+    writer: Writer,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
     ledger: Arc<Ledger>,
-    resumed: Arc<Resumed>,
     handle: Handle,
     run_id: String,
     consult: Consultation,
     who: Option<String>,
 ) {
     handle.spawn(consult_run(
-        client, config, model, ledger, resumed, run_id, consult, who,
+        writer, config, model, ledger, run_id, consult, who,
     ));
 }
 
@@ -1610,11 +1684,10 @@ fn spawn_consult(
 /// answer presented as a whole one is not.
 #[allow(clippy::too_many_arguments)]
 async fn consult_run(
-    client: GladeClient,
+    writer: Writer,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
     ledger: Arc<Ledger>,
-    resumed: Arc<Resumed>,
     run_id: String,
     consult: Consultation,
     who: Option<String>,
@@ -1628,27 +1701,21 @@ async fn consult_run(
     // reads back nothing and every record this turn appends lands on a taken
     // slot. Once per conversation per process: the turn appends many records
     // and only the first of them meets an unseen chain.
-    resumed
-        .once(
-            &client,
-            &config.share,
-            &config.ask_id,
-            conversation.as_bytes(),
-        )
-        .await;
+    writer.resume(&config.ask_id, conversation.as_bytes()).await;
 
     // The transcript IS the log share (section 6): the supplier reads back its
     // own records for this conversation and replays them as prior turns. This
     // happens BEFORE anything of this turn is appended, so what comes back is
     // exactly the turns that came before.
     let prior = conversation::turns(
-        &client
+        &writer
+            .client
             .fold_log(&config.share, &config.ask_id, Some(conversation.as_bytes()))
             .await,
     );
     let mut seq: u64 = 1;
     append_ask(
-        &client,
+        &writer,
         &config,
         &conversation,
         &GyldAskRecord::question(&run_id, seq, &who, &conversation, question),
@@ -1667,7 +1734,7 @@ async fn consult_run(
     for note in resolved.notes.iter() {
         seq += 1;
         append_ask(
-            &client,
+            &writer,
             &config,
             &conversation,
             &GyldAskRecord::note(&run_id, seq, &who, &conversation, note.clone()),
@@ -1772,7 +1839,7 @@ async fn consult_run(
             }
         };
         seq += 1;
-        append_ask(&client, &config, &conversation, &record).await;
+        append_ask(&writer, &config, &conversation, &record).await;
     }
 
     let (exit, said) = match work.await {
@@ -1799,7 +1866,7 @@ async fn consult_run(
     };
     seq += 1;
     let end = GyldAskRecord::end(&run_id, seq, &who, &conversation, exit, said);
-    append_ask(&client, &config, &conversation, &end).await;
+    append_ask(&writer, &config, &conversation, &end).await;
 }
 
 /// One thing a consultation produces, on its way to a record.
@@ -1818,18 +1885,17 @@ enum Reply {
 
 /// Append one reply record to the ask surface, keyed by CONVERSATION.
 async fn append_ask(
-    client: &GladeClient,
+    writer: &Writer,
     config: &GyldConfig,
     conversation: &str,
     record: &GyldAskRecord,
 ) {
-    let _ = client
-        .append(
-            &config.share,
+    let _ = writer
+        .write(
             &config.ask_id,
             "log",
             record.to_bytes(),
-            Some(conversation.as_bytes()),
+            conversation.as_bytes(),
         )
         .await;
 }
@@ -1845,7 +1911,7 @@ async fn append_ask(
 /// bundle. A first build that fails is failure as DATA on the run and one log
 /// line; the supplier stays up and the root simply still has no build.
 fn spawn_first_build(
-    client: GladeClient,
+    writer: Writer,
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
     handle: Handle,
@@ -1873,7 +1939,7 @@ fn spawn_first_build(
                 // streams to have been valid in. A failed one still has its
                 // half-written directory removed, which is `land`'s business.
                 stream_run(
-                    client.clone(),
+                    writer.clone(),
                     config.clone(),
                     runner,
                     inner,
@@ -1887,11 +1953,11 @@ fn spawn_first_build(
                 .await;
             }
             Ok(Err(e)) => {
-                fail_first_build(&client, &config, &run_id, &who, e).await;
+                fail_first_build(&writer, &config, &run_id, &who, e).await;
             }
             Err(e) => {
                 fail_first_build(
-                    &client,
+                    &writer,
                     &config,
                     &run_id,
                     &who,
@@ -1954,7 +2020,7 @@ fn declared_streams(config: &GyldConfig, runner: &Arc<dyn Runner>) -> Vec<String
 /// A first build that never got as far as a host: the reason goes on the run,
 /// closed by the terminal record, exactly as a failed run's would.
 async fn fail_first_build(
-    client: &GladeClient,
+    writer: &Writer,
     config: &GyldConfig,
     run_id: &str,
     who: &Option<String>,
@@ -1962,9 +2028,9 @@ async fn fail_first_build(
 ) {
     eprintln!("glade-gyld: first build failed: {reason}");
     let record = GyldOutputRecord::line(run_id, 1, who, "stderr", reason);
-    append(client, config, run_id, &record).await;
+    append(writer, config, run_id, &record).await;
     append(
-        client,
+        writer,
         config,
         run_id,
         &GyldOutputRecord::end(run_id, 2, who, -1),
@@ -1973,19 +2039,13 @@ async fn fail_first_build(
 }
 
 /// Append one output record to the log surface, keyed by run id.
-async fn append(
-    client: &GladeClient,
-    config: &GyldConfig,
-    run_id: &str,
-    record: &GyldOutputRecord,
-) {
-    let _ = client
-        .append(
-            &config.share,
+async fn append(writer: &Writer, config: &GyldConfig, run_id: &str, record: &GyldOutputRecord) {
+    let _ = writer
+        .write(
             &config.output_id,
             "log",
             record.to_bytes(),
-            Some(run_id.as_bytes()),
+            run_id.as_bytes(),
         )
         .await;
 }

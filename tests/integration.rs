@@ -33,6 +33,11 @@
 //!  12. a RESTARTED supplier republishes over the value it left behind in an
 //!      earlier session: same origin, a chain it has to pick up again rather
 //!      than start over, so the newest census is what a mount folds.
+//!  13. a RESTARTED supplier keeps writing an open conversation.
+//!  14. a publish picks its chains up by the node's heads, and never waits for
+//!      a zone the session is subscribed to to fall quiet.
+//!  15. a write the node REFUSES is said on stderr with its chain, its seq and
+//!      its code, once for the attempt and once for the one retry.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -46,7 +51,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use glade_client::GladeClient;
+use glade_client::{GladeClient, OpOutcome};
 use glade_gyld::{
     serve_with, Declined, GyldAskRecord, GyldConfig, GyldOutputRecord, GyldResponse, Limits,
     ModelClient, ModelEvent, ModelOutcome, ModelRequest, Plan, RunOutput, Runner,
@@ -3798,9 +3803,10 @@ async fn census_says(sub: &GladeClient, want: &str) -> bool {
 /// 0 collides with the slots the earlier session already filled, and a lamport
 /// restarted at 0 loses the value fold to the record it is trying to replace.
 ///
-/// Both failures are SILENT at the supplier — `append` ships fire-and-forget and
-/// the node's rejection comes back on a frame nothing correlates — so the only
-/// way to see it is from the outside: what does a mount fold after the restart?
+/// Both failures were SILENT at the supplier until client-writes Step 4.1 —
+/// `append` shipped fire-and-forget, and the node's rejection came back on a
+/// frame nothing correlated — so this test looks from the outside: what does a
+/// mount fold after the restart?
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
     let tmp = Tmp::new("republish");
@@ -3881,8 +3887,9 @@ async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
 /// replays the prior turns by folding its OWN session store, which a fresh
 /// session has nothing in, so the model is told the conversation is new; and
 /// every record the turn then appends lands on a taken slot and is refused as
-/// an equivocation. Neither is visible at the supplier — `append` ships
-/// fire-and-forget — so the only way to see it is from a mount.
+/// an equivocation. Neither was visible at the supplier until client-writes
+/// Step 4.1 — `append` shipped fire-and-forget — so this test looks from a
+/// mount.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_supplier_keeps_writing_an_open_conversation() {
     let tmp = Tmp::new("reask");
@@ -3967,5 +3974,252 @@ async fn a_restarted_supplier_keeps_writing_an_open_conversation() {
     req.close().await;
     second.shutdown().await;
     sub.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 14. a publish resumes by the heads, never by waiting for quiet --------
+
+/// What the third session of test 14 writes, so a mount can count it.
+const CHATTER: &[u8] = br#"{"chatter":true}"#;
+
+/// A chain is picked up by subscribing to it, and the subscribe returns once the
+/// node's replay of it is in (client-writes plan, Step 4.1). The supplier used to
+/// wait instead until its op receiver had been quiet for 150 ms, for at most 5 s.
+/// That receiver hears EVERY zone the session is subscribed to, so one zone that
+/// never fell quiet held every publish for the whole 5 s.
+///
+/// Here that zone is an ask conversation the supplier has answered, and so is
+/// subscribed to, with a third session writing there every 20 ms. The rebuild's
+/// publication has chains to pick up: its stream's documents, which the seeded
+/// build did not have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publish_resumes_without_waiting_for_quiet() {
+    let tmp = Tmp::new("quiet");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let build = seed_bundle(&bundle);
+    seed_agent(&bundle, &build);
+
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gyld.streams", None)
+        .await
+        .unwrap();
+    sub.subscribe("ws-razel", "gyld.ask", Some(CONVERSATION.as_bytes()))
+        .await
+        .unwrap();
+
+    let model = Arc::new(ScriptedModel {
+        chunks: vec!["custody is held by the node"],
+        ..Default::default()
+    });
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle),
+        Arc::new(StampedBundleBuilder(AtomicU64::new(1))),
+        model,
+    )
+    .await
+    .unwrap();
+    let req = GladeClient::new("requester");
+    req.connect(&url).await.unwrap();
+    attached(&req).await;
+
+    // The supplier answers on the conversation, and is subscribed to it from
+    // then on.
+    assert!(
+        request(&req, &explain("base", "who holds the key?"))
+            .await
+            .ok
+    );
+    ask_turns(&sub, CONVERSATION, 1).await;
+
+    // A third session that never lets the conversation fall quiet, seen
+    // arriving before the rebuild is asked for.
+    let chatter = GladeClient::new("chatter");
+    chatter.connect(&url).await.unwrap();
+    let noise = {
+        let chatter = chatter.clone();
+        tokio::spawn(async move {
+            while chatter
+                .append(
+                    "ws-razel",
+                    "gyld.ask",
+                    "log",
+                    CHATTER.to_vec(),
+                    Some(CONVERSATION.as_bytes()),
+                )
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let s = sub.clone();
+    let chattering = poll(|| {
+        let s = s.clone();
+        async move {
+            s.fold_log("ws-razel", "gyld.ask", Some(CONVERSATION.as_bytes()))
+                .await
+                .iter()
+                .filter(|e| e.as_slice() == CHATTER)
+                .count()
+                >= 3
+        }
+    })
+    .await;
+    assert!(
+        chattering,
+        "the third session is writing to the conversation"
+    );
+
+    let asked = tokio::time::Instant::now();
+    assert!(request(&req, r#"{"verb":"rebuild"}"#).await.ok);
+    let landed = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let census = sub
+                .fold_value("ws-razel", "gyld.streams", None)
+                .await
+                .unwrap_or_default();
+            if String::from_utf8_lossy(&census).contains(r#""revision":"r1""#) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let waited = asked.elapsed();
+    noise.abort();
+    assert!(
+        landed.is_ok(),
+        "the rebuild's census reaches the mount within 1.5 s, however busy another \
+         zone of the supplier's is; it had not after {waited:?}"
+    );
+
+    chatter.close().await;
+    req.close().await;
+    sub.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 15. a write the node refuses is said, and tried once more -------------
+
+/// No supplier write is refused unseen (client-writes plan, Step 4.1). Every op
+/// the supplier appends is answered, and a refusal is said on stderr with its
+/// chain, its seq and its code; the chain is picked up again and the write tried
+/// once more, and a second refusal is said too before the write is dropped.
+///
+/// The node refuses here for a reason no resume cures: a test client took the
+/// zone of `base`'s stream document first, with a `crdt` op, and the node refuses
+/// a `value` op on a `crdt` zone as a shape conflict (`node/src/store.rs`). The
+/// BINARY runs, because what is under test is what it says on stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_the_node_refuses_is_reported() {
+    let tmp = Tmp::new("refused-write");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_whole_bundle(&bundle);
+
+    let squatter = GladeClient::new("squatter");
+    squatter.connect(&url).await.unwrap();
+    let (_, held) = squatter
+        .append_outcome(
+            "ws-razel",
+            "gyld.stream",
+            "crdt",
+            b"{}".to_vec(),
+            Some(b"base"),
+        )
+        .await
+        .expect("the squatter's op went out");
+    assert_eq!(held, OpOutcome::Accepted, "the zone is a crdt one now");
+
+    // A seeded build, so the supplier publishes at attach and runs no host;
+    // `--python` names nothing, so no real Gyld host could run anyway.
+    let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
+        .args(["--node", &url, "--gyld-root"])
+        .arg(&gyld)
+        .arg("--bundle-root")
+        .arg(&bundle)
+        .args([
+            "--share",
+            "ws-razel",
+            "--principal",
+            "tester",
+            "--python",
+            "/nonexistent/python3",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn glade-gyld binary");
+    let pid = supplier.id().expect("binary pid");
+
+    // Everything it says up to the line that closes the publication.
+    let mut lines = BufReader::new(supplier.stderr.take().expect("piped stderr")).lines();
+    let mut said: Vec<String> = Vec::new();
+    let published = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let closes = line.contains("glade-gyld: published builds/build-0000000000009");
+            said.push(line);
+            if closes {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(published, Ok(true)),
+        "the supplier published the seeded build: {said:#?}"
+    );
+
+    let refused: Vec<&String> = said
+        .iter()
+        .filter(|line| line.contains("the node refused seq 0 of ws-razel/gyld.stream[base]"))
+        .collect();
+    assert_eq!(
+        refused.len(),
+        2,
+        "the refusal is named twice, for the attempt and for the retry: {said:#?}"
+    );
+    assert!(
+        refused[0].contains("Protocol")
+            && refused[0].contains("shape conflict")
+            && refused[0].contains("once more"),
+        "the attempt's refusal names its code, and the retry to come: {}",
+        refused[0]
+    );
+    assert!(
+        refused[1].contains("again: Protocol")
+            && refused[1].contains("shape conflict")
+            && refused[1].contains("the write is dropped"),
+        "the retry's refusal names its code, and the write dropped: {}",
+        refused[1]
+    );
+    assert_eq!(
+        said.iter()
+            .filter(|line| line.contains("the node refused"))
+            .count(),
+        2,
+        "no other write of the publication was refused: {said:#?}"
+    );
+
+    let killed = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "sent SIGTERM");
+    let status = tokio::time::timeout(Duration::from_secs(10), supplier.wait())
+        .await
+        .expect("binary exited after SIGTERM")
+        .expect("wait");
+    assert!(status.success(), "clean shutdown exit 0, got {status:?}");
+
+    squatter.close().await;
     node.kill().await.ok();
 }

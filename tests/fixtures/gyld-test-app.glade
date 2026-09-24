@@ -24,7 +24,7 @@ binding gyld.decisions value share commons latest
 binding gyld.lens      value share commons latest
 
 # bootstrap grant (data only — enforcement is stage-2).
-seed owner gyld gyld.*
+seed owner ws-razel gyld.*
 
 # the workspace share this app serves from; the booted loader is its host.
 workspace ws-razel razel

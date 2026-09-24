@@ -1,0 +1,73 @@
+{
+  "rule": "No process-global mutable state in production code: statics with interior mutability, thread-local slots, environment or working-directory reads at the point of use, process-wide hooks and child processes that inherit the live environment. Pass state through configuration and context instead, read the process's arguments and environment once at the entry point, and spawn children with env_clear() plus an explicit environment. check_process_globals.py fails on anything unlisted and on entries that no longer match, so this list only shrinks. 'debt' entries are scheduled for removal (dev-docs/ProcessGlobalsPlan.md in the glade-wz workspace); 'permanent' entries are read once at a program's entry point or carry no shared state.",
+  "source": "scripts/checks/check_process_globals.py is gwz-core's checker at commit 730e7119 (gwz-dev workspace), vendored byte for byte; its own tests live there.",
+  "roots": [
+    "src/lib.rs",
+    "src/bin/glade-gyld.rs"
+  ],
+  "entries": [
+    {
+      "path": "src/agent.rs",
+      "kind": "env",
+      "name": "env::var",
+      "disposition": "debt",
+      "reason": "AgentOverrides::from_env reads the environment where it is used; capture it once in main and call from_vars with the snapshot (ProcessGlobalsPlan Step 2.2)."
+    },
+    {
+      "path": "src/bin/glade-gyld.rs",
+      "kind": "env",
+      "name": "env::args",
+      "disposition": "permanent",
+      "reason": "The program reads its arguments once, at its entry point, and passes them down."
+    },
+    {
+      "path": "src/bundle.rs",
+      "kind": "static",
+      "name": "NEXT",
+      "disposition": "permanent",
+      "reason": "Temp-name sequence for sibling_temp; only fetch_add, no shared state."
+    },
+    {
+      "path": "src/exec.rs",
+      "kind": "process",
+      "name": "Command::new",
+      "disposition": "debt",
+      "reason": "Runs Python with the live process environment; spawn it with env_clear() plus the supplier's captured environment (ProcessGlobalsPlan Step 3.1)."
+    },
+    {
+      "path": "src/github.rs",
+      "kind": "env",
+      "name": "env::var",
+      "disposition": "debt",
+      "reason": "discovered() reads the token variables at first use; take them from the captured environment (ProcessGlobalsPlan Step 2.2)."
+    },
+    {
+      "path": "src/github.rs",
+      "kind": "process",
+      "name": "Command::new(\"gh\")",
+      "disposition": "debt",
+      "reason": "Runs gh auth token with the live process environment; spawn it with env_clear() plus the captured environment (ProcessGlobalsPlan Step 3.1)."
+    },
+    {
+      "path": "src/github.rs",
+      "kind": "static",
+      "name": "HELD",
+      "disposition": "debt",
+      "reason": "The discovered GitHub token, cached process-wide in a OnceLock; hold it in the supplier's context (ProcessGlobalsPlan Step 4.3)."
+    },
+    {
+      "path": "src/model.rs",
+      "kind": "env",
+      "name": "env::var",
+      "disposition": "debt",
+      "reason": "discover_key reads the key variables at the point of use; take them from the captured environment (ProcessGlobalsPlan Step 2.2)."
+    },
+    {
+      "path": "src/supplier.rs",
+      "kind": "env",
+      "name": "env::var",
+      "disposition": "debt",
+      "reason": "The supplier checks the key variables at the point of use; take them from the captured environment (ProcessGlobalsPlan Step 2.2)."
+    }
+  ]
+}

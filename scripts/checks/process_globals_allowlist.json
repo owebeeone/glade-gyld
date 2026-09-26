@@ -40,13 +40,6 @@
       "name": "Command::new(\"gh\")",
       "disposition": "permanent",
       "reason": "Runs gh auth token with env_clear() plus the start-up snapshot main captured (Environment::apply_to): the pattern the rule requires of a child. The checker cannot see env_clear(); the tests in src/environment.rs, src/github.rs and tests/child_environment.rs hold it (ProcessGlobalsPlan Step 3.1)."
-    },
-    {
-      "path": "src/github.rs",
-      "kind": "static",
-      "name": "HELD",
-      "disposition": "debt",
-      "reason": "The discovered GitHub token, cached process-wide in a OnceLock; hold it in the supplier's context (ProcessGlobalsPlan Step 4.3)."
     }
   ]
 }

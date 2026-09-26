@@ -6,13 +6,14 @@
 //! ([`crate::tools::wrap`]).
 //!
 //! **The token is discovered ONCE, at attach, and never travels.**
-//! [`discovered`] looks at `GITHUB_TOKEN` in the environment the supplier
-//! started with first, and runs `gh auth token` only if that is empty — one
-//! subprocess for the life of the supplier, bounded, and with `gh`'s own error
-//! going nowhere near a record. What is logged, recorded and said in a refusal
-//! is WHICH source answered ([`Source::says`]) and never the value: [`Token`]
-//! has a hand-written [`std::fmt::Debug`] so a `{:?}` somebody adds later
-//! cannot leak it either.
+//! [`discover_with_gh`] looks at `GITHUB_TOKEN` in the environment the
+//! supplier started with first, and runs `gh auth token` only if that is empty
+//! — one subprocess for the life of the supplier, bounded, and with `gh`'s own
+//! error going nowhere near a record. The supplier holds the [`Token`] it
+//! returns, and nothing here keeps one. What is logged, recorded and said in a
+//! refusal is WHICH source answered ([`Source::says`]) and never the value:
+//! [`Token`] has a hand-written [`std::fmt::Debug`] so a `{:?}` somebody adds
+//! later cannot leak it either.
 //!
 //! **With no token the tool still works, and says what that costs.** GitHub
 //! rate-limits an unauthenticated caller to a trickle — sixty requests an hour
@@ -109,20 +110,21 @@ impl std::fmt::Debug for Token {
     }
 }
 
-/// The token this PROCESS found, discovered on first ask and never again, from
-/// the environment the process started with (`env`) and `gh`.
+/// The token, from `env` (the environment the supplier started with) and then
+/// the real `gh`.
 ///
-/// Once, because the second source is a subprocess: `gh auth token` per
-/// question would be a fork per question, and the config file is re-read every
-/// call precisely so that nothing else has to be.
-pub fn discovered(env: &Environment) -> &'static Token {
-    static HELD: OnceLock<Token> = OnceLock::new();
-    HELD.get_or_init(|| discover(env, &|| gh_auth_token(env)))
+/// The supplier calls this ONCE, at attach, and holds what it returns for its
+/// life ([`crate::supplier::serve`]): `gh auth token` per question would be a
+/// fork per question, and the config file is re-read every call precisely so
+/// that nothing else has to be. Nothing is kept here, so a second call asks
+/// again.
+pub fn discover_with_gh(env: &Environment) -> Token {
+    discover(env, &|| gh_auth_token(env))
 }
 
-/// [`discovered`] over an arbitrary `gh`, so the ORDER is asserted with made-up
-/// variables and no subprocess. `env` is the snapshot the entry point captured;
-/// the process's own environment is never read here.
+/// [`discover_with_gh`] over an arbitrary `gh`, so the ORDER is asserted with
+/// made-up variables and no subprocess. `env` is the snapshot the entry point
+/// captured; the process's own environment is never read here.
 ///
 /// `GITHUB_TOKEN` first and `gh` only when it is empty — a desk that exported a
 /// token meant that token, and a `gh` login it forgot about must not quietly
@@ -1028,6 +1030,23 @@ mod tests {
         assert_eq!(blank.source, Source::None);
         assert!(!blank.found());
         assert_eq!(Source::None.says(), "no token (unauthenticated)");
+    }
+
+    /// Nothing is held in the process: each discovery answers from the
+    /// snapshot it is given, so two suppliers in one process hold two tokens.
+    /// Both made up, and compared without being printed.
+    #[test]
+    fn each_discovery_answers_from_its_own_snapshot() {
+        let one = discover_with_gh(&Environment::of([(TOKEN_ENV, "made-up-one")]));
+        let two = discover_with_gh(&Environment::of([(TOKEN_ENV, "made-up-two")]));
+        assert!(
+            one.value.as_deref() == Some("made-up-one"),
+            "the first snapshot's own token"
+        );
+        assert!(
+            two.value.as_deref() == Some("made-up-two"),
+            "and the second's, not the first's again"
+        );
     }
 
     #[test]

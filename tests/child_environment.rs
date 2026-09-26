@@ -9,9 +9,9 @@
 //! binary of its own, so nothing runs beside it.
 //!
 //! Both spawn sites are driven as the supplier drives them: a Gyld host through
-//! `PythonRunner`, and `gh auth token` through `github::discovered`. Each child
-//! is a shell script that lists its environment; only NAMES are compared, and
-//! every value here is made up.
+//! `PythonRunner`, and `gh auth token` through `github::discover_with_gh`. Each
+//! child is a shell script that lists its environment; only NAMES are compared,
+//! and every value here is made up.
 
 #[cfg(unix)]
 mod unix {
@@ -104,7 +104,7 @@ mod unix {
         let host_saw = names(out.stdout.as_bytes());
 
         // `gh auth token`, through the discovery the supplier makes.
-        let token = github::discovered(&env);
+        let token = github::discover_with_gh(&env);
         let gh_saw = std::fs::read(&report)
             .map(|listing| names(&listing))
             .unwrap_or_default();

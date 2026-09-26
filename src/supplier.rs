@@ -40,6 +40,7 @@ use crate::conversation::{self, Ledger};
 use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, Refusal};
 use crate::environment::Environment;
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
+use crate::github::{self, Token};
 use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
 use crate::outcome::{self, Put, Snapshot};
 use crate::prompt::{self, Prompt};
@@ -197,32 +198,35 @@ pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSuppli
     // whether there is one — that is the refusal's business, per request.
     let resolved = config.resolve_agent();
     eprintln!("glade-gyld: agent {}", resolved.says());
+    // The github token, discovered here and only here: from the environment the
+    // supplier started with, then `gh`. The supplier holds it for its life and
+    // hands it on; nothing in the process keeps one.
+    let token = github::discover_with_gh(&config.env);
     // And which tools this desk gets, and where the network ones may go. Hosts,
     // counts and the SOURCE of the github token: no key, no token value and no
-    // page. The token is discovered here, once, for the life of the process.
+    // page.
     eprintln!(
         "glade-gyld: agent {}",
-        toolset::says(
-            &resolved.config.tools,
-            crate::github::discovered(&config.env)
-        )
+        toolset::says(&resolved.config.tools, &token)
     );
     for note in resolved.notes.iter() {
         eprintln!("glade-gyld: agent config: {note}");
     }
     let model = model::HttpsModelClient::new(resolved.config, config.env.clone());
     let runner = PythonRunner::new(python, config.env.clone());
-    serve_with(config, Arc::new(runner), Arc::new(model)).await
+    serve_with(config, Arc::new(runner), Arc::new(model), token).await
 }
 
-/// Connect, attach and serve with a caller-supplied runner and model client.
-/// The tests drive this one with a recording runner and a scripted model, so
-/// the whole verb path is exercised with no interpreter, no Gyld checkout and
-/// no network in sight.
+/// Connect, attach and serve with a caller-supplied runner, model client and
+/// github token. The tests drive this one with a recording runner, a scripted
+/// model and a token of their own, none or a made-up one, so the whole verb
+/// path is exercised with no interpreter, no Gyld checkout and no network in
+/// sight.
 pub async fn serve_with(
     config: GyldConfig,
     runner: Arc<dyn Runner>,
     model: Arc<dyn ModelClient>,
+    token: Token,
 ) -> io::Result<GyldSupplier> {
     let config = Arc::new(config);
     let client = GladeClient::new(format!("glade-gyld:{}:{}", config.share, config.glade_id));
@@ -248,6 +252,7 @@ pub async fn serve_with(
         config.clone(),
         runner.clone(),
         model,
+        Arc::new(token),
         Handle::current(),
         runs,
         first.clone(),
@@ -512,12 +517,15 @@ impl Drop for Writing {
 
 /// Build the exchange handler. It is a synchronous `Fn` (the kit's contract) and
 /// never returns `Err`, so the WIRE `ExchangeRes.ok` stays `true` and the PAYLOAD
-/// carries success or failure.
+/// carries success or failure. `token` is the github token the supplier holds
+/// for its life.
+#[allow(clippy::too_many_arguments)]
 fn make_handler(
     writer: Writer,
     config: Arc<GyldConfig>,
     runner: Arc<dyn Runner>,
     model: Arc<dyn ModelClient>,
+    token: Arc<Token>,
     handle: Handle,
     runs: Arc<Runs>,
     first: Arc<FirstBuild>,
@@ -533,6 +541,7 @@ fn make_handler(
             &config,
             &runner,
             &model,
+            &token,
             &ledger,
             &handle,
             &runs,
@@ -552,6 +561,7 @@ fn answer(
     config: &Arc<GyldConfig>,
     runner: &Arc<dyn Runner>,
     model: &Arc<dyn ModelClient>,
+    token: &Arc<Token>,
     ledger: &Arc<Ledger>,
     handle: &Handle,
     runs: &Arc<Runs>,
@@ -644,6 +654,7 @@ fn answer(
             writer.clone(),
             config.clone(),
             model.clone(),
+            token.clone(),
             ledger.clone(),
             handle.clone(),
             run_id.clone(),
@@ -1676,6 +1687,7 @@ fn spawn_consult(
     writer: Writer,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
+    token: Arc<Token>,
     ledger: Arc<Ledger>,
     handle: Handle,
     run_id: String,
@@ -1683,7 +1695,7 @@ fn spawn_consult(
     who: Option<String>,
 ) {
     handle.spawn(consult_run(
-        writer, config, model, ledger, run_id, consult, who,
+        writer, config, model, token, ledger, run_id, consult, who,
     ));
 }
 
@@ -1698,11 +1710,15 @@ fn spawn_consult(
 /// The partial text of a turn the output budget stopped is KEPT and said to be
 /// partial: half an answer that says it is half an answer is data; half an
 /// answer presented as a whole one is not.
+///
+/// `token` is the github token the supplier discovered at attach and holds: a
+/// question never discovers one.
 #[allow(clippy::too_many_arguments)]
 async fn consult_run(
     writer: Writer,
     config: Arc<GyldConfig>,
     model: Arc<dyn ModelClient>,
+    token: Arc<Token>,
     ledger: Arc<Ledger>,
     run_id: String,
     consult: Consultation,
@@ -1759,11 +1775,9 @@ async fn consult_run(
     }
     let model_config = resolved.config;
     let drafted_by = model_config.model.clone();
-    // The two roots a source index measures itself against, and the environment
-    // the github token is discovered from, carried onto the blocking task with
-    // everything else the tools need.
+    // The two roots a source index measures itself against, carried onto the
+    // blocking task with everything else the tools need.
     let layout = config.layout.clone();
-    let env = config.env.clone();
     let spent = ledger.spent(&conversation);
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
@@ -1775,7 +1789,7 @@ async fn consult_run(
             // The allow-list a desk that wrote none means, resolved against
             // what IS configured: the local tools always, and a network tool
             // only where the thing it needs is already there (11.2, 11.7).
-            let token = crate::github::discovered(&env);
+            let token: &Token = &token;
             let policy = model_config
                 .tools
                 .allowing(toolset::on_by_default(&model_config.tools, token));

@@ -41,6 +41,9 @@
 //!  16. the environment is read ONCE, when the binary starts, and handed down:
 //!      its readers see that snapshot, a model client sends the snapshot's key
 //!      ahead of the key file, and no value reaches a line.
+//!  17. the github token is discovered ONCE, when the binary attaches, and the
+//!      supplier holds it: a question uses the held token, and its value
+//!      reaches no model request, no record and no line.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -55,6 +58,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use glade_client::{GladeClient, OpOutcome};
+use glade_gyld::github::{Source, Token};
 use glade_gyld::{
     serve_with, Declined, GyldAskRecord, GyldConfig, GyldOutputRecord, GyldResponse, Limits,
     ModelClient, ModelEvent, ModelOutcome, ModelRequest, Plan, RunOutput, Runner,
@@ -527,6 +531,7 @@ async fn each_verb_maps_to_one_recorded_host_invocation() {
         config_for(&url, gyld.clone(), bundle.clone()),
         runner.clone(),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -679,7 +684,7 @@ async fn a_decisions_root_holds_the_notebooks_and_the_stage_links_to_them() {
         .layout
         .clone()
         .with_decisions_root(Some(decisions.clone()));
-    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel))
+    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel), Token::default())
         .await
         .unwrap();
 
@@ -754,6 +759,7 @@ async fn refusals_are_data_and_never_reach_a_host() {
         config_for(&url, gyld, bundle),
         runner.clone(),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -820,6 +826,7 @@ async fn explain_refusals_are_data_and_the_supplier_keeps_answering() {
         config_for(&url, gyld, bundle.clone()),
         runner.clone(),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -968,7 +975,7 @@ async fn conversed(
     let mut settings = config_for(&url, gyld, bundle);
     config(&mut settings);
     let runner = Arc::new(Recorder::default());
-    let _sup = serve_with(settings, runner.clone(), model.clone())
+    let _sup = serve_with(settings, runner.clone(), model.clone(), Token::default())
         .await
         .unwrap();
 
@@ -1000,6 +1007,15 @@ async fn conversed(
 
 /// One consultation, end to end, against a scripted model.
 async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldAskRecord> {
+    consulted_holding(model, tag, Token::default()).await
+}
+
+/// [`consulted`], by a supplier holding `token` as its github token.
+async fn consulted_holding(
+    model: Arc<ScriptedModel>,
+    tag: &str,
+    token: Token,
+) -> Vec<GyldAskRecord> {
     let tmp = Tmp::new(tag);
     let (mut node, port) = boot(&tmp).await;
     let url = format!("ws://127.0.0.1:{port}");
@@ -1012,6 +1028,7 @@ async fn consulted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldAskRecord> {
         config_for(&url, gyld, bundle.clone()),
         runner.clone(),
         model.clone(),
+        token,
     )
     .await
     .unwrap();
@@ -1104,6 +1121,41 @@ async fn a_normal_consultation_cites_then_answers_and_closes_clean() {
     assert!(
         end.line.is_none(),
         "a clean end says nothing beyond how it ended"
+    );
+}
+
+/// A question uses the github token the supplier HOLDS, the one `serve`
+/// discovered at attach and handed on; a question never discovers one. With a
+/// made-up token held, `github` is among the tools declared to the model, and
+/// the token's value is in neither the model's request nor a record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_uses_the_token_the_supplier_holds_and_says_none_of_it() {
+    let model = Arc::new(ScriptedModel {
+        chunks: vec!["It is blocked."],
+        ..Default::default()
+    });
+    let token = Token::of(Source::Env, Some("made-up-github-token".into()));
+    let records = consulted_holding(model.clone(), "consult-token", token).await;
+
+    let seen = model.seen();
+    assert_eq!(seen.len(), 1, "one turn");
+    let declared: Vec<&str> = seen[0]
+        .tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        declared.contains(&glade_gyld::github::GITHUB),
+        "a held token puts github among the tools on by default: {declared:?}"
+    );
+    // Compared, and never printed.
+    assert!(
+        !format!("{seen:?}").contains("made-up-github-token"),
+        "the token's value is not in the model's request"
+    );
+    assert!(
+        !format!("{records:?}").contains("made-up-github-token"),
+        "and not in a record"
     );
 }
 
@@ -1406,9 +1458,14 @@ async fn drafted(model: Arc<ScriptedModel>, tag: &str) -> Vec<GyldAskRecord> {
     seed_agent(&bundle, &build);
 
     let runner = Arc::new(Recorder::default());
-    let _sup = serve_with(config_for(&url, gyld, bundle), runner.clone(), model)
-        .await
-        .unwrap();
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle),
+        runner.clone(),
+        model,
+        Token::default(),
+    )
+    .await
+    .unwrap();
 
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
@@ -2258,9 +2315,14 @@ async fn a_host_failure_answers_as_data() {
         fail: Some("timed out after 200ms".into()),
         ..Default::default()
     });
-    let _sup = serve_with(config_for(&url, gyld, bundle), runner, Arc::new(NoModel))
-        .await
-        .unwrap();
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle),
+        runner,
+        Arc::new(NoModel),
+        Token::default(),
+    )
+    .await
+    .unwrap();
 
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
@@ -2298,9 +2360,14 @@ async fn streaming_output_reaches_a_subscriber_in_sequence() {
         gate: Some(gate.clone()),
         ..Default::default()
     });
-    let _sup = serve_with(config_for(&url, gyld, bundle), runner, Arc::new(NoModel))
-        .await
-        .unwrap();
+    let _sup = serve_with(
+        config_for(&url, gyld, bundle),
+        runner,
+        Arc::new(NoModel),
+        Token::default(),
+    )
+    .await
+    .unwrap();
 
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
@@ -2577,6 +2644,92 @@ async fn the_binary_hands_the_environment_it_started_with_down_to_its_readers() 
     );
 }
 
+/// End to end, in the shipped binary: `main` captures a made-up GITHUB_TOKEN,
+/// `serve` discovers it once at attach and hands it on, and a question's call
+/// to the model declares `github` because of it. The token's value is in no
+/// request the model endpoint saw and in no line the binary printed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_discovers_its_token_at_start_and_a_question_uses_it() {
+    let tmp = Tmp::new("bin-token");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    let build = seed_bundle(&bundle);
+    seed_agent(&bundle, &build);
+    // The model endpoint, on loopback. A local base URL takes the ollama
+    // profile, so the one request it sees is the question's own.
+    let endpoint = endpoint::Endpoint::serve(|_seen, _nth| (200, "text/event-stream", SSE.into()));
+
+    let supplier = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
+        .args(["--node", &url, "--gyld-root"])
+        .arg(&gyld)
+        .arg("--bundle-root")
+        .arg(&bundle)
+        .args(["--principal", "gianni"])
+        .env_clear()
+        .env(glade_gyld::github::TOKEN_ENV, "made-up-github-token")
+        .env(glade_gyld::BASE_URL_ENV, &endpoint.base_url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn glade-gyld binary");
+    let pid = supplier.id().expect("binary pid");
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+    let accepted = request(&requester, &explain("base", "why is this blocked?")).await;
+    assert!(accepted.ok, "{accepted:?}");
+    let asked = poll(|| {
+        let asked = !endpoint.seen().is_empty();
+        async move { asked }
+    })
+    .await;
+    assert!(asked, "the question reached the model endpoint");
+
+    let seen = endpoint.seen();
+    let declared: Vec<&str> = seen[0].body["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        declared.contains(&glade_gyld::github::GITHUB),
+        "the token discovered at start reached the question: {declared:?}"
+    );
+    // Compared, and never printed.
+    assert!(
+        !format!("{seen:?}").contains("made-up-github-token"),
+        "the token's value is in no request the endpoint saw"
+    );
+
+    let killed = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "sent SIGTERM");
+    let out = tokio::time::timeout(Duration::from_secs(10), supplier.wait_with_output())
+        .await
+        .expect("binary exited after SIGTERM")
+        .expect("wait");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("a token from GITHUB_TOKEN"), "{said}");
+    assert!(
+        !said.contains("made-up-github-token"),
+        "a token's value is in no line: {said}"
+    );
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
 // ---- 7. a successful build publishes onto the value surfaces (step 4.2) ----
 
 /// A runner that writes a small but complete emitted bundle into the plan's
@@ -2627,6 +2780,7 @@ async fn a_successful_build_publishes_the_bundle_onto_the_value_surfaces() {
         config_for(&url, gyld, bundle.clone()),
         Arc::new(BundleBuilder),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -2749,6 +2903,7 @@ async fn a_build_already_in_the_bundle_root_is_published_when_the_supplier_attac
         config_for(&url, gyld, bundle.clone()),
         Arc::new(NeverRuns),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -2920,6 +3075,7 @@ async fn an_empty_bundle_root_gets_its_first_build_and_the_census_lands() {
         config_for(&url, gyld.clone(), bundle.clone()),
         runner.clone(),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -3198,6 +3354,7 @@ async fn a_write_gyld_rejects_is_refused_and_the_notebook_is_put_back() {
         config,
         Arc::new(glade_gyld::PythonRunner::new(python, started_env())),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -3462,6 +3619,7 @@ async fn one_notebook_holds_as_many_fragment_answers_as_the_owner_makes() {
         config,
         Arc::new(glade_gyld::PythonRunner::new(python, started_env())),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -3725,7 +3883,7 @@ async fn two_overlapping_answers_both_end_in_a_consistent_state() {
         .layout
         .clone()
         .with_decisions_root(Some(decisions.clone()));
-    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel))
+    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel), Token::default())
         .await
         .unwrap();
 
@@ -3914,6 +4072,7 @@ async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
         config_for(&url, gyld.clone(), bundle.clone()),
         runner.clone(),
         Arc::new(NoModel),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -3929,9 +4088,14 @@ async fn a_restarted_supplier_republishes_over_its_own_earlier_value() {
     first.shutdown().await;
 
     // ---- session two: the restart, same origin, empty chain state ----------
-    let second = serve_with(config_for(&url, gyld, bundle), runner, Arc::new(NoModel))
-        .await
-        .unwrap();
+    let second = serve_with(
+        config_for(&url, gyld, bundle),
+        runner,
+        Arc::new(NoModel),
+        Token::default(),
+    )
+    .await
+    .unwrap();
     let req = GladeClient::new("requester-2");
     req.connect(&url).await.unwrap();
     attached(&req).await;
@@ -3997,6 +4161,7 @@ async fn a_restarted_supplier_keeps_writing_an_open_conversation() {
         config_for(&url, gyld.clone(), bundle.clone()),
         Arc::new(Recorder::default()),
         told.clone(),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -4021,6 +4186,7 @@ async fn a_restarted_supplier_keeps_writing_an_open_conversation() {
         config_for(&url, gyld, bundle),
         Arc::new(Recorder::default()),
         again.clone(),
+        Token::default(),
     )
     .await
     .unwrap();
@@ -4100,6 +4266,7 @@ async fn a_publish_resumes_without_waiting_for_quiet() {
         config_for(&url, gyld, bundle),
         Arc::new(StampedBundleBuilder(AtomicU64::new(1))),
         model,
+        Token::default(),
     )
     .await
     .unwrap();

@@ -7,18 +7,18 @@
   ],
   "entries": [
     {
-      "path": "src/agent.rs",
-      "kind": "env",
-      "name": "env::var",
-      "disposition": "debt",
-      "reason": "AgentOverrides::from_env reads the environment where it is used; capture it once in main and call from_vars with the snapshot (ProcessGlobalsPlan Step 2.2)."
-    },
-    {
       "path": "src/bin/glade-gyld.rs",
       "kind": "env",
       "name": "env::args",
       "disposition": "permanent",
       "reason": "The program reads its arguments once, at its entry point, and passes them down."
+    },
+    {
+      "path": "src/bin/glade-gyld.rs",
+      "kind": "env",
+      "name": "env::vars_os",
+      "disposition": "permanent",
+      "reason": "The program captures its whole start-up environment once, at its entry point, and passes it down through GyldConfig; nothing below main reads the process's own (ProcessGlobalsPlan Step 2.2)."
     },
     {
       "path": "src/bundle.rs",
@@ -36,13 +36,6 @@
     },
     {
       "path": "src/github.rs",
-      "kind": "env",
-      "name": "env::var",
-      "disposition": "debt",
-      "reason": "discovered() reads the token variables at first use; take them from the captured environment (ProcessGlobalsPlan Step 2.2)."
-    },
-    {
-      "path": "src/github.rs",
       "kind": "process",
       "name": "Command::new(\"gh\")",
       "disposition": "debt",
@@ -54,20 +47,6 @@
       "name": "HELD",
       "disposition": "debt",
       "reason": "The discovered GitHub token, cached process-wide in a OnceLock; hold it in the supplier's context (ProcessGlobalsPlan Step 4.3)."
-    },
-    {
-      "path": "src/model.rs",
-      "kind": "env",
-      "name": "env::var",
-      "disposition": "debt",
-      "reason": "discover_key reads the key variables at the point of use; take them from the captured environment (ProcessGlobalsPlan Step 2.2)."
-    },
-    {
-      "path": "src/supplier.rs",
-      "kind": "env",
-      "name": "env::var",
-      "disposition": "debt",
-      "reason": "The supplier checks the key variables at the point of use; take them from the captured environment (ProcessGlobalsPlan Step 2.2)."
     }
   ]
 }

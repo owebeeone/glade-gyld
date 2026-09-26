@@ -6,12 +6,13 @@
 //! ([`crate::tools::wrap`]).
 //!
 //! **The token is discovered ONCE, at attach, and never travels.**
-//! [`discovered`] looks at `GITHUB_TOKEN` first and runs `gh auth token` only
-//! if that is empty — one subprocess for the life of the supplier, bounded, and
-//! with `gh`'s own error going nowhere near a record. What is logged, recorded
-//! and said in a refusal is WHICH source answered ([`Source::says`]) and never
-//! the value: [`Token`] has a hand-written [`std::fmt::Debug`] so a
-//! `{:?}` somebody adds later cannot leak it either.
+//! [`discovered`] looks at `GITHUB_TOKEN` in the environment the supplier
+//! started with first, and runs `gh auth token` only if that is empty — one
+//! subprocess for the life of the supplier, bounded, and with `gh`'s own error
+//! going nowhere near a record. What is logged, recorded and said in a refusal
+//! is WHICH source answered ([`Source::says`]) and never the value: [`Token`]
+//! has a hand-written [`std::fmt::Debug`] so a `{:?}` somebody adds later
+//! cannot leak it either.
 //!
 //! **With no token the tool still works, and says what that costs.** GitHub
 //! rate-limits an unauthenticated caller to a trickle — sixty requests an hour
@@ -30,6 +31,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::environment::Environment;
 use crate::fetch::USER_AGENT;
 use crate::tools::{Tool, ToolOutput, ToolRefusal};
 
@@ -107,24 +109,26 @@ impl std::fmt::Debug for Token {
     }
 }
 
-/// The token this PROCESS found, discovered on first ask and never again.
+/// The token this PROCESS found, discovered on first ask and never again, from
+/// the environment the process started with (`env`) and `gh`.
 ///
 /// Once, because the second source is a subprocess: `gh auth token` per
 /// question would be a fork per question, and the config file is re-read every
 /// call precisely so that nothing else has to be.
-pub fn discovered() -> &'static Token {
+pub fn discovered(env: &Environment) -> &'static Token {
     static HELD: OnceLock<Token> = OnceLock::new();
-    HELD.get_or_init(|| discover(&|name| std::env::var(name).ok(), &gh_auth_token))
+    HELD.get_or_init(|| discover(env, &gh_auth_token))
 }
 
-/// [`discovered`] over an arbitrary environment and an arbitrary `gh`, so the
-/// ORDER is asserted with no process environment and no subprocess.
+/// [`discovered`] over an arbitrary `gh`, so the ORDER is asserted with made-up
+/// variables and no subprocess. `env` is the snapshot the entry point captured;
+/// the process's own environment is never read here.
 ///
 /// `GITHUB_TOKEN` first and `gh` only when it is empty — a desk that exported a
 /// token meant that token, and a `gh` login it forgot about must not quietly
 /// answer as somebody else.
-pub fn discover(var: &dyn Fn(&str) -> Option<String>, gh: &dyn Fn() -> Option<String>) -> Token {
-    if let Some(value) = var(TOKEN_ENV) {
+pub fn discover(env: &Environment, gh: &dyn Fn() -> Option<String>) -> Token {
+    if let Some(value) = env.var(TOKEN_ENV) {
         let value = value.trim().to_string();
         if !value.is_empty() {
             return Token {
@@ -996,25 +1000,25 @@ mod tests {
             *asked.lock().unwrap_or_else(|p| p.into_inner()) += 1;
             Some("from-gh".to_string())
         };
-        let from_env = discover(
-            &|name| (name == TOKEN_ENV).then(|| "from-env".to_string()),
-            &gh,
-        );
+        let from_env = discover(&Environment::of([(TOKEN_ENV, "from-env")]), &gh);
         assert_eq!(from_env.source, Source::Env);
-        assert!(from_env.found());
+        assert!(
+            from_env.value.as_deref() == Some("from-env"),
+            "the snapshot's own token, and not one the process holds"
+        );
         assert_eq!(
             *asked.lock().unwrap_or_else(|p| p.into_inner()),
             0,
             "a desk that exported a token meant that one; `gh` is not even run"
         );
 
-        let from_gh = discover(&|_| None, &gh);
+        let from_gh = discover(&Environment::default(), &gh);
         assert_eq!(from_gh.source, Source::Gh);
         assert!(from_gh.found());
 
         // A blank variable is not a value, and a `gh` with nothing to say is
         // no token at all rather than an empty one.
-        let blank = discover(&|_| Some("   ".to_string()), &|| None);
+        let blank = discover(&Environment::of([(TOKEN_ENV, "   ")]), &|| None);
         assert_eq!(blank.source, Source::None);
         assert!(!blank.found());
         assert_eq!(Source::None.says(), "no token (unauthenticated)");

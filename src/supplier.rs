@@ -38,6 +38,7 @@ use crate::ask::{self, AgentState, AskDraft, Consultation};
 use crate::bundle::{self, Layout};
 use crate::conversation::{self, Ledger};
 use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, Refusal};
+use crate::environment::Environment;
 use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
 use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
 use crate::outcome::{self, Put, Snapshot};
@@ -82,6 +83,12 @@ pub struct GyldConfig {
     /// configuration is [`GyldConfig::resolve_agent`], taken afresh at attach
     /// and at every call.
     pub agent: AgentOverrides,
+    /// The environment this process STARTED with, captured once by the entry
+    /// point and handed down ([`Environment`]). Every variable the supplier
+    /// reads is read here: the agent's endpoint and model, the model key, the
+    /// GitHub token. Empty unless the caller supplies one, so a test sees the
+    /// variables it made up and nothing else.
+    pub env: Environment,
 }
 
 impl GyldConfig {
@@ -103,18 +110,20 @@ impl GyldConfig {
             principal: None,
             limits: Limits::default(),
             agent: AgentOverrides::default(),
+            env: Environment::default(),
         }
     }
 
     /// The effective agent configuration, read NOW: the config file under the
-    /// app-owned bundle root, the environment over it, the flags over both.
+    /// app-owned bundle root, the environment the process started with over it,
+    /// the flags over both.
     ///
     /// Taken afresh every time, which is the point. grazel spawns this supplier
     /// with a fixed argument list, so the file is the only channel a running
     /// desk has — and a file that were read once at attach would need a
     /// restart of the whole app to change a model.
     pub fn resolve_agent(&self) -> Resolved {
-        agent::resolve(&self.layout.bundle_root, &self.agent)
+        agent::resolve(&self.layout.bundle_root, &self.env, &self.agent)
     }
 
     /// The key file this supplier reads when the environment carries no key.
@@ -135,11 +144,14 @@ impl GyldConfig {
 ///
 /// PRESENCE only. Whether a key exists is a boolean; the key VALUE is read by
 /// the model client at the moment of the call and by nothing else, so it never
-/// reaches a plan, a prompt, a record or a log line.
+/// reaches a plan, a prompt, a record or a log line. The variables are the
+/// config's snapshot, never the process's own.
 fn agent_state(config: &GyldConfig, latest: Option<&std::path::Path>) -> AgentState {
     let key_file = config.key_file();
     let named = |name: &str| {
-        std::env::var(name)
+        config
+            .env
+            .var(name)
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
     };
@@ -190,12 +202,15 @@ pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSuppli
     // page. The token is discovered here, once, for the life of the process.
     eprintln!(
         "glade-gyld: agent {}",
-        toolset::says(&resolved.config.tools, crate::github::discovered())
+        toolset::says(
+            &resolved.config.tools,
+            crate::github::discovered(&config.env)
+        )
     );
     for note in resolved.notes.iter() {
         eprintln!("glade-gyld: agent config: {note}");
     }
-    let model = model::HttpsModelClient::new(resolved.config);
+    let model = model::HttpsModelClient::new(resolved.config, config.env.clone());
     serve_with(config, Arc::new(PythonRunner::new(python)), Arc::new(model)).await
 }
 
@@ -1743,9 +1758,11 @@ async fn consult_run(
     }
     let model_config = resolved.config;
     let drafted_by = model_config.model.clone();
-    // The two roots a source index measures itself against, carried onto the
-    // blocking task with everything else the tools need.
+    // The two roots a source index measures itself against, and the environment
+    // the github token is discovered from, carried onto the blocking task with
+    // everything else the tools need.
     let layout = config.layout.clone();
+    let env = config.env.clone();
     let spent = ledger.spent(&conversation);
     let work =
         tokio::task::spawn_blocking(move || -> Result<crate::model::ModelOutcome, String> {
@@ -1757,7 +1774,7 @@ async fn consult_run(
             // The allow-list a desk that wrote none means, resolved against
             // what IS configured: the local tools always, and a network tool
             // only where the thing it needs is already there (11.2, 11.7).
-            let token = crate::github::discovered();
+            let token = crate::github::discovered(&env);
             let policy = model_config
                 .tools
                 .allowing(toolset::on_by_default(&model_config.tools, token));
@@ -2093,6 +2110,43 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         bundle::write_latest(&layout, &empty).unwrap();
         assert_eq!(at_attach(&layout), AtAttach::Bootstrap);
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
+
+    /// The key check reads the config's snapshot, never the process's own
+    /// environment, and a config holding a key prints its name and no value.
+    #[test]
+    fn the_key_check_reads_the_configured_environment_and_prints_no_value() {
+        let bundle = root("key-env");
+        let mut config = GyldConfig::new("ws://x", bundle.join("gyld"), bundle.clone());
+        assert!(
+            !agent_state(&config, None).key,
+            "no snapshot and no key file is no key"
+        );
+
+        config.env = Environment::of([(ask::KEY_ENV, "made-up-api-key")]);
+        assert!(agent_state(&config, None).key, "the snapshot's key counts");
+        let printed = format!("{config:?}");
+        assert!(printed.contains(ask::KEY_ENV), "{printed}");
+        assert!(
+            !printed.contains("made-up-api-key"),
+            "a value is in no debug print: {printed}"
+        );
+
+        config.env = Environment::of([
+            (ask::KEY_ENV, " "),
+            (agent::AUTH_TOKEN_ENV, "made-up-auth-token"),
+        ]);
+        assert!(
+            agent_state(&config, None).key,
+            "so does the second name's, under a blank first"
+        );
+
+        config.env = Environment::of([(ask::KEY_ENV, " ")]);
+        assert!(
+            !agent_state(&config, None).key,
+            "a blank variable is no key"
+        );
         let _ = std::fs::remove_dir_all(&bundle);
     }
 

@@ -33,8 +33,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gyld::{
-    serve, AgentOverrides, Compat, GyldConfig, Limits, Surfaces, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,
-    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE,
+    serve, AgentOverrides, Compat, Environment, GyldConfig, Limits, Surfaces, DEFAULT_ASK_ID,
+    DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE,
     DEFAULT_TIMEOUT_SECS,
 };
 
@@ -57,7 +57,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1).collect()) {
+    // The environment, read ONCE, here, and handed down through `GyldConfig`:
+    // nothing below this line reads the process's own. The whole of it, so a
+    // child the supplier spawns can be given exactly what it would have
+    // inherited, and the snapshot prints names only, never a value.
+    let env = Environment::of(std::env::vars_os());
+    let args = match parse_args(std::env::args().skip(1).collect(), env) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("glade-gyld: {e}\n{USAGE}");
@@ -122,7 +127,8 @@ async fn wait_for_shutdown_signal() {
 
 /// A tiny hand-rolled flag parser (the crate stays dep-light — no clap).
 /// `--node`, `--gyld-root` and `--bundle-root` are required; the rest default.
-fn parse_args(args: Vec<String>) -> Result<Args, String> {
+/// `env` is the environment `main` captured, carried into the config as it is.
+fn parse_args(args: Vec<String>, env: Environment) -> Result<Args, String> {
     let mut node: Option<String> = None;
     let mut gyld_root: Option<PathBuf> = None;
     let mut bundle_root: Option<PathBuf> = None;
@@ -229,5 +235,6 @@ fn parse_args(args: Vec<String>) -> Result<Args, String> {
         max_output_bytes,
     };
     config.agent = agent;
+    config.env = env;
     Ok(Args { config, python })
 }

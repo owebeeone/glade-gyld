@@ -472,7 +472,9 @@ authority:
    `GYLD_AGENT_COMPAT`, and the two key variables. The model variable is ours
    rather than `ANTHROPIC_MODEL`, which is Claude Code's own and would otherwise
    be inherited by accident on any desk that has it set for a different client.
-   A blank variable is treated as unset.
+   A blank variable is treated as unset. The supplier reads its environment
+   once, when it starts, and every variable here (and `GITHUB_TOKEN`) comes
+   from that snapshot.
 
 3. **The flags**, for a supplier somebody can pass flags to.
 

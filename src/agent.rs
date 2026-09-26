@@ -13,8 +13,9 @@
 //!    attach and again at every call, so a model can be changed without
 //!    restarting anything. Every field is optional.
 //! 2. The environment: [`BASE_URL_ENV`], [`MODEL_ENV`], and the two key
-//!    variables. [`AUTH_TOKEN_ENV`] is here because it is what the dabeest
-//!    client guide sets and what Claude-shaped clients already export.
+//!    variables, as the supplier started with them ([`Environment`], captured
+//!    once in `main`). [`AUTH_TOKEN_ENV`] is here because it is what the
+//!    dabeest client guide sets and what Claude-shaped clients already export.
 //! 3. The flags, for a supplier somebody CAN pass flags to.
 //!
 //! **A value nobody set is not a value.** Everything here is `Option`, and the
@@ -37,6 +38,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::environment::Environment;
 use crate::model::{ModelConfig, Shape, DEFAULT_AGENT_MODEL, DEFAULT_BASE_URL};
 use crate::tools::{
     FetchPolicy, ToolBudgets, ToolPolicy, DEFAULT_FETCH_BYTES, DEFAULT_TOOL_RESULT_BYTES,
@@ -279,19 +281,15 @@ impl AgentOverrides {
         }
     }
 
-    /// What the environment says. Only the three names a desk can realistically
-    /// set are read, plus the profile: the numbers belong in the config file,
-    /// where they can carry a comment and a reason.
+    /// What the environment says, through `var`: [`resolve`] passes the
+    /// [`Environment`] the process started with, and a test passes a lookup of
+    /// its own. Only the three names a desk can realistically set are read,
+    /// plus the profile: the numbers belong in the config file, where they can
+    /// carry a comment and a reason.
     ///
     /// An empty or blank variable is treated as unset. `ANTHROPIC_BASE_URL=`
     /// in a launcher script is how a variable gets cleared, and reading it as
     /// "the endpoint is the empty string" would break the run instead.
-    pub fn from_env() -> (AgentOverrides, Vec<String>) {
-        AgentOverrides::from_vars(&|name| std::env::var(name).ok())
-    }
-
-    /// [`AgentOverrides::from_env`] over an arbitrary lookup, so the precedence
-    /// is tested without touching the process environment.
     pub fn from_vars(var: &dyn Fn(&str) -> Option<String>) -> (AgentOverrides, Vec<String>) {
         let mut notes: Vec<String> = Vec::new();
         let read = |name: &str| -> Option<String> {
@@ -534,13 +532,14 @@ impl Resolved {
 /// URL: a local endpoint's output budget is not Anthropic's, and neither is the
 /// window its input has to fit in. `bundle_root` is what a relative `key_file`
 /// and the config file itself are resolved against — the app's own directory,
-/// never a requester's.
-pub fn resolve(bundle_root: &Path, flags: &AgentOverrides) -> Resolved {
+/// never a requester's. `env` is the environment the process started with,
+/// captured at its entry point: the process's own is never read here.
+pub fn resolve(bundle_root: &Path, env: &Environment, flags: &AgentOverrides) -> Resolved {
     let path = bundle_root.join(DEFAULT_CONFIG_FILE);
     let (file, mut notes) = AgentOverrides::from_file(&path);
-    let (env, env_notes) = AgentOverrides::from_env();
+    let (said, env_notes) = AgentOverrides::from_vars(&|name| env.var(name));
     notes.extend(env_notes);
-    resolve_from(bundle_root, file.under(&env).under(flags), notes)
+    resolve_from(bundle_root, file.under(&said).under(flags), notes)
 }
 
 /// [`resolve`] once the three sources are already merged, so precedence is
@@ -768,6 +767,37 @@ mod tests {
         assert_eq!(all.model, "from-flag");
         assert_eq!(all.base_url, "http://env:2");
         assert_eq!(all.max_output_tokens, 111);
+    }
+
+    #[test]
+    fn resolve_reads_the_environment_it_is_handed_and_the_flags_still_beat_it() {
+        // No config file under this root, so the snapshot is the one source
+        // that speaks.
+        let root = PathBuf::from("/nonexistent/glade-gyld-bundle");
+        let env = Environment::of([
+            (MODEL_ENV, "made-up-model"),
+            (BASE_URL_ENV, "http://127.0.0.1:9/"),
+            (COMPAT_ENV, "anthropic"),
+        ]);
+        let said = resolve(&root, &env, &AgentOverrides::default());
+        assert!(said.notes.is_empty(), "{:?}", said.notes);
+        assert_eq!(said.config.model, "made-up-model");
+        assert_eq!(said.config.base_url, "http://127.0.0.1:9");
+        assert_eq!(
+            said.config.compat,
+            Compat::Anthropic,
+            "the named profile beats the detection"
+        );
+
+        let flags = AgentOverrides {
+            model: Some("from-flag".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&root, &env, &flags).config.model, "from-flag");
+
+        // An empty snapshot is no environment at all.
+        let bare = resolve(&root, &Environment::default(), &AgentOverrides::default());
+        assert_eq!(bare.config, ModelConfig::default_at(&root));
     }
 
     #[test]

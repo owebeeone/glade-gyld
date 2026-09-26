@@ -38,6 +38,9 @@
 //!      a zone the session is subscribed to to fall quiet.
 //!  15. a write the node REFUSES is said on stderr with its chain, its seq and
 //!      its code, once for the attempt and once for the one retry.
+//!  16. the environment is read ONCE, when the binary starts, and handed down:
+//!      its readers see that snapshot, a model client sends the snapshot's key
+//!      ahead of the key file, and no value reaches a line.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1597,10 +1600,9 @@ fn the_bundle_roots_own_config_file_configures_a_supplier_that_was_given_no_flag
     assert!(bare.notes.is_empty(), "{:?}", bare.notes);
     assert_eq!(bare.config.key_file, bundle.join("agent/api-key"));
 
-    // The file lands beside the key file and is read at the next call. This
-    // process's OWN environment outranks it (that is the precedence under
-    // test), so what it can be asserted to change is what the environment
-    // here leaves alone.
+    // The file lands beside the key file and is read at the next call. The
+    // config carries no environment, so nothing outranks the file here,
+    // however this test process was started.
     let path = bundle.join(glade_gyld::DEFAULT_CONFIG_FILE);
     std::fs::write(
         &path,
@@ -1611,20 +1613,26 @@ fn the_bundle_roots_own_config_file_configures_a_supplier_that_was_given_no_flag
     let local = config.resolve_agent();
     assert!(local.notes.is_empty(), "{:?}", local.notes);
     assert_eq!(local.config.max_output_tokens, 4242);
-    if std::env::var(glade_gyld::BASE_URL_ENV).is_err() {
-        assert_eq!(local.config.base_url, "http://127.0.0.1:11434");
-        assert_eq!(
-            local.config.compat,
-            glade_gyld::Compat::Ollama,
-            "an endpoint that is not Anthropic's takes the ollama profile"
-        );
-        assert!(!local.config.count_tokens, "there is no count_tokens there");
-    } else {
-        eprintln!("SKIP: {} is set here", glade_gyld::BASE_URL_ENV);
-    }
-    if std::env::var(glade_gyld::MODEL_ENV).is_err() {
-        assert_eq!(local.config.model, "qwen3.8-96k");
-    }
+    assert_eq!(local.config.base_url, "http://127.0.0.1:11434");
+    assert_eq!(
+        local.config.compat,
+        glade_gyld::Compat::Ollama,
+        "an endpoint that is not Anthropic's takes the ollama profile"
+    );
+    assert!(!local.config.count_tokens, "there is no count_tokens there");
+    assert_eq!(local.config.model, "qwen3.8-96k");
+
+    // The environment the supplier started with outranks the file where it
+    // speaks, and only there.
+    let mut started = config.clone();
+    started.env = glade_gyld::Environment::of([(glade_gyld::MODEL_ENV, "made-up-model")]);
+    let over_file = started.resolve_agent();
+    assert_eq!(over_file.config.model, "made-up-model");
+    assert_eq!(over_file.config.base_url, "http://127.0.0.1:11434");
+    assert_eq!(
+        over_file.config.max_output_tokens, 4242,
+        "the file still holds the rest"
+    );
 
     // A flag that WAS passed still wins over both; one that was not passed
     // sets nothing, which is what makes the file usable at all.
@@ -1677,7 +1685,7 @@ async fn the_real_model_client_answers_with_data_from_a_blocking_task() {
         timeout: Duration::from_secs(5),
         ..Default::default()
     };
-    let client = glade_gyld::model::HttpsModelClient::new(config.clone());
+    let client = glade_gyld::model::HttpsModelClient::new(config.clone(), no_env());
     let request = ModelRequest {
         tools: Vec::new(),
         steps: Vec::new(),
@@ -1880,6 +1888,12 @@ const SSE: &str = concat!(
     "\n\n",
 );
 
+/// No environment at all, so the key a client sends is the key FILE's however
+/// this test process was started.
+fn no_env() -> glade_gyld::Environment {
+    glade_gyld::Environment::default()
+}
+
 /// A key file the client can read, in a directory the caller owns.
 fn agent_key(tmp: &Tmp, value: &str) -> PathBuf {
     let key = tmp.path().join("api-key");
@@ -1940,7 +1954,7 @@ fn the_ollama_profile_estimates_the_budget_sends_a_bearer_and_never_asks_for_a_c
         glade_gyld::Compat::Ollama,
         agent_key(&tmp, "ollama"),
     );
-    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone(), no_env());
 
     let mut events: Vec<ModelEvent> = Vec::new();
     let counted = client
@@ -1995,7 +2009,7 @@ fn the_anthropic_profile_counts_with_the_endpoint_and_sends_no_bearer() {
         glade_gyld::Compat::Anthropic,
         agent_key(&tmp, "sk-test"),
     );
-    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone(), no_env());
 
     let mut events: Vec<ModelEvent> = Vec::new();
     let counted = client
@@ -2026,6 +2040,35 @@ fn the_anthropic_profile_counts_with_the_endpoint_and_sends_no_bearer() {
     assert!(notes_of(&events).is_empty(), "nothing to say: {events:?}");
 }
 
+/// The key a client sends is the one in the environment the supplier STARTED
+/// with, handed to it as a snapshot, ahead of the key file. Both made up.
+#[test]
+fn the_client_sends_the_key_its_snapshot_holds_ahead_of_the_key_file() {
+    let tmp = Tmp::new("compat-env-key");
+    let endpoint = endpoint::Endpoint::serve(|_seen, _nth| (200, "text/event-stream", SSE.into()));
+    let request = request_to(
+        &endpoint.base_url,
+        glade_gyld::Compat::Ollama,
+        agent_key(&tmp, "made-up-file-key"),
+    );
+    let env = glade_gyld::Environment::of([(glade_gyld::ask::KEY_ENV, "made-up-env-key")]);
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone(), env);
+    client.stream(&request, &mut |_| {}).expect("the stream");
+
+    // Compared and never printed: were the process's own environment read after
+    // all, the key on the wire would be a real one.
+    let seen = endpoint.seen();
+    assert_eq!(seen.len(), 1, "one request, and it was the stream");
+    assert!(
+        seen[0].header("x-api-key") == Some("made-up-env-key"),
+        "the snapshot's key, ahead of the key file's"
+    );
+    assert!(
+        seen[0].header("authorization") == Some("Bearer made-up-env-key"),
+        "and the same key as the bearer"
+    );
+}
+
 #[test]
 fn a_404_on_count_tokens_becomes_an_estimate_and_is_asked_only_once() {
     let tmp = Tmp::new("compat-404");
@@ -2041,7 +2084,7 @@ fn a_404_on_count_tokens_becomes_an_estimate_and_is_asked_only_once() {
         glade_gyld::Compat::Anthropic,
         agent_key(&tmp, "sk-test"),
     );
-    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone(), no_env());
 
     let mut events: Vec<ModelEvent> = Vec::new();
     let counted = client
@@ -2094,7 +2137,7 @@ fn a_400_on_strict_and_then_on_cache_control_is_retried_smaller_and_each_drop_is
         glade_gyld::Compat::Ollama,
         agent_key(&tmp, "ollama"),
     );
-    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone(), no_env());
 
     let mut events: Vec<ModelEvent> = Vec::new();
     let outcome = client
@@ -2161,7 +2204,7 @@ fn an_endpoint_that_400s_whatever_it_is_sent_is_a_transport_failure_with_its_own
         glade_gyld::Compat::Ollama,
         agent_key(&tmp, "ollama"),
     );
-    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone());
+    let client = glade_gyld::model::HttpsModelClient::new(request.config.clone(), no_env());
 
     let mut events: Vec<ModelEvent> = Vec::new();
     let said = client
@@ -2493,6 +2536,39 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
 
     requester.close().await;
     node.kill().await.ok();
+}
+
+/// The binary reads its environment ONCE, at start, and hands it down: `main`
+/// captures it into `GyldConfig`, and the attach lines are read from there. A
+/// made-up model and a made-up token go in; the lines name the model and the
+/// token's SOURCE, never its value. Nothing listens on port 1, so the binary
+/// says them and exits with no node at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_hands_the_environment_it_started_with_down_to_its_readers() {
+    let tmp = Tmp::new("bin-env");
+    let run = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
+        .args(["--node", "ws://127.0.0.1:1", "--gyld-root"])
+        .arg(tmp.path().join("gyld"))
+        .arg("--bundle-root")
+        .arg(tmp.path().join("bundle"))
+        .env_clear()
+        .env(glade_gyld::MODEL_ENV, "made-up-model")
+        .env(glade_gyld::github::TOKEN_ENV, "made-up-token-value")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("the binary exits once the node refuses it")
+        .expect("run the glade-gyld binary");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "nothing listens on port 1: {said}");
+    assert!(said.contains("model made-up-model"), "{said}");
+    assert!(said.contains("a token from GITHUB_TOKEN"), "{said}");
+    assert!(
+        !said.contains("made-up-token-value"),
+        "a token's value is in no line: {said}"
+    );
 }
 
 // ---- 7. a successful build publishes onto the value surfaces (step 4.2) ----

@@ -16,10 +16,11 @@
 //! `max_tokens`, and a turn that stops there is SAID to be partial rather than
 //! passed off as an answer.
 //!
-//! **The key never travels.** It is read from the environment or from an
-//! app-owned file at the moment of the call, put in one header, and dropped. It
-//! is in no plan, no prompt, no record, no log line and no [`Debug`] output:
-//! [`ModelConfig`] carries the key FILE's path and never a key.
+//! **The key never travels.** It is read from the environment the supplier
+//! started with, or from an app-owned file, at the moment of the call, put in
+//! one header, and dropped. It is in no plan, no prompt, no record, no log line
+//! and no [`Debug`] output: [`ModelConfig`] carries the key FILE's path and
+//! never a key.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ use std::time::Duration;
 use crate::agent::Compat;
 use crate::ask::{AskRefusal, KEY_ENV};
 use crate::conversation::{self, Turn};
+use crate::environment::Environment;
 use crate::prompt::Prompt;
 use crate::tools::{ToolPolicy, ToolRegistry};
 
@@ -776,16 +778,17 @@ pub fn consult(
 
 /// The model key, at the moment of the call and nowhere else.
 ///
-/// `ANTHROPIC_API_KEY` in the supplier's environment first, then
-/// [`crate::agent::AUTH_TOKEN_ENV`], then the key file. The second name is
-/// there because it is the one Claude-shaped clients and the dabeest launchers
-/// already export, and a local endpoint's token is a dummy value that must
-/// nonetheless be present. The file is MODE CHECKED: a credential any other
-/// account on the machine can read is refused rather than used, because a
-/// supplier that quietly accepts one teaches everybody that it is fine.
-pub fn discover_key(key_file: &Path) -> Result<String, AskRefusal> {
+/// `ANTHROPIC_API_KEY` in the environment the supplier started with (`env`,
+/// captured at its entry point) first, then [`crate::agent::AUTH_TOKEN_ENV`],
+/// then the key file. The second name is there because it is the one
+/// Claude-shaped clients and the dabeest launchers already export, and a local
+/// endpoint's token is a dummy value that must nonetheless be present. The file
+/// is MODE CHECKED: a credential any other account on the machine can read is
+/// refused rather than used, because a supplier that quietly accepts one
+/// teaches everybody that it is fine.
+pub fn discover_key(env: &Environment, key_file: &Path) -> Result<String, AskRefusal> {
     for name in [KEY_ENV, crate::agent::AUTH_TOKEN_ENV] {
-        if let Ok(value) = std::env::var(name) {
+        if let Some(value) = env.var(name) {
             let value = value.trim().to_string();
             if !value.is_empty() {
                 return Ok(value);
@@ -876,6 +879,9 @@ struct Learned {
 /// The real client: raw HTTPS to the Messages API, over rustls.
 pub struct HttpsModelClient {
     config: ModelConfig,
+    /// The environment the supplier started with: where the key is looked for
+    /// before the key file ([`discover_key`]).
+    env: Environment,
     http: OnceLock<reqwest::blocking::Client>,
     learned: std::sync::Mutex<Learned>,
 }
@@ -894,9 +900,12 @@ impl Rejected {
 }
 
 impl HttpsModelClient {
-    pub fn new(config: ModelConfig) -> HttpsModelClient {
+    /// A client for `config`, taking its key from `env` — the snapshot the entry
+    /// point captured — before the key file.
+    pub fn new(config: ModelConfig, env: Environment) -> HttpsModelClient {
         HttpsModelClient {
             config,
+            env,
             http: OnceLock::new(),
             learned: std::sync::Mutex::new(Learned::default()),
         }
@@ -978,7 +987,7 @@ impl HttpsModelClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::blocking::Response, Rejected> {
-        let key = discover_key(&config.key_file).map_err(|r| Rejected {
+        let key = discover_key(&self.env, &config.key_file).map_err(|r| Rejected {
             status: 0,
             said: r.says(),
         })?;
@@ -2056,33 +2065,54 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api-key");
+        let none = Environment::default();
+        // Every key is compared here and never printed: were the process's own
+        // environment read after all, the key that came back would be real.
+        let is =
+            |env: &Environment, want: &str| discover_key(env, &path).ok().as_deref() == Some(want);
+        let refusal = |env: &Environment| match discover_key(env, &path) {
+            Ok(_) => panic!("a key was found (it is not printed) where a refusal was due"),
+            Err(e) => e,
+        };
 
-        // No environment key in this process and no file: the refusal names
-        // both places, and never a value.
-        if std::env::var(KEY_ENV)
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true)
-        {
-            let e = discover_key(&path).expect_err("a refusal");
-            assert!(e.says().contains("ANTHROPIC_API_KEY"), "{e}");
-            assert!(e.says().contains("api-key"), "{e}");
+        // No key in the snapshot and no file: the refusal names both places,
+        // and never a value. What this process's own environment holds does
+        // not matter; it is not read.
+        let e = refusal(&none);
+        assert!(e.says().contains("ANTHROPIC_API_KEY"), "{e}");
+        assert!(e.says().contains("api-key"), "{e}");
 
-            std::fs::write(&path, "sk-test-value\n# a comment\n").unwrap();
-            modes::set(&path, 0o644);
-            let e = discover_key(&path).expect_err("a mode refusal");
-            let said = e.says();
-            assert!(said.contains("readable"), "{said}");
-            assert!(!said.contains("sk-test-value"), "a key never reaches data");
+        std::fs::write(&path, "sk-test-value\n# a comment\n").unwrap();
+        modes::set(&path, 0o644);
+        let said = refusal(&none).says();
+        assert!(said.contains("readable"), "{said}");
+        assert!(!said.contains("sk-test-value"), "a key never reaches data");
 
-            modes::set(&path, 0o600);
-            assert_eq!(discover_key(&path).unwrap(), "sk-test-value");
+        modes::set(&path, 0o600);
+        assert!(is(&none, "sk-test-value"), "the file's key");
 
-            std::fs::write(&path, "\n").unwrap();
-            modes::set(&path, 0o600);
-            assert!(discover_key(&path).is_err(), "an empty key file is no key");
-        } else {
-            eprintln!("SKIP: {KEY_ENV} is set in this environment");
-        }
+        // The snapshot's key comes first, over a file that holds one too. A
+        // blank one is no key, and the second name is asked next.
+        let first = Environment::of([(KEY_ENV, "made-up-env-key")]);
+        assert!(
+            is(&first, "made-up-env-key"),
+            "the snapshot's key, ahead of the file's"
+        );
+        let second = Environment::of([
+            (KEY_ENV, "  "),
+            (crate::agent::AUTH_TOKEN_ENV, "made-up-auth-token"),
+        ]);
+        assert!(
+            is(&second, "made-up-auth-token"),
+            "the second name's, under a blank first"
+        );
+
+        std::fs::write(&path, "\n").unwrap();
+        modes::set(&path, 0o600);
+        assert!(
+            discover_key(&none, &path).is_err(),
+            "an empty key file is no key"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

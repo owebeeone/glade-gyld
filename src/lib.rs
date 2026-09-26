@@ -34,6 +34,8 @@
 //! * [`agent`] — how that client is configured when nobody can pass it a flag:
 //!   `agent/config.json` under the bundle root, the environment over it, the
 //!   flags over both, and the compatibility profile of the endpoint.
+//! * [`environment`] — the [`Environment`] the process started with, captured
+//!   once at its entry point and handed down; its `Debug` prints names only.
 //! * [`bundle`] — the bundle-root layout, the staging repository, containment,
 //!   the latest-build pointer and file digests.
 //! * [`verbs`] — the allow-list and the PURE planner: a request becomes one host
@@ -64,6 +66,7 @@ pub mod ask;
 pub mod bundle;
 pub mod conversation;
 pub mod envelope;
+pub mod environment;
 pub mod exec;
 pub mod fetch;
 pub mod github;
@@ -92,6 +95,7 @@ pub use envelope::{
     GyldArgs, GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, Refusal, ASK_ANSWER,
     ASK_CITATION, ASK_DRAFT, ASK_END, ASK_NOTE, ASK_QUESTION, ASK_TOOL_CALL, ASK_TOOL_RESULT,
 };
+pub use environment::Environment;
 pub use exec::{
     Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };

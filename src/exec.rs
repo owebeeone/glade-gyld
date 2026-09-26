@@ -9,6 +9,10 @@
 //! killed and the failure is data. Output: a per-stream byte budget, after which
 //! lines stop accumulating and the answer says so. Pipes drain on their own
 //! threads, so a chatty host can never deadlock the wait.
+//!
+//! A host runs in the environment the supplier STARTED with and nothing else
+//! ([`Environment::apply_to`]), with the two Python variables set over it: a
+//! variable set in this process since never reaches one.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -16,6 +20,7 @@ use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::environment::Environment;
 use crate::verbs::Plan;
 
 /// The default wall-clock bound for one host run. A full re-capture of a bundle
@@ -72,11 +77,14 @@ pub trait Runner: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct PythonRunner {
     pub python: PathBuf,
+    /// The environment the supplier started with: all a host run is given,
+    /// with the two Python variables set over it.
+    pub env: Environment,
 }
 
 impl PythonRunner {
-    pub fn new(python: PathBuf) -> PythonRunner {
-        PythonRunner { python }
+    pub fn new(python: PathBuf, env: Environment) -> PythonRunner {
+        PythonRunner { python, env }
     }
 }
 
@@ -87,19 +95,23 @@ impl Runner for PythonRunner {
         limits: Limits,
         on_line: &mut dyn FnMut(&str, &str),
     ) -> Result<RunOutput, String> {
-        run_bounded(&self.python, plan, limits, on_line)
+        run_bounded(&self.python, &self.env, plan, limits, on_line)
     }
 }
 
 /// Spawn the host, drain both pipes on threads, enforce both bounds.
+///
+/// The host is given `env` and nothing else. The snapshot goes on FIRST,
+/// because `env_clear()` would drop the two Python variables set before it.
 pub fn run_bounded(
     python: &Path,
+    env: &Environment,
     plan: &Plan,
     limits: Limits,
     on_line: &mut dyn FnMut(&str, &str),
 ) -> Result<RunOutput, String> {
     let mut command = std::process::Command::new(python);
-    command
+    env.apply_to(&mut command)
         .arg("-B")
         .args(&plan.argv)
         .current_dir(&plan.cwd)
@@ -236,6 +248,11 @@ mod tests {
         path
     }
 
+    /// No environment at all: these shims need nothing from one.
+    fn none() -> Environment {
+        Environment::default()
+    }
+
     fn a_plan() -> Plan {
         let layout = Layout::new(std::env::temp_dir(), PathBuf::from("/b"));
         let request =
@@ -259,7 +276,7 @@ mod tests {
             "#!/bin/sh\necho one\necho two\necho oops >&2\nexit 3\n",
         );
         let mut seen: Vec<(String, String)> = Vec::new();
-        let out = run_bounded(&sh, &a_plan(), Limits::default(), &mut |s, l| {
+        let out = run_bounded(&sh, &none(), &a_plan(), Limits::default(), &mut |s, l| {
             seen.push((s.into(), l.into()));
         })
         .unwrap();
@@ -278,7 +295,7 @@ mod tests {
             timeout: Duration::from_millis(150),
             ..Limits::default()
         };
-        let e = run_bounded(&sh, &a_plan(), limits, &mut |_, _| {}).unwrap_err();
+        let e = run_bounded(&sh, &none(), &a_plan(), limits, &mut |_, _| {}).unwrap_err();
         assert!(e.contains("timed out"), "{e}");
         let _ = std::fs::remove_dir_all(sh.parent().unwrap());
     }
@@ -293,7 +310,7 @@ mod tests {
             max_output_bytes: 64,
             ..Limits::default()
         };
-        let out = run_bounded(&sh, &a_plan(), limits, &mut |_, _| {}).unwrap();
+        let out = run_bounded(&sh, &none(), &a_plan(), limits, &mut |_, _| {}).unwrap();
         assert!(out.truncated, "{out:?}");
         assert!(
             out.stdout.len() <= 64,
@@ -308,11 +325,39 @@ mod tests {
     fn a_missing_interpreter_is_an_error_not_a_panic() {
         let e = run_bounded(
             Path::new("/no/such/python"),
+            &none(),
             &a_plan(),
             Limits::default(),
             &mut |_, _| {},
         )
         .unwrap_err();
         assert!(e.contains("failed to spawn"), "{e}");
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use crate::environment::tests::unix::{names_past_the_shell, set};
+
+        /// A host is given the snapshot and the two Python variables set over
+        /// it, and nothing of this process's own environment. The stand-in host
+        /// lists its environment; only the names are compared.
+        #[test]
+        fn a_host_is_given_the_snapshot_and_its_two_python_variables_only() {
+            let sh = shim("env", "#!/bin/sh\nexec /usr/bin/env -0\n");
+            let env = Environment::of([("GYLD_MADE_UP_SNAPSHOT", "made-up")]);
+            let out = run_bounded(&sh, &env, &a_plan(), Limits::default(), &mut |_, _| {})
+                .expect("the stand-in host ran");
+            assert_eq!(out.exit, 0, "the stand-in host exited {}", out.exit);
+            assert_eq!(
+                names_past_the_shell(out.stdout.as_bytes()),
+                set(&[
+                    "GYLD_MADE_UP_SNAPSHOT",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PYTHONPATH"
+                ])
+            );
+            let _ = std::fs::remove_dir_all(sh.parent().unwrap());
+        }
     }
 }

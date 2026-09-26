@@ -474,7 +474,9 @@ authority:
    be inherited by accident on any desk that has it set for a different client.
    A blank variable is treated as unset. The supplier reads its environment
    once, when it starts, and every variable here (and `GITHUB_TOKEN`) comes
-   from that snapshot.
+   from that snapshot. The children it runs, the Gyld hosts and
+   `gh auth token`, are given that snapshot and nothing else, so a variable set
+   in the supplier after it started reaches none of them.
 
 3. **The flags**, for a supplier somebody can pass flags to.
 

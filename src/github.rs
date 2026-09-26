@@ -117,7 +117,7 @@ impl std::fmt::Debug for Token {
 /// call precisely so that nothing else has to be.
 pub fn discovered(env: &Environment) -> &'static Token {
     static HELD: OnceLock<Token> = OnceLock::new();
-    HELD.get_or_init(|| discover(env, &gh_auth_token))
+    HELD.get_or_init(|| discover(env, &|| gh_auth_token(env)))
 }
 
 /// [`discovered`] over an arbitrary `gh`, so the ORDER is asserted with made-up
@@ -149,11 +149,17 @@ pub fn discover(env: &Environment, gh: &dyn Fn() -> Option<String>) -> Token {
 /// `gh auth token`, bounded, with its own output going nowhere else.
 ///
 /// A fixed argv with nothing composed into it: no question, no repository and
-/// no model output reaches this, and there is no shell.
-fn gh_auth_token() -> Option<String> {
+/// no model output reaches this, and there is no shell. It runs in `env`, the
+/// environment the supplier started with, and nothing else: `gh` is found on
+/// that `PATH` and finds its login under that `HOME`, as it did when it
+/// inherited them.
+fn gh_auth_token(env: &Environment) -> Option<String> {
+    let env = env.clone();
     let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
     std::thread::spawn(move || {
-        let ran = std::process::Command::new("gh")
+        let mut command = std::process::Command::new("gh");
+        let ran = env
+            .apply_to(&mut command)
             .args(["auth", "token"])
             .stdin(std::process::Stdio::null())
             .output();
@@ -1067,5 +1073,37 @@ mod tests {
             "the API wraps its base64 at 60 columns and the newlines are skipped"
         );
         assert!(decode("not base64!").is_none());
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+        use crate::environment::tests::unix::{names_past_the_shell, set};
+
+        /// `gh` is the one on the snapshot's `PATH`, and it is given the
+        /// snapshot and nothing else. The stand-in answers with its environment
+        /// listing where a token would be; only the names are compared.
+        #[test]
+        fn gh_is_found_on_the_snapshots_path_and_given_the_snapshot_only() {
+            let dir = std::env::temp_dir().join(format!("glade-gyld-gh-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let gh = dir.join("gh");
+            std::fs::write(&gh, "#!/bin/sh\nexec /usr/bin/env -0\n").unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let env = Environment::of([
+                ("PATH", dir.display().to_string()),
+                ("GYLD_MADE_UP_SNAPSHOT", "made-up".to_string()),
+            ]);
+            let listing = gh_auth_token(&env).expect("the stand-in gh answered");
+            assert_eq!(
+                names_past_the_shell(listing.as_bytes()),
+                set(&["GYLD_MADE_UP_SNAPSHOT", "PATH"])
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

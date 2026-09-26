@@ -211,7 +211,8 @@ pub async fn serve(config: GyldConfig, python: PathBuf) -> io::Result<GyldSuppli
         eprintln!("glade-gyld: agent config: {note}");
     }
     let model = model::HttpsModelClient::new(resolved.config, config.env.clone());
-    serve_with(config, Arc::new(PythonRunner::new(python)), Arc::new(model)).await
+    let runner = PythonRunner::new(python, config.env.clone());
+    serve_with(config, Arc::new(runner), Arc::new(model)).await
 }
 
 /// Connect, attach and serve with a caller-supplied runner and model client.

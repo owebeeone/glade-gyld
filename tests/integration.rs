@@ -2385,6 +2385,12 @@ async fn streaming_output_reaches_a_subscriber_in_sequence() {
 
 // ---- 5. ONE real subprocess against a Gyld checkout ------------------------
 
+/// This test process's own environment, captured as `main` captures the
+/// binary's: a real host run here is given what a desk's would be.
+fn started_env() -> glade_gyld::Environment {
+    glade_gyld::Environment::of(std::env::vars_os())
+}
+
 /// The Gyld checkout the real-subprocess test runs against, if one is here.
 fn gyld_checkout() -> Option<PathBuf> {
     let candidate = match std::env::var_os("GLADE_GYLD_TEST_GYLD_ROOT") {
@@ -2436,7 +2442,7 @@ fn the_emit_host_answers_help_as_a_real_subprocess() {
         timeout: Duration::from_secs(60),
         max_output_bytes: 1 << 20,
     };
-    let out = glade_gyld::exec::run_bounded(&python, &plan, limits, &mut |_, _| {})
+    let out = glade_gyld::exec::run_bounded(&python, &started_env(), &plan, limits, &mut |_, _| {})
         .expect("the emit host ran");
     assert_eq!(out.exit, 0, "stderr: {}", out.stderr);
     assert!(
@@ -3190,7 +3196,7 @@ async fn a_write_gyld_rejects_is_refused_and_the_notebook_is_put_back() {
     };
     let _sup = serve_with(
         config,
-        Arc::new(glade_gyld::PythonRunner::new(python)),
+        Arc::new(glade_gyld::PythonRunner::new(python, started_env())),
         Arc::new(NoModel),
     )
     .await
@@ -3454,7 +3460,7 @@ async fn one_notebook_holds_as_many_fragment_answers_as_the_owner_makes() {
     };
     let _sup = serve_with(
         config,
-        Arc::new(glade_gyld::PythonRunner::new(python)),
+        Arc::new(glade_gyld::PythonRunner::new(python, started_env())),
         Arc::new(NoModel),
     )
     .await

@@ -242,8 +242,9 @@ pub struct AgentOverrides {
     pub search_provider: Option<Provider>,
     /// The SearXNG base URL.
     pub search_url: Option<String>,
-    /// The Brave key, as the desk wrote it.
-    pub search_key: Option<String>,
+    /// The Brave key, as the desk wrote it. It prints as `<set>` and never as
+    /// itself, so this struct's derived `Debug` is safe to use.
+    pub search_key: Option<InlineKey>,
     /// A file holding the Brave key, resolved against the bundle root unless
     /// it is absolute, and mode checked at the moment of the call.
     pub search_key_file: Option<PathBuf>,
@@ -414,7 +415,7 @@ impl AgentOverrides {
                 fetch_bytes: held.fetch_bytes,
                 search_provider,
                 search_url: held.search_url,
-                search_key: held.search_key,
+                search_key: held.search_key.map(InlineKey),
                 search_key_file: held.search_key_file.map(PathBuf::from),
             },
             notes,
@@ -422,9 +423,20 @@ impl AgentOverrides {
     }
 }
 
+/// A key the desk wrote inline in the config file: carried and compared, and
+/// never printed. Its `Debug` says only that one was set.
+#[derive(Clone, PartialEq)]
+pub struct InlineKey(pub String);
+
+impl std::fmt::Debug for InlineKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InlineKey(<set>)")
+    }
+}
+
 /// `agent/config.json` itself. Every field optional, and the names are the
-/// ones the README documents.
-#[derive(Clone, Debug, Default, Deserialize)]
+/// ones the README documents. No `Debug`: it holds an inline key as written.
+#[derive(Clone, Default, Deserialize)]
 struct AgentFile {
     #[serde(default)]
     model: Option<String>,
@@ -616,7 +628,7 @@ pub fn resolve_from(bundle_root: &Path, merged: AgentOverrides, notes: Vec<Strin
                     // directory exactly as the model key file is. The value
                     // behind it is not read here and not read at attach.
                     key: SearchKey::of(
-                        merged.search_key,
+                        merged.search_key.map(|key| key.0),
                         merged.search_key_file.map(|path| {
                             if path.is_absolute() {
                                 path
@@ -959,6 +971,30 @@ mod tests {
             "{search:?}"
         );
         assert!(!search.says().contains("sk-inline-secret"));
+    }
+
+    #[test]
+    fn a_search_key_written_inline_is_in_no_debug_print_of_the_overrides() {
+        let (held, notes) = AgentOverrides::from_json(
+            r#"{"search_provider": "brave", "search_key": "made-up-search-key"}"#,
+            Path::new("c"),
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        let merged = AgentOverrides::default().under(&held);
+        for printed in [format!("{held:?}"), format!("{merged:#?}")] {
+            assert!(
+                printed.contains("search_key"),
+                "the field is named: {printed}"
+            );
+            assert!(
+                !printed.contains("made-up-search-key"),
+                "its value is not: {printed}"
+            );
+        }
+        // The key still reaches the policy, which prints none either.
+        let search = resolved(merged).tools.search;
+        assert!(search.configured());
+        assert!(!format!("{search:?}").contains("made-up-search-key"));
     }
 
     #[test]

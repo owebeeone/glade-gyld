@@ -506,6 +506,17 @@ impl WriteGate {
         *holder = Some(run_id.to_string());
         Ok(Writing(gate.clone()))
     }
+
+    /// Is a write in flight: the gate taken and not yet freed?
+    ///
+    /// The exchange path asks before it lays the stage (G2). Every `fork` and
+    /// `link` holds the gate from before its host starts until its run has
+    /// settled, and only the handler, which the kit serialises, starts one: so
+    /// while this says no, no such host is writing into the staging tree.
+    fn in_flight(&self) -> bool {
+        let holder = self.holder.lock().unwrap_or_else(|e| e.into_inner());
+        holder.is_some()
+    }
 }
 
 impl Drop for Writing {
@@ -581,7 +592,15 @@ fn answer(
         .clone()
         .or_else(|| config.principal.clone());
 
-    if let Err(e) = bundle::ensure_stage(&config.layout) {
+    // A streamed `fork` or `link` may still be running, its host writing its
+    // module into the staging tree. While a write is in flight the stage is laid
+    // without adopting, so no verb moves that file mid-run (G2); the run's own
+    // settle adopts it once the host is done.
+    let staged = match writes.in_flight() {
+        true => bundle::ensure_stage_without_adopting(&config.layout),
+        false => bundle::ensure_stage(&config.layout),
+    };
+    if let Err(e) = staged {
         return GyldResponse::failed(format!("bundle root unusable: {e}"), who);
     }
     let latest = bundle::latest_build(&config.layout);

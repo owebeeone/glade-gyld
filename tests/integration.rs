@@ -744,6 +744,124 @@ async fn a_decisions_root_holds_the_notebooks_and_the_stage_links_to_them() {
     node.kill().await.ok();
 }
 
+// ---- 1c. a streamed fork's module stays where its host is writing it -------
+
+/// A `fork` host that is still RUNNING: it writes its module into the staging
+/// tree as the real host does, says so, and then waits for the test's word to
+/// finish, as the real host goes on to read its module back and check it.
+///
+/// Channels rather than a `Barrier`: a test that fails early drops its ends,
+/// and the host goes straight on instead of parking a thread for good.
+struct StillForking {
+    /// `(path, text)` the host writes: `overlays/<file>`, the staging tree.
+    wrote: (PathBuf, &'static str),
+    /// Sent once the module is on disk. Zero capacity, so the host is still
+    /// running when the test hears it.
+    written: SyncSender<()>,
+    /// The test's word that the host may finish.
+    finish: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Runner for StillForking {
+    fn run(
+        &self,
+        _plan: &Plan,
+        _limits: Limits,
+        _on_line: &mut dyn FnMut(&str, &str),
+    ) -> Result<RunOutput, String> {
+        let (path, text) = &self.wrote;
+        std::fs::write(path, text).map_err(|e| e.to_string())?;
+        let _ = self.written.send(());
+        let _ = self
+            .finish
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+        Ok(RunOutput {
+            exit: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+        })
+    }
+}
+
+/// G2, 2026-09-27: every verb lays the stage on the exchange path, and laying it
+/// ADOPTS a regular notebook it finds in the staging tree, which is exactly what
+/// a streamed `fork`'s module is while its host is still running. A verb that
+/// arrived mid-run must leave the file where the host is writing it; the run's
+/// own settle adopts it once the host is done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_forks_module_stays_put_until_its_host_is_done() {
+    let tmp = Tmp::new("fork-mid-run");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let (gyld, bundle) = roots(&tmp);
+    seed_bundle(&bundle);
+    let decisions = tmp.path().join("decisions");
+    let forked = "glade-decisions-keys-a.gyld.py";
+    let staged = bundle.join("overlays").join(forked);
+    let kept = decisions.join(forked);
+    let (written, on_disk) = std::sync::mpsc::sync_channel::<()>(0);
+    let (finish, finishing) = std::sync::mpsc::channel::<()>();
+    let runner = Arc::new(StillForking {
+        wrote: (staged.clone(), "# forked\n"),
+        written,
+        finish: Mutex::new(finishing),
+    });
+    let mut config = config_for(&url, gyld.clone(), bundle.clone());
+    config.layout = config
+        .layout
+        .clone()
+        .with_decisions_root(Some(decisions.clone()));
+    let _sup = serve_with(config, runner.clone(), Arc::new(NoModel), Token::default())
+        .await
+        .unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    attached(&requester).await;
+
+    let accepted = request(
+        &requester,
+        r#"{"verb":"fork","stream_output":true,"args":{"parent":"base","stream":"keys-a"}}"#,
+    )
+    .await;
+    assert!(accepted.ok, "{accepted:?}");
+    let heard = tokio::task::spawn_blocking(move || on_disk.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(heard.is_ok(), "the fork host never wrote its module");
+
+    // The host is mid-run, and any verb lays the stage: `list` does.
+    let listed = request(&requester, r#"{"verb":"list"}"#).await;
+    assert!(listed.ok, "{listed:?}");
+    let held = std::fs::symlink_metadata(&staged).unwrap().file_type();
+    assert!(
+        held.is_file(),
+        "the host's module was moved out from under it mid-run: {} is now {held:?}",
+        staged.display()
+    );
+    assert_eq!(std::fs::read_to_string(&staged).unwrap(), "# forked\n");
+    assert!(
+        kept.symlink_metadata().is_err(),
+        "nothing is adopted while the host runs"
+    );
+
+    // The host finishes, and the run's own settle adopts its module.
+    finish.send(()).unwrap();
+    let adopted = poll(|| {
+        let (staged, kept) = (staged.clone(), kept.clone());
+        async move { std::fs::read_link(&staged).ok() == Some(kept) }
+    })
+    .await;
+    assert!(adopted, "the run adopts its module once its host is done");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "# forked\n");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
 // ---- 2. refusals are data, and no host is invoked --------------------------
 
 #[tokio::test(flavor = "multi_thread")]

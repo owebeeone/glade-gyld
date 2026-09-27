@@ -241,6 +241,19 @@ pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
     ensure_stage_with(layout, &|_| {})
 }
 
+/// [`ensure_stage`] with the ADOPTION left out, for a caller that knows a Gyld
+/// host may still be writing into the staging tree.
+///
+/// A streamed `fork` or `link` host writes its module into `<stage>/examples`
+/// and reads it back to check it after the verb's accept has gone out, so a
+/// regular notebook there may be that host's file mid-run, and adopting it
+/// would move the file out from under the host (G2, 2026-09-27). The run's own
+/// settle adopts it once the host is done. The linking, the sweep and the
+/// seeding still run: none of them touches a regular file.
+pub fn ensure_stage_without_adopting(layout: &Layout) -> io::Result<()> {
+    lay_stage(layout, false, &|_| {})
+}
+
 /// Where [`ensure_stage_with`] has got to, told to its `on_step` as it gets
 /// there.
 ///
@@ -264,6 +277,11 @@ pub enum Step<'a> {
 
 /// [`ensure_stage`], telling `on_step` each [`Step`] it reaches.
 pub fn ensure_stage_with(layout: &Layout, on_step: &dyn Fn(Step<'_>)) -> io::Result<()> {
+    lay_stage(layout, true, on_step)
+}
+
+/// The work of [`ensure_stage_with`], ADOPTING or not.
+fn lay_stage(layout: &Layout, adopting: bool, on_step: &dyn Fn(Step<'_>)) -> io::Result<()> {
     let overlays = layout.overlays();
     std::fs::create_dir_all(&overlays)?;
     std::fs::create_dir_all(layout.builds())?;
@@ -274,8 +292,10 @@ pub fn ensure_stage_with(layout: &Layout, on_step: &dyn Fn(Step<'_>)) -> io::Res
 
     if let Some(decisions) = layout.decisions_root.as_ref() {
         std::fs::create_dir_all(decisions)?;
-        for note in adopt_held(layout, on_step)?.notes() {
-            eprintln!("glade-gyld: {note}");
+        if adopting {
+            for note in adopt_held(layout, on_step)?.notes() {
+                eprintln!("glade-gyld: {note}");
+            }
         }
         link_notebooks(decisions, &overlays)?;
         drop_dangling(&overlays, on_step)?;
@@ -502,8 +522,9 @@ fn move_file(from: &Path, to: &Path) -> io::Result<()> {
 /// exactly that, and re-pointing it is how the owner's copy of a shipped sample
 /// comes to be the one the hosts read.
 ///
-/// A real file at that name is left alone: [`adopt`] has already run this pass,
-/// so a regular file still there is one of its conflicts.
+/// A real file at that name is left alone: it is one of [`adopt`]'s conflicts,
+/// or a module a running host is still writing
+/// ([`ensure_stage_without_adopting`]).
 fn link_notebooks(decisions: &Path, overlays: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(decisions)? {
         let entry = entry?;

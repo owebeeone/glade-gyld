@@ -101,7 +101,9 @@ order:
    into the decisions root and a link is left in its place. A name the decisions
    root already holds with *different* bytes is left alone on both sides, with
    one log line naming both paths: losing one of two notebooks to a tidying step
-   is not a thing this supplier does.
+   is not a thing this supplier does. While a write is in flight, a verb's
+   staging skips this step, so a streamed `fork` or `link` host's module is not
+   moved mid-run; the run adopts it as it settles (G2).
 2. **Link.** Every notebook in the decisions root is linked into `overlays/`,
    re-pointing a link that leads elsewhere. A seed link into the checkout is
    exactly that, which is how the owner's copy of a shipped sample
@@ -370,7 +372,9 @@ which no path separator, flag or shell metacharacter can satisfy), and path
 containment inside the bundle root. Planning is pure: a refusal is produced with
 no filesystem effect at all, and no refusal ever reaches a host.
 
-Everything is bounded. A run is killed at `--timeout-secs`; stdout and stderr
+Everything is bounded. A run is killed at `--timeout-secs` with every process its
+host started (a host runs in a process group of its own on unix, a job object on
+Windows), so its answer never waits on one of them; stdout and stderr
 each stop accumulating at `--max-output-bytes` and the answer says so; an
 exported overlay module over 1 MiB is refused; a bundle document larger than the
 output budget is refused with a pointer to fetch it over the static path rather

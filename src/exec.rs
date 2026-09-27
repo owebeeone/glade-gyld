@@ -5,10 +5,11 @@
 //! a blocking task with a line sink that appends each line to the log surface as
 //! it arrives. There is no second command shape to keep in step.
 //!
-//! Everything is bounded. Wall clock: a hard timeout, after which the child is
-//! killed and the failure is data. Output: a per-stream byte budget, after which
-//! lines stop accumulating and the answer says so. Pipes drain on their own
-//! threads, so a chatty host can never deadlock the wait.
+//! Everything is bounded. Wall clock: a hard timeout, after which the host is
+//! killed with every process it started (the `tree` module) and the failure is
+//! data. Output: a per-stream byte budget, after which lines stop accumulating
+//! and the answer says so. Pipes drain on their own threads, so a chatty host
+//! can never deadlock the wait.
 //!
 //! A host runs in the environment the supplier STARTED with and nothing else
 //! ([`Environment::apply_to`]), with the two Python variables set over it: a
@@ -121,8 +122,7 @@ pub fn run_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let (mut child, host) = tree::spawn(&mut command)
         .map_err(|e| format!("failed to spawn {}: {e}", python.display()))?;
 
     let (tx, rx) = mpsc::channel::<(&'static str, String)>();
@@ -168,7 +168,7 @@ pub fn run_bounded(
     }
 
     if timed_out {
-        let _ = child.kill();
+        host.end(&mut child);
         let _ = child.wait();
     } else {
         match child.wait() {
@@ -223,6 +223,120 @@ fn drain<R: std::io::Read + Send + 'static>(
             }
         }
     })
+}
+
+/// A host's WHOLE process tree, which a timeout ends, behind an explicit module
+/// boundary per platform (the workzone's conditional-compilation rule).
+///
+/// Killing the host alone was not enough (G3, 2026-09-27): a process the host
+/// started inherits its output pipes and holds them open for as long as it
+/// lives, so the drainers, and with them the run, waited for it, and it went on
+/// running after the timeout that was meant to end it.
+///
+/// std signals no process group and makes no job object, and a crate for the
+/// one call each needs is more than it is worth: each is declared here, from
+/// the system library std already links.
+#[cfg(unix)]
+mod tree {
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+
+    extern "C" {
+        /// `kill(2)`: a negative pid signals that process group.
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    /// `SIGKILL`, which is 9 on every unix.
+    const SIGKILL: i32 = 9;
+
+    /// The host's process group, which every process it starts joins unless
+    /// it leaves on purpose. Its id is the host's own pid.
+    pub struct Tree(u32);
+
+    /// Spawn the host as the leader of a process group of its own.
+    pub fn spawn(command: &mut Command) -> io::Result<(Child, Tree)> {
+        let child = command.process_group(0).spawn()?;
+        let group = child.id();
+        Ok((child, Tree(group)))
+    }
+
+    impl Tree {
+        /// Kill the whole group, and the host itself should the group not be
+        /// signalled. Called BEFORE the host is waited for: until then the
+        /// group's id is the unreaped host's pid, which nothing else can have.
+        pub fn end(&self, child: &mut Child) {
+            if let Ok(group) = i32::try_from(self.0) {
+                // SAFETY: kill(2) is handed two integers and reads no memory.
+                unsafe {
+                    kill(-group, SIGKILL);
+                }
+            }
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod tree {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::process::{Child, Command};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+    }
+
+    /// A job object holding the host, which every process it starts joins.
+    /// `None` when none could be made or the host could not be put in it: then
+    /// the host alone is killed, as before.
+    ///
+    /// The host joins it just after it starts, so a process it started before
+    /// then would stay outside; a Python host starts nothing that early.
+    pub struct Tree(Option<OwnedHandle>);
+
+    /// Spawn the host and put it in a job object of its own.
+    pub fn spawn(command: &mut Command) -> io::Result<(Child, Tree)> {
+        let child = command.spawn()?;
+        let job = job_for(&child);
+        Ok((child, Tree(job)))
+    }
+
+    fn job_for(child: &Child) -> Option<OwnedHandle> {
+        // SAFETY: no security attributes and no name, both of which may be null.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: a handle CreateJobObjectW has just returned, owned by nothing
+        // else, which the OwnedHandle closes.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        // SAFETY: two live handles, the job's and the one std holds for the host.
+        let assigned =
+            unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
+        match assigned != 0 {
+            true => Some(job),
+            false => None,
+        }
+    }
+
+    impl Tree {
+        /// Kill every process in the job, and the host itself should there be
+        /// no job.
+        pub fn end(&self, child: &mut Child) {
+            if let Some(job) = self.0.as_ref() {
+                // SAFETY: a live job handle this Tree owns.
+                unsafe {
+                    TerminateJobObject(job.as_raw_handle(), 1);
+                }
+            }
+            let _ = child.kill();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -288,15 +402,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(sh.parent().unwrap());
     }
 
+    /// The timeout ends the host's WHOLE process tree. The stand-in host starts
+    /// a child of its own, which holds the output pipes open for as long as it
+    /// lives: a timeout that killed the host alone left the run waiting for that
+    /// child to finish (G3, 2026-09-27), so an answer long before it would have
+    /// is the proof the child is gone.
     #[test]
     fn a_slow_host_times_out_as_an_error() {
-        let sh = shim("slow", "#!/bin/sh\nsleep 5\n");
+        let sh = shim(
+            "slow",
+            "#!/bin/sh\n[ -n \"$WARM\" ] && exit 0\nsleep 30 &\necho started\nwait\n",
+        );
+        // A new script's first run can wait on the system's check of a new
+        // executable for longer than the timeout below (0.1 to 0.4 s on macOS),
+        // and a host killed before it has started its child proves nothing. One
+        // run that ends at once pays for that check here.
+        let warm = Environment::of([("WARM", "1")]);
+        run_bounded(&sh, &warm, &a_plan(), Limits::default(), &mut |_, _| {}).unwrap();
+
         let limits = Limits {
             timeout: Duration::from_millis(150),
             ..Limits::default()
         };
-        let e = run_bounded(&sh, &none(), &a_plan(), limits, &mut |_, _| {}).unwrap_err();
+        let mut seen: Vec<String> = Vec::new();
+        let began = Instant::now();
+        let e = run_bounded(&sh, &none(), &a_plan(), limits, &mut |_, line| {
+            seen.push(line.into());
+        })
+        .unwrap_err();
+        let took = began.elapsed();
         assert!(e.contains("timed out"), "{e}");
+        assert_eq!(seen, ["started"], "the host started its child in time");
+        assert!(
+            took < Duration::from_secs(5),
+            "the run answered after {took:?}: the host's own child outlived the timeout"
+        );
         let _ = std::fs::remove_dir_all(sh.parent().unwrap());
     }
 

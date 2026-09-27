@@ -45,7 +45,8 @@
 //!      supplier holds it: a question uses the held token, and its value
 //!      reaches no model request, no record and no line.
 //!  18. the BINARY, stopped by SIGTERM or SIGINT, ends a running host's whole
-//!      tree before it exits (G4).
+//!      tree before it exits (G4), then waits at most about a second for a
+//!      model call still in flight.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -2828,6 +2829,84 @@ mod stopping {
             .expect("wait");
         assert!(status.success(), "a clean shutdown exits 0, got {status:?}");
 
+        requester.close().await;
+        node.kill().await.ok();
+    }
+
+    /// 2026-09-28: once the hosts are ended, stopping waits at most about a
+    /// second for work still in flight. An `explain` whose model call is
+    /// waiting on an answer would otherwise hold the exit until that call's own
+    /// clock ran out, minutes away. The endpoint here takes the connection and
+    /// never answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigterm_waits_at_most_about_a_second_for_a_model_call_in_flight() {
+        let tmp = Tmp::new("stop-in-flight");
+        let (mut node, port) = boot(&tmp).await;
+        let url = format!("ws://127.0.0.1:{port}");
+        let (gyld, bundle) = roots(&tmp);
+        let build = seed_bundle(&bundle);
+        seed_agent(&bundle, &build);
+        // Loopback, so the ollama profile: the first connection is the
+        // question's own call, with no count asked for ahead of it.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback");
+        silent
+            .set_nonblocking(true)
+            .expect("a listener that never blocks");
+        let base_url = format!("http://{}", silent.local_addr().expect("an address"));
+
+        let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
+            .args(["--node", &url, "--gyld-root"])
+            .arg(&gyld)
+            .arg("--bundle-root")
+            .arg(&bundle)
+            .args(["--principal", "gianni"])
+            .env_clear()
+            .env(glade_gyld::BASE_URL_ENV, &base_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn glade-gyld binary");
+        let pid = supplier.id().expect("binary pid");
+
+        let requester = GladeClient::new("requester");
+        requester.connect(&url).await.unwrap();
+        attached(&requester).await;
+        let accepted = request(&requester, &explain("base", "why is this blocked?")).await;
+        assert!(accepted.ok, "{accepted:?}");
+        // Taken, and held unanswered until the test ends: the call is in flight.
+        let mut held = None;
+        let called = poll(|| {
+            if held.is_none() {
+                held = silent.accept().ok();
+            }
+            let called = held.is_some();
+            async move { called }
+        })
+        .await;
+        assert!(called, "the question's call reached the model endpoint");
+
+        let sent = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(sent.success(), "sent SIGTERM");
+        let signalled = std::time::Instant::now();
+        let exited = tokio::time::timeout(Duration::from_secs(10), supplier.wait()).await;
+        let took = signalled.elapsed();
+        let status = exited
+            .expect("the binary exited within 10 s of SIGTERM, with a model call in flight")
+            .expect("wait");
+        // The second the binary gives work in flight, and a second to spare.
+        assert!(
+            took < Duration::from_secs(2),
+            "the binary took {took:?} to exit after SIGTERM"
+        );
+        assert!(status.success(), "a clean shutdown exits 0, got {status:?}");
+
+        drop(held);
         requester.close().await;
         node.kill().await.ok();
     }

@@ -19,7 +19,8 @@
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
 //! link drop (the kit helper), and on a signal ends every running host's whole
-//! tree, then tears the session down cleanly.
+//! tree, then tears the session down cleanly, waiting at most about a second
+//! for work still in flight.
 //!
 //! **A flag that was not passed sets nothing.** grazel spawns this binary with
 //! a fixed argument list and none of the `--agent-*` flags in it, so the
@@ -49,6 +50,9 @@ const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --b
 [--agent-base-url https://api.anthropic.com] [--agent-compat anthropic|ollama] \
 [--agent-max-input-tokens 200000] [--agent-max-output-tokens 64000] \
 [--agent-max-conversation-tokens 1000000]";
+
+/// How long stopping waits for work still in flight once the hosts are ended.
+const IN_FLIGHT_WITHIN: Duration = Duration::from_secs(1);
 
 /// The parsed CLI: the supplier config plus the interpreter to run the hosts.
 struct Args {
@@ -86,7 +90,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(args, signals)) {
+    let served = runtime.block_on(run(args, signals));
+    // Dropped, the runtime would wait for every blocking task to return, and an
+    // `explain` whose model call waits on an answer returns only when that
+    // call's own clock runs out, minutes away. `run` has ended the hosts by
+    // now, so what is left gets a second and is then left behind (2026-09-28).
+    runtime.shutdown_timeout(IN_FLIGHT_WITHIN);
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("glade-gyld: {e}");

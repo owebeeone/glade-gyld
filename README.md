@@ -42,7 +42,9 @@ glade-gyld --node ws://127.0.0.1:9099 \
 ```
 
 Attaches, serves, reattaches on link drop, and shuts down cleanly on
-SIGTERM/SIGINT. Stopping it ends every running host's whole process tree first.
+SIGTERM/SIGINT. Stopping it ends every running host's whole process tree first,
+then waits at most about 1 s for in-flight calls, such as an `explain` still
+waiting on the model, before it exits.
 The interpreter default is not decoration: the Gyld hosts need
 Python 3.13 and the system `python3` is 3.10, on which they fail.
 

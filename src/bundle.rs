@@ -21,6 +21,8 @@
 //!   latest.json         {"output_dir": "builds/<stamp>"} — swapped after a
 //!                       successful build (section 4.7: "swaps a symlink or
 //!                       index after a successful build").
+//!   stage.lock          empty; locked by whichever caller is laying the stage
+//!                       ([`ensure_stage`]), so callers take turns.
 //! ```
 //!
 //! `--gyld-root` is therefore used for exactly two things: running the scripts
@@ -133,6 +135,13 @@ impl Layout {
         self.bundle_root.join("latest.json")
     }
 
+    /// The file [`ensure_stage`] holds an exclusive lock on while it lays the
+    /// stage: one caller at a time per bundle root, whichever process it is in.
+    /// Beside the trees rather than in them, so no host ever reads it.
+    pub fn stage_lock(&self) -> PathBuf {
+        self.bundle_root.join("stage.lock")
+    }
+
     /// The Gyld host script `name` lives at `<gyld-root>/scripts/<name>`.
     pub fn script(&self, name: &str) -> PathBuf {
         self.gyld_root.join("scripts").join(name)
@@ -213,10 +222,12 @@ pub fn lexically_normalize(path: &Path) -> Option<PathBuf> {
 /// there (a supplier-written overlay, or a link from an earlier run) is left
 /// exactly as it is, so a written overlay always wins over the checkout's copy.
 ///
-/// Idempotent CONCURRENTLY too, which is the case the supplier actually runs:
-/// every verb ensures the stage on the exchange path while the first build
-/// ensures it on its own task, so on a fresh bundle root two callers reach the
-/// same absent link at once. See [`already_laid`].
+/// Safe CONCURRENTLY too, which is the case the supplier actually runs: every
+/// verb ensures the stage on the exchange path, the first build ensures it on
+/// its own task, and a streamed run ensures it again as it settles. One caller
+/// lays the stage at a time, under an exclusive lock on [`Layout::stage_lock`];
+/// the others wait their turn, which is a few directory listings long. See
+/// [`Staging`] for why each step being idempotent on its own was not enough.
 ///
 /// With a decisions root configured, three more steps run first, in this order:
 /// the notebooks a host wrote into the staging tree are ADOPTED into the
@@ -227,18 +238,47 @@ pub fn lexically_normalize(path: &Path) -> Option<PathBuf> {
 /// seeded, and only where no name exists, which is what makes the owner's copy
 /// shadow a shipped sample rather than fight it.
 pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
+    ensure_stage_with(layout, &|_| {})
+}
+
+/// Where [`ensure_stage_with`] has got to, told to its `on_step` as it gets
+/// there.
+///
+/// Production listens to none of it ([`ensure_stage`]). It is here so a test
+/// can hold one caller at the exact step another caller's race needs, and
+/// replay an interleaving a loaded machine produces once in a while every time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Step<'a> {
+    /// About to take the stage lock; the caller waits here while another holds
+    /// it.
+    Locking,
+    /// About to claim this host-written notebook for adoption.
+    Claiming(&'a Path),
+    /// Claimed it: the name stays empty until the adoption lays its link.
+    Claimed(&'a Path),
+    /// About to ask whether this link in the staging tree leads anywhere.
+    Checking(&'a Path),
+    /// Found that it leads nowhere, and about to remove it.
+    Dropping(&'a Path),
+}
+
+/// [`ensure_stage`], telling `on_step` each [`Step`] it reaches.
+pub fn ensure_stage_with(layout: &Layout, on_step: &dyn Fn(Step<'_>)) -> io::Result<()> {
     let overlays = layout.overlays();
     std::fs::create_dir_all(&overlays)?;
     std::fs::create_dir_all(layout.builds())?;
     std::fs::create_dir_all(layout.stage())?;
+    // Everything below reads a tree and then acts on what it read: one caller
+    // at a time.
+    let _staging = Staging::take(layout, on_step)?;
 
     if let Some(decisions) = layout.decisions_root.as_ref() {
         std::fs::create_dir_all(decisions)?;
-        for note in adopt(layout)?.notes() {
+        for note in adopt_held(layout, on_step)?.notes() {
             eprintln!("glade-gyld: {note}");
         }
         link_notebooks(decisions, &overlays)?;
-        drop_dangling(&overlays)?;
+        drop_dangling(&overlays, on_step)?;
     }
 
     let source = layout.gyld_root.join("examples");
@@ -261,6 +301,72 @@ pub fn ensure_stage(layout: &Layout) -> io::Result<()> {
         already_laid(platform::link_dir(&overlays, &examples))?;
     }
     Ok(())
+}
+
+/// The stage lock, HELD: an exclusive lock on [`Layout::stage_lock`] for as long
+/// as this lives.
+///
+/// Each of [`ensure_stage`]'s steps was made safe against another caller doing
+/// the SAME step ([`already_laid`], the claim in [`adopt`]). None was safe
+/// against a caller doing the step before it, because a caller's listing of
+/// `overlays/` is a snapshot it goes on acting on after the tree has moved. G1,
+/// 2026-09-27, an adoption lost among eight racing callers:
+///
+/// 1. LATE lists a host-written `forked1.gyld.py`: a regular file.
+/// 2. WINNER adopts it: the notebook moves to the decisions root and a link
+///    takes its place.
+/// 3. LATE claims the name its listing gave it, which is now the WINNER's link,
+///    and the name is empty until LATE lays the link again.
+/// 4. SWEEPER, whose listing already held that link, asks in that gap whether it
+///    leads anywhere: nothing is there.
+/// 5. LATE lays its link, and SWEEPER removes what holds the name — the good
+///    link. Every caller's linking pass had already run, so nothing put it back.
+///
+/// The notebook itself stayed safe in the decisions root, but its stream was
+/// gone from the stage until the next verb linked it again, and a build in
+/// between would not have seen it. Under the lock one caller lays the stage at
+/// a time, so what a caller listed is still there when it acts.
+///
+/// A lock on a FILE in the bundle root, because the root is what is guarded:
+/// every caller shares it, whatever `Layout` value, thread or process it comes
+/// from — the exchange handler, a streamed run's `settle`, the first build's
+/// task, a second supplier pointed at the same root. Nothing is kept in the
+/// process, and the lock goes with the open file, so a caller that panics or
+/// dies cannot leave the stage locked.
+struct Staging(std::fs::File);
+
+impl Staging {
+    /// Take the lock, waiting while another caller holds it. `on_step` hears
+    /// [`Step::Locking`] first.
+    fn take(layout: &Layout, on_step: &dyn Fn(Step<'_>)) -> io::Result<Staging> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(layout.stage_lock())?;
+        on_step(Step::Locking);
+        loop {
+            match file.lock() {
+                Ok(()) => {
+                    return Ok(Staging(file));
+                }
+                // A signal landing while this caller waits is no reason to
+                // refuse the verb: wait again.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Staging {
+    /// Unlock rather than leave it to the close: Windows frees a closed
+    /// handle's lock only when it gets round to it.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// The authoring suffix every overlay module carries.
@@ -314,12 +420,23 @@ impl Adopted {
 /// tidying step is not something a tool gets to do: both stay, and the caller
 /// says so.
 ///
-/// Concurrency-safe by CLAIMING: the staged file is renamed to a sibling
-/// temporary first, so of two callers reaching the same file only one can win
-/// and the loser sees `NotFound` and moves on. A caller that checked the file
-/// and then renamed it could instead rename the LINK the winner had just laid,
-/// and leave it pointing at itself.
+/// Concurrency-safe by the stage lock ([`Staging`]), which this takes. The
+/// staged file is still CLAIMED — renamed to a sibling temporary before
+/// anything else — but the claim alone never made it safe: a rename takes
+/// whatever holds the name, and a caller whose listing predated another's
+/// adoption claimed the winner's LINK. It laid the link again, but the name was
+/// empty in between, and a sweep that looked in that gap lost the adoption (G1).
 pub fn adopt(layout: &Layout) -> io::Result<Adopted> {
+    if layout.decisions_root.is_none() || !layout.overlays().is_dir() {
+        return Ok(Adopted::default());
+    }
+    let _staging = Staging::take(layout, &|_| {})?;
+    adopt_held(layout, &|_| {})
+}
+
+/// The work of [`adopt`], for a caller HOLDING the stage lock, telling
+/// `on_step` as it claims each file.
+fn adopt_held(layout: &Layout, on_step: &dyn Fn(Step<'_>)) -> io::Result<Adopted> {
     let decisions = match layout.decisions_root.as_ref() {
         Some(root) => root,
         None => {
@@ -340,12 +457,14 @@ pub fn adopt(layout: &Layout) -> io::Result<Adopted> {
         let staged = entry.path();
         let kept = decisions.join(entry.file_name());
         let claimed = sibling_temp(&staged);
+        on_step(Step::Claiming(&staged));
         match std::fs::rename(&staged, &claimed) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 continue;
             }
             other => other?,
         }
+        on_step(Step::Claimed(&staged));
         if kept.symlink_metadata().is_ok() {
             if std::fs::read(&claimed)? == std::fs::read(&kept)? {
                 std::fs::remove_file(&claimed)?;
@@ -416,14 +535,21 @@ fn link_notebooks(decisions: &Path, overlays: &Path) -> io::Result<()> {
 /// would fail on it and take the build down with it; removed, the stream is
 /// simply no longer declared — and if the checkout ships a sample of that name,
 /// the seeding step below puts the sample back.
-fn drop_dangling(overlays: &Path) -> io::Result<()> {
+///
+/// Check, then remove: the removal takes whatever holds the name BY THEN, and
+/// only the stage lock makes that the link the check looked at. No other caller
+/// can empty the name and fill it again in between, which is how G1 lost an
+/// adoption ([`Staging`]).
+fn drop_dangling(overlays: &Path, on_step: &dyn Fn(Step<'_>)) -> io::Result<()> {
     for entry in std::fs::read_dir(overlays)? {
         let entry = entry?;
         if !entry.file_type()?.is_symlink() {
             continue;
         }
         let link = entry.path();
+        on_step(Step::Checking(&link));
         if !link.exists() {
+            on_step(Step::Dropping(&link));
             already_gone(std::fs::remove_file(&link))?;
         }
     }
@@ -442,6 +568,11 @@ fn drop_dangling(overlays: &Path) -> io::Result<()> {
 /// `bundle root unusable: File exists (os error 17)`, which refused the verb or,
 /// worse, abandoned the first build and left the root with no bundle at all.
 ///
+/// The stage lock ([`Staging`]) now keeps two of those callers from meeting
+/// here at all. This stays: the supplier's own write path and a restore lay
+/// links in `overlays/` without the lock, and a name one of them took is still
+/// a name to leave alone.
+///
 /// Every other error is still an error: a read-only root, a missing parent, a
 /// permission refusal all come straight back.
 fn already_laid(result: io::Result<()>) -> io::Result<()> {
@@ -452,8 +583,9 @@ fn already_laid(result: io::Result<()>) -> io::Result<()> {
 }
 
 /// And the other half of it: treat `NotFound` from REMOVING something as the
-/// success it is. [`drop_dangling`] is check-then-act in the same way, so the
-/// caller that loses the race has the outcome it asked for — the link is gone.
+/// success it is — a restore took the same dangling link first, say, and the
+/// link is gone either way. What a removal must never do is take a link laid
+/// AFTER the check; that is the stage lock's job, not this one's.
 fn already_gone(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -651,6 +783,8 @@ mod tests {
         let l = Layout::new(PathBuf::from("/g"), PathBuf::from("/b"));
         assert_eq!(l.overlays(), PathBuf::from("/b/overlays"));
         assert_eq!(l.stage_examples(), PathBuf::from("/b/stage/examples"));
+        // Beside the trees the hosts read, never in them.
+        assert_eq!(l.stage_lock(), PathBuf::from("/b/stage.lock"));
         assert_eq!(
             l.new_build_dir("build-1"),
             PathBuf::from("/b/builds/build-1")
@@ -1007,6 +1141,174 @@ mod tests {
             assert_eq!(std::fs::read_dir(layout.overlays()).unwrap().count(), 16);
             assert_eq!(std::fs::read_dir(&decisions).unwrap().count(), 8);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Who a step came from, in the race the next test replays.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum Caller {
+        /// Listed the host's file before anyone adopted it, and claims it late.
+        Late,
+        /// Adopts the file, start to finish.
+        Winner,
+        /// Drops the links that lead nowhere.
+        Sweeper,
+    }
+
+    /// What a caller has done: a [`Step`] it reached, or its return.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum Did {
+        Locking,
+        Claiming,
+        Claimed,
+        Checking,
+        Dropping,
+        Returned,
+    }
+
+    /// Every `(caller, did)` so far, and a way to wait for one.
+    #[derive(Default)]
+    struct Score {
+        seen: std::sync::Mutex<std::collections::HashSet<(Caller, Did)>>,
+        moved: std::sync::Condvar,
+    }
+
+    impl Score {
+        fn did(&self, who: Caller, what: Did) {
+            self.seen.lock().unwrap().insert((who, what));
+            self.moved.notify_all();
+        }
+
+        /// Wait until `who` has done any of `any`. Bounded, so a replay that
+        /// stalls fails the test instead of hanging the suite.
+        fn until(&self, who: Caller, any: &[Did]) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut seen = self.seen.lock().unwrap();
+            while !any.iter().any(|what| seen.contains(&(who, *what))) {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(
+                    !left.is_zero(),
+                    "the replay stalled: {who:?} never did any of {any:?}"
+                );
+                seen = self.moved.wait_timeout(seen, left).unwrap().0;
+            }
+        }
+    }
+
+    #[test]
+    fn an_adoption_survives_a_late_claim_and_a_sweep_by_two_other_callers() {
+        // G1, 2026-09-27: the eight-caller race above lost an adoption once, on
+        // a loaded machine. This is the interleaving that loses it, held step by
+        // step through `ensure_stage_with`:
+        //
+        // 1. LATE lists `overlays/`: the host's file, a regular file.
+        // 2. WINNER adopts it — the notebook moves to the decisions root and a
+        //    link takes its place — and returns.
+        // 3. SWEEPER lists `overlays/`: the winner's link.
+        // 4. LATE acts on its listing and claims the NAME: the winner's link.
+        // 5. SWEEPER asks whether that link leads anywhere. The name is empty.
+        // 6. LATE finds the notebook kept already and lays its link again.
+        // 7. SWEEPER removes what now holds the name — the good link — and
+        //    nothing lays it again: every caller's linking pass has run.
+        //
+        // With the stage lock, WINNER and SWEEPER stop at `Locking` while LATE
+        // is inside. The replay takes that as its cue to let LATE go on, so the
+        // same steps run to the end instead of deadlocking, one caller at a time.
+        let (root, layout) = three_trees("adopt-late", &[]);
+        let name = "glade-decisions-forked.gyld.py";
+        let staged = layout.overlays().join(name);
+        let kept = root.join("decisions").join(name);
+        std::fs::create_dir_all(layout.overlays()).unwrap();
+        std::fs::write(&staged, "forked\n").unwrap();
+
+        let score = Score::default();
+        let on_late = |step: Step<'_>| match step {
+            Step::Claiming(path) if path == staged.as_path() => {
+                score.did(Caller::Late, Did::Claiming);
+                score.until(Caller::Winner, &[Did::Returned, Did::Locking]);
+                score.until(Caller::Sweeper, &[Did::Checking, Did::Locking]);
+            }
+            Step::Claimed(path) if path == staged.as_path() => {
+                score.did(Caller::Late, Did::Claimed);
+                score.until(Caller::Sweeper, &[Did::Dropping, Did::Locking]);
+            }
+            _ => {}
+        };
+        let on_winner = |step: Step<'_>| {
+            if matches!(step, Step::Locking) {
+                score.did(Caller::Winner, Did::Locking);
+            }
+        };
+        let on_sweeper = |step: Step<'_>| match step {
+            Step::Locking => {
+                score.did(Caller::Sweeper, Did::Locking);
+            }
+            Step::Checking(path) if path == staged.as_path() => {
+                score.did(Caller::Sweeper, Did::Checking);
+                score.until(Caller::Late, &[Did::Claimed]);
+            }
+            Step::Dropping(path) if path == staged.as_path() => {
+                score.did(Caller::Sweeper, Did::Dropping);
+                score.until(Caller::Late, &[Did::Returned]);
+            }
+            _ => {}
+        };
+
+        let returned = std::thread::scope(|scope| {
+            let late = scope.spawn(|| {
+                let done = ensure_stage_with(&layout, &on_late);
+                score.did(Caller::Late, Did::Returned);
+                done
+            });
+            score.until(Caller::Late, &[Did::Claiming]);
+            let winner = scope.spawn(|| {
+                let done = ensure_stage_with(&layout, &on_winner);
+                score.did(Caller::Winner, Did::Returned);
+                done
+            });
+            score.until(Caller::Winner, &[Did::Returned, Did::Locking]);
+            let sweeper = scope.spawn(|| {
+                let done = ensure_stage_with(&layout, &on_sweeper);
+                score.did(Caller::Sweeper, Did::Returned);
+                done
+            });
+            [late, winner, sweeper].map(|caller| caller.join().expect("the staging thread ran"))
+        });
+        for done in returned {
+            done.expect("a concurrent ensure_stage is not a failure");
+        }
+
+        assert_eq!(
+            points_at(&layout.overlays(), name),
+            Some(kept.clone()),
+            "the adoption the winner finished is still in the stage"
+        );
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "forked\n");
+        // Nothing left behind: no claimed temporary, no second copy.
+        assert_eq!(std::fs::read_dir(layout.overlays()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(root.join("decisions")).unwrap().count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stage_lock_that_cannot_be_taken_refuses_the_staging_rather_than_run_it_unlocked() {
+        let (root, layout) = three_trees("stage-lock", &[]);
+        let name = "glade-decisions-forked.gyld.py";
+        let staged = layout.overlays().join(name);
+        std::fs::create_dir_all(layout.overlays()).unwrap();
+        std::fs::write(&staged, "forked\n").unwrap();
+        // A lock file nothing can open for writing: a directory of that name.
+        std::fs::create_dir_all(layout.stage_lock()).unwrap();
+
+        ensure_stage(&layout).expect_err("no lock, no staging");
+        adopt(&layout).expect_err("and no adoption either");
+        // Nothing moved: the host's file is where it left it, and the owner's
+        // folder was never even made.
+        assert!(staged.symlink_metadata().unwrap().file_type().is_file());
+        assert!(root.join("decisions").symlink_metadata().is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

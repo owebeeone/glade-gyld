@@ -56,6 +56,8 @@ Python 3.13 and the system `python3` is 3.10, on which they fail.
                       name exists, so a notebook always wins over the
                       checkout's sample of the same name.
   stage/examples  ->  ../overlays      (the hosts' `--repository <bundle-root>/stage`)
+  stage.lock          held while one caller lays the stage (adopt, link, drop,
+                      seed); other callers wait their turn.
   builds/<stamp>/     one emitted bundle per build; never overwritten.
   requests/<run>.json a request document a host has to read off disk: so far only
                       the `fragment` a `merge` is handed. Written immediately
@@ -111,9 +113,13 @@ order:
    seeding step puts the sample back.
 4. **Seed**, as ever, only where no name exists.
 
-Every step treats "already done by the other caller" as success: two callers
-ensure the stage at the same moment in production (every verb on the exchange
-path, and the first build on its own task).
+Callers take turns: each holds `stage.lock` while it adopts, links, drops and
+seeds, since two callers do ensure the stage at the same moment in production
+(every verb on the exchange path, a run's settle, and the first build on its own
+task). Without the lock a rename or a remove could act on whatever held a name by
+then, and a sweep could drop the link another caller had just put back (G1, fixed
+2026-09-27). If the lock cannot be taken, the staging is refused rather than run
+unlocked.
 
 **The supplier never runs git.** A new ruling shows up in the owner's
 `git status`; he commits it when he means it.

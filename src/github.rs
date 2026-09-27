@@ -154,17 +154,17 @@ pub fn discover(env: &Environment, gh: &dyn Fn() -> Option<String>) -> Token {
 /// no model output reaches this, and there is no shell. It runs in `env`, the
 /// environment the supplier started with, and nothing else: `gh` is found on
 /// that `PATH` and finds its login under that `HOME`, as it did when it
-/// inherited them.
+/// inherited them. It starts with the shutdown signals unblocked, as every
+/// child does ([`crate::signals`]).
 fn gh_auth_token(env: &Environment) -> Option<String> {
     let env = env.clone();
     let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
     std::thread::spawn(move || {
         let mut command = std::process::Command::new("gh");
-        let ran = env
-            .apply_to(&mut command)
+        env.apply_to(&mut command)
             .args(["auth", "token"])
-            .stdin(std::process::Stdio::null())
-            .output();
+            .stdin(std::process::Stdio::null());
+        let ran = crate::signals::unblocked_in_child(&mut command).output();
         let answer = match ran {
             Ok(output) if output.status.success() => String::from_utf8(output.stdout)
                 .ok()

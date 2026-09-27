@@ -43,7 +43,9 @@
 //! * [`outcome`] — what a WRITING verb did to the stream it wrote: the snapshot a
 //!   refused write is put back to, and the reading of Gyld's own
 //!   `validation.json` that says whether it made things worse.
-//! * [`exec`] — the bounded runner (wall clock and output bytes).
+//! * [`exec`] — the bounded runner (wall clock and output bytes), and the
+//!   [`Hosts`] it has running, which a shutdown ends.
+//! * [`signals`] — the shutdown signals, taken with no handler on unix.
 //! * [`publish`] — what a successful build puts on the value surfaces.
 //! * [`tools`] — the [`tools::Tool`] trait, the allow-list registry and the
 //!   budgets one turn's tool use runs under (section 11); the loop that drives
@@ -75,6 +77,7 @@ pub mod outcome;
 pub mod prompt;
 pub mod publish;
 pub mod search;
+pub mod signals;
 pub mod sources;
 pub mod supplier;
 pub mod tools;
@@ -97,7 +100,7 @@ pub use envelope::{
 };
 pub use environment::Environment;
 pub use exec::{
-    Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
+    Hosts, Limits, PythonRunner, RunOutput, Runner, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECS,
 };
 pub use model::{
     degrade, draft_tool, estimate_tokens, Declined, Fold, ModelClient, ModelConfig, ModelEvent,
@@ -110,6 +113,7 @@ pub use outcome::{classify, said, Held, Outcome, Put, Snapshot, RUN_FAILED};
 pub use prompt::{compose, Prompt, STANCE};
 pub use publish::{Publication, Surfaces, DEFAULT_STATIC_BASE};
 pub use search::{SearchSources, SEARCH_SOURCES};
+pub use signals::ShutdownSignals;
 pub use sources::{ResolvedSource, SourceIndex, SOURCES_FORMAT};
 pub use supplier::{
     serve, serve_with, GyldConfig, GyldSupplier, DEFAULT_ASK_ID, DEFAULT_GLADE_ID,

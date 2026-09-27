@@ -18,7 +18,8 @@
 //! ```
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
-//! link drop (the kit helper), and tears the session down cleanly on a signal.
+//! link drop (the kit helper), and on a signal ends every running host's whole
+//! tree, then tears the session down cleanly.
 //!
 //! **A flag that was not passed sets nothing.** grazel spawns this binary with
 //! a fixed argument list and none of the `--agent-*` flags in it, so the
@@ -33,9 +34,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gyld::{
-    serve, AgentOverrides, Compat, Environment, GyldConfig, Limits, Surfaces, DEFAULT_ASK_ID,
-    DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID, DEFAULT_PYTHON, DEFAULT_SHARE,
-    DEFAULT_TIMEOUT_SECS,
+    serve, AgentOverrides, Compat, Environment, GyldConfig, Limits, ShutdownSignals, Surfaces,
+    DEFAULT_ASK_ID, DEFAULT_GLADE_ID, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_OUTPUT_ID, DEFAULT_PYTHON,
+    DEFAULT_SHARE, DEFAULT_TIMEOUT_SECS,
 };
 
 const USAGE: &str = "usage: glade-gyld --node ws://HOST:PORT --gyld-root DIR --bundle-root DIR \
@@ -55,8 +56,11 @@ struct Args {
     python: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The shutdown signals, blocked FIRST, before any thread exists, so every
+    // thread inherits the block and one thread takes them: grazel's pattern,
+    // with no handler installed (G4, `glade_gyld::signals`).
+    let signals = ShutdownSignals::block();
     // The environment, read ONCE, here, and handed down through `GyldConfig`:
     // nothing below this line reads the process's own. The whole of it, so a
     // child the supplier spawns can be given exactly what it would have
@@ -70,7 +74,19 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(args).await {
+    // Built here, after the block, and not by `#[tokio::main]`, which starts
+    // its threads before the first line of `main`.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("glade-gyld: cannot start the runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(args, signals)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("glade-gyld: {e}");
@@ -79,7 +95,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Args) -> std::io::Result<()> {
+async fn run(args: Args, signals: ShutdownSignals) -> std::io::Result<()> {
     let config = args.config;
     eprintln!(
         "glade-gyld: attaching to {} as {}/{} (gyld-root {}, bundle-root {}, decisions-root {}, \
@@ -98,31 +114,22 @@ async fn run(args: Args) -> std::io::Result<()> {
         },
         config.principal.as_deref().unwrap_or("<none>"),
     );
-    let supplier = serve(config, args.python).await?;
+    let mut stop = signals.watch()?;
+    // A signal while attaching stops there: attaching starts no host until
+    // the moment it is done.
+    let supplier = tokio::select! {
+        served = serve(config, args.python) => served?,
+        _ = &mut stop => {
+            eprintln!("glade-gyld: signal received while attaching; stopping");
+            return Ok(());
+        }
+    };
     eprintln!("glade-gyld: serving; SIGTERM/SIGINT to stop");
 
-    wait_for_shutdown_signal().await;
-    eprintln!("glade-gyld: signal received, detaching");
+    let _ = stop.await;
+    eprintln!("glade-gyld: signal received; ending running hosts, then detaching");
     supplier.shutdown().await;
     Ok(())
-}
-
-/// Resolve on SIGTERM or SIGINT (Ctrl-C) — the clean-shutdown trigger.
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 /// A tiny hand-rolled flag parser (the crate stays dep-light — no clap).

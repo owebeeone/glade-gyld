@@ -44,6 +44,8 @@
 //!  17. the github token is discovered ONCE, when the binary attaches, and the
 //!      supplier holds it: a question uses the held token, and its value
 //!      reaches no model request, no record and no line.
+//!  18. the BINARY, stopped by SIGTERM or SIGINT, ends a running host's whole
+//!      tree before it exits (G4).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -2727,6 +2729,135 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
 
     requester.close().await;
     node.kill().await.ok();
+}
+
+// ---- G4: stopping the binary ends every running host's tree ----------------
+
+/// G4, 2026-09-28: stopped by SIGTERM (the desk's stop) or SIGINT (a terminal's
+/// Ctrl-C), the binary ends every running host's WHOLE tree, and only then
+/// exits. Since G3 each host leads a process group of its own, which neither
+/// signal reaches, so glade-gyld must end them itself. The stand-in interpreter
+/// is a streamed `fork`'s host that has started a child and waits for it, and
+/// each writes its process id where the test can read it.
+#[cfg(unix)]
+mod stopping {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigterm_ends_a_running_hosts_tree_before_the_binary_exits() {
+        stop_with("TERM").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigint_ends_a_running_hosts_tree_before_the_binary_exits() {
+        if !ends_a_child("INT") {
+            eprintln!("SKIP: SIGINT is ignored here, as it is for a background job");
+            return;
+        }
+        stop_with("INT").await;
+    }
+
+    async fn stop_with(signal: &str) {
+        let tmp = Tmp::new(&format!("stop-{}", signal.to_lowercase()));
+        let (mut node, port) = boot(&tmp).await;
+        let url = format!("ws://127.0.0.1:{port}");
+        let (gyld, bundle) = roots(&tmp);
+        seed_bundle(&bundle);
+        let host_file = tmp.path().join("host.pid");
+        let child_file = tmp.path().join("child.pid");
+        let python = tmp.path().join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\n/bin/sleep 30 &\necho $! > '{}'\necho started\nwait\n",
+                host_file.display(),
+                child_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gyld"))
+            .args(["--node", &url, "--gyld-root"])
+            .arg(&gyld)
+            .arg("--bundle-root")
+            .arg(&bundle)
+            .args(["--share", "ws-razel", "--principal", "tester", "--python"])
+            .arg(&python)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn glade-gyld binary");
+        let pid = supplier.id().expect("binary pid");
+
+        let requester = GladeClient::new("requester");
+        requester.connect(&url).await.unwrap();
+        attached(&requester).await;
+        let accepted = request(
+            &requester,
+            r#"{"verb":"fork","stream_output":true,"args":{"parent":"base","stream":"keys-a"}}"#,
+        )
+        .await;
+        assert!(accepted.ok, "{accepted:?}");
+        let started = poll(|| {
+            let (host, child) = (host_file.clone(), child_file.clone());
+            async move { id_in(&host).is_some() && id_in(&child).is_some() }
+        })
+        .await;
+        assert!(started, "the host started its child");
+        let host = id_in(&host_file).unwrap();
+        let child = id_in(&child_file).unwrap();
+        assert!(alive(host) && alive(child), "both run before the signal");
+
+        let sent = std::process::Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .expect("send the signal");
+        assert!(sent.success(), "sent SIG{signal}");
+        let exited = tokio::time::timeout(Duration::from_secs(10), supplier.wait()).await;
+        let gone = poll(|| async move { !alive(host) && !alive(child) }).await;
+        assert!(
+            gone,
+            "the host ({host}) or its child ({child}) outlived glade-gyld's SIG{signal}"
+        );
+        let status = exited
+            .expect("the binary exited after the signal")
+            .expect("wait");
+        assert!(status.success(), "a clean shutdown exits 0, got {status:?}");
+
+        requester.close().await;
+        node.kill().await.ok();
+    }
+
+    /// The process id a stand-in wrote to `path`, once it has.
+    fn id_in(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Is `pid` still a process? `kill -0` sends nothing.
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Does `signal` end a shell that sends it to itself? A test run as a
+    /// background job starts with SIGINT ignored, and hands that on.
+    fn ends_a_child(signal: &str) -> bool {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -{signal} $$; echo survived"))
+            .output()
+            .expect("run /bin/sh");
+        !String::from_utf8_lossy(&out.stdout).contains("survived")
+    }
 }
 
 /// The binary reads its environment ONCE, at start, and hands it down: `main`

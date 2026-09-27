@@ -24,7 +24,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -39,7 +39,7 @@ use crate::bundle::{self, Layout};
 use crate::conversation::{self, Ledger};
 use crate::envelope::{GyldAskRecord, GyldOutputRecord, GyldRequest, GyldResponse, Refusal};
 use crate::environment::Environment;
-use crate::exec::{Limits, PythonRunner, RunOutput, Runner};
+use crate::exec::{Hosts, Limits, PythonRunner, RunOutput, Runner};
 use crate::github::{self, Token};
 use crate::model::{self, ModelClient, ModelConfig, ModelEvent, ModelRequest};
 use crate::outcome::{self, Put, Snapshot};
@@ -181,11 +181,33 @@ pub struct GyldSupplier {
     #[allow(dead_code)]
     client: GladeClient,
     supplier: Supplier,
+    /// The hosts its runs have running, which the shutdown ends first (G4).
+    hosts: Hosts,
 }
 
+/// How long the shutdown waits for the runs to end their hosts. Each ends its
+/// own within one of the runner's ticks, so this is a bound, not a pace.
+const HOSTS_END_WITHIN: Duration = Duration::from_secs(5);
+
 impl GyldSupplier {
-    /// Stop reattaching and close the session (the SIGTERM path).
+    /// End every running host's whole tree, then stop reattaching and close the
+    /// session: the SIGTERM path. Each host leads a process group (a job object
+    /// on Windows) of its own, which no signal to this process reaches, so a
+    /// host left running would outlive the supplier (G4, 2026-09-28).
     pub async fn shutdown(&self) {
+        let hosts = self.hosts.clone();
+        match tokio::task::spawn_blocking(move || hosts.end_all(HOSTS_END_WITHIN)).await {
+            Ok(0) => {}
+            Ok(left) => {
+                eprintln!(
+                    "glade-gyld: {left} host(s) still running {}s into the shutdown",
+                    HOSTS_END_WITHIN.as_secs()
+                );
+            }
+            Err(e) => {
+                eprintln!("glade-gyld: ending the hosts failed: {e}");
+            }
+        }
         self.supplier.detach_all().await;
     }
 }
@@ -229,6 +251,8 @@ pub async fn serve_with(
     token: Token,
 ) -> io::Result<GyldSupplier> {
     let config = Arc::new(config);
+    // The runner's hosts are the supplier's to end.
+    let hosts = runner.hosts();
     let client = GladeClient::new(format!("glade-gyld:{}:{}", config.share, config.glade_id));
     client.connect(&config.node_url).await?;
 
@@ -285,7 +309,11 @@ pub async fn serve_with(
         }
     }
 
-    Ok(GyldSupplier { client, supplier })
+    Ok(GyldSupplier {
+        client,
+        supplier,
+        hosts,
+    })
 }
 
 /// What the supplier does with the bundle root it finds when it starts serving.

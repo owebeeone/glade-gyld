@@ -564,8 +564,10 @@ mod tests {
         /// A `.cmd` script runs as it is.
         pub fn runnable(_path: &Path) {}
 
-        /// `vars` over this process's own environment: `PING.EXE` is found and
-        /// finds its network stack through `SystemRoot`.
+        /// `vars` over this process's own environment. cmd.exe runs no batch
+        /// file without `SystemRoot`: it exits 1 and says nothing (G5b,
+        /// 2026-09-28). `PING.EXE` is found, and finds its network stack,
+        /// through it too.
         pub fn env(vars: &[(&str, &str)]) -> Environment {
             let given = vars
                 .iter()
@@ -574,7 +576,8 @@ mod tests {
         }
     }
 
-    /// No environment at all: these shims need nothing from one.
+    /// No environment at all, for a host that never runs. A stand-in that runs
+    /// is given [`stand_in::env`], which on Windows is not empty.
     fn none() -> Environment {
         Environment::default()
     }
@@ -618,8 +621,9 @@ mod tests {
     #[test]
     fn lines_reach_the_sink_and_the_collected_output() {
         let sh = shim("lines", stand_in::LINES);
+        let env = stand_in::env(&[]);
         let mut seen: Vec<(String, String)> = Vec::new();
-        let out = run_bounded(&sh, &none(), &a_plan(), Limits::default(), &mut |s, l| {
+        let out = run_bounded(&sh, &env, &a_plan(), Limits::default(), &mut |s, l| {
             seen.push((s.into(), l.into()));
         })
         .unwrap();
@@ -723,7 +727,8 @@ mod tests {
             max_output_bytes: 64,
             ..Limits::default()
         };
-        let out = run_bounded(&sh, &none(), &a_plan(), limits, &mut |_, _| {}).unwrap();
+        let env = stand_in::env(&[]);
+        let out = run_bounded(&sh, &env, &a_plan(), limits, &mut |_, _| {}).unwrap();
         assert!(out.truncated, "{out:?}");
         assert!(
             out.stdout.len() <= 64,
